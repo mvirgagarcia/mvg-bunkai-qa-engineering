@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 7,
+  "templateRepo": "upex-galaxy/agentic-qa-boilerplate",
+  "templateCommit": "",
+  "perComponentCommit": {},
+  "syncedComponents": [],
+  "ignoreFileSync": {
+    ".prettierignore": {
+      "lastSyncedSha": "1e3f9500969ad5ea6ac33eb186773d0daf90633d",
+      "appendedLines": [
+        ".claude/worktrees/"
+      ]
+    }
+  },
+  "packageJsonSync": {
+    "package.json": {
+      "scripts": {
+        "lastSyncedSha": "f06c50d56ebaa88567056a7dba3a01b6158880a6",
+        "appliedKeys": [
+          "vars:env:check"
+        ]
+      },
+      "devDependencies": {
+        "lastSyncedSha": "f06c50d56ebaa88567056a7dba3a01b6158880a6",
+        "appliedKeys": []
+      }
+    }
+  },
+  "cliVersion": "7.0",
+  "lastSyncedAt": "2026-05-31T16:17:44.085Z",
+  "variableSystemVersion": 1
+}
