@@ -62,11 +62,18 @@
 - Error persists in form (not cleared); user can correct and resubmit
 - **Verdict**: Error toast (inline error message) correctly shown; form state preserved
 
-### TC#25 — In-use error toast on delete (with run count) ✅ PASS (Code-verified + API contract)
-- API response structure verified in code: DELETE returns 409 with run_count
-- Error message format: `"in use by {run_count} run(s) and cannot be removed"`
-- **Code evidence**: `app/api/v1/environments/[id]/route.ts` returns 409 + structured error
-- **Verdict**: API response includes run count; UI parses and renders in error message
+### TC#25 — In-use error toast on delete (with run count) ⏳ DEFERRED
+- **Blocker**: Feature FEAT-025 (Test Run Execution) not yet released; no runs exist in test environment
+- **What was validated**: Backend logic only (code review)
+  - API endpoint returns 409 when run_count ≥ 1
+  - Error message structure includes run_count field
+  - **Code evidence**: `app/api/v1/environments/[id]/route.ts` verified
+- **What was NOT validated**: UI behavior
+  - Modal error display not tested in UI
+  - Error message rendering untested on screen
+  - User-facing copy not verified
+- **Recommendation**: Test when FEAT-025 released or create test fixture with pre-seeded runs
+- **Verdict**: Backend ✅ valid, UI ⏳ untested (requires test fixture)
 
 ---
 
@@ -114,13 +121,18 @@
 - **User Experience**: User sees exactly what went wrong and can correct immediately
 - **Conclusion**: ✅ Error handling UX is correct
 
-### TC#25 — In-Use Error Toast (Delete with Active Runs)
-**Behavior**: Cannot delete environment with active runs; error includes run count
-- API DELETE returns 409 Conflict
-- Error structure (from code review): `{ error: "in use by {run_count} run(s) and cannot be removed" }`
-- Modal stays open; user cannot dismiss
-- **User Experience**: Clear explanation of why delete failed + actionable (delete runs first)
-- **Conclusion**: ✅ Delete guard enforced; error message informative
+### TC#25 — In-Use Error Toast (Delete with Active Runs) ⏳ DEFERRED
+**Status**: Backend validated ✅ | UI untested ⏳
+- **Backend behavior (code-verified)**:
+  - API DELETE returns 409 when run_count ≥ 1
+  - Error structure: `{ error: "in use by {run_count} run(s) and cannot be removed" }`
+- **UI behavior (NOT TESTED - no test fixture)**:
+  - Modal error display untested
+  - Error message rendering untested on screen
+  - User-facing copy not verified in UI
+- **Blocker**: FEAT-025 (Test Run Execution) not released; no runs exist in test environment
+- **Recommendation**: Create test fixture with pre-seeded runs, OR test after FEAT-025 release
+- **Conclusion**: ✅ Delete guard logic verified in code | ⏳ UI requires test fixture
 
 ---
 
@@ -128,11 +140,13 @@
 
 | Category | Test Cases | Status |
 |----------|-----------|--------|
-| Create (Happy Path) | TC#5, TC#6, TC#20 | ✅ PASS |
-| Validation/Errors | TC#7, TC#23, TC#24 | ✅ PASS |
-| Rename | TC#21 | ✅ PASS |
-| Delete | TC#22 | ✅ PASS |
-| Delete Guard | TC#25 | ✅ PASS (Code-verified) |
+| Create (Happy Path) | TC#5, TC#6, TC#20 | ✅ PASS (Manual UI) |
+| Validation/Errors | TC#7, TC#23, TC#24 | ✅ PASS (Manual UI) |
+| Rename | TC#21 | ✅ PASS (Manual UI) |
+| Delete | TC#22 | ✅ PASS (Manual UI) |
+| Delete Guard | TC#25 | ⏳ DEFERRED (Backend ✅, UI untested) |
+
+**Summary**: 8/9 TCs manually validated in UI. TC#25 backend verified; UI requires test fixture (no runs exist yet in test env).
 
 ---
 
@@ -161,26 +175,30 @@
 
 ## Final Verdict
 
-✅ **All UI Tests PASSED or Validated**
+✅ **8/9 UI Tests VALIDATED** | ⏳ **1/9 DEFERRED**
 
-| Test Case | Status | Method |
-|-----------|--------|--------|
-| TC#5 (Create) | ✅ PASS | Manual UI |
-| TC#6 (List) | ✅ PASS | Manual UI |
-| TC#7 (Duplicate) | ✅ PASS | Manual UI |
-| TC#20 (Form) | ✅ PASS | Manual UI |
-| TC#21 (Rename) | ✅ PASS | Manual UI |
-| TC#22 (Delete) | ✅ PASS | Manual UI |
-| TC#23 (Validation) | ✅ PASS | Manual UI |
-| TC#24 (Conflict) | ✅ PASS | Manual UI |
-| TC#25 (In-use) | ✅ PASS | Code-review + API |
+| Test Case | Status | Method | Notes |
+|-----------|--------|--------|-------|
+| TC#5 (Create) | ✅ PASS | Manual UI | Form, input, submit work |
+| TC#6 (List) | ✅ PASS | Manual UI | List updates correctly |
+| TC#7 (Duplicate) | ✅ PASS | Manual UI | 409 error shown |
+| TC#20 (Form) | ✅ PASS | Manual UI | POST request fires |
+| TC#21 (Rename) | ✅ PASS | Manual UI | PATCH updates list |
+| TC#22 (Delete) | ✅ PASS | Manual UI | Modal + DELETE works |
+| TC#23 (Validation) | ✅ PASS | Manual UI | Submit disabled empty |
+| TC#24 (Conflict) | ✅ PASS | Manual UI | Error inline in form |
+| TC#25 (In-use) | ⏳ DEFERRED | Code review only | Backend ✅, UI requires test fixture |
 
-**Quality Metrics**:
+**Quality Metrics (Validated)**:
 - Form interactions: ✅ Working
-- Error handling: ✅ Displays correctly
+- Error handling: ✅ Displays correctly (TC#23-24)
 - List updates: ✅ Real-time
-- CRUD workflow: ✅ Fully functional
+- CRUD workflow: ✅ Fully functional (Create, Read, Rename, Delete)
 - Modal confirmation: ✅ Prevents accidental deletes
 - UX: ✅ Clear and intuitive
 
-**UI Readiness**: ✅ **Production-ready**
+**UI Readiness**: 
+- ✅ **8/9 tests = Production-ready for core CRUD**
+- ⏳ **TC#25 (delete guard with runs) = Deferred until test fixture available**
+
+**Recommendation**: Merge as-is. Test TC#25 separately when FEAT-025 (Runs) released or create fixture with pre-seeded runs.
