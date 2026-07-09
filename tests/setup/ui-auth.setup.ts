@@ -26,19 +26,17 @@ const apiStateFile = config.auth.apiStatePath;
 /**
  * UI Authentication Setup
  *
- * 1. Navigates to login page (via LoginPage.goto())
- * 2. Sets up response interception BEFORE triggering login
- * 3. Uses LoginPage.loginSuccessfully() ATC (triggers login + token fetch)
- * 4. Captures JWT token from intercepted response
- * 5. Saves storageState (cookies) for UI tests
- * 6. Saves api-state (token) for API integration
+ * Uses direct API call to /api/v1/auth/signin (headless auth)
+ * instead of UI magic-link flow for speed + reliability.
+ *
+ * 1. POSTs credentials to /api/v1/auth/signin
+ * 2. Captures JWT token + PAT from response
+ * 3. Saves cookies for UI tests
+ * 4. Saves api-state (token) for API integration
  */
-setup('UI Setup: authenticate via UI', async ({ ui, page }) => {
-  console.log('[UI Setup] Starting UI authentication...');
-  console.log('[UI Setup] Target: /login');
-
-  // Navigate to login page (outside of ATC)
-  await ui.login.goto();
+setup('UI Setup: authenticate via UI', async ({ page }) => {
+  console.log('[UI Setup] Starting API authentication...');
+  console.log('[UI Setup] Target: /api/v1/auth/signin');
 
   // Credentials for login
   const credentials = {
@@ -46,22 +44,18 @@ setup('UI Setup: authenticate via UI', async ({ ui, page }) => {
     password: config.testUser.password,
   };
 
-  // Set up response interception BEFORE triggering login
-  // The login UI calls /api/auth/login after successful NextAuth sign-in
-  const tokenPromise = page.waitForResponse(
-    resp => resp.url().includes(config.auth.tokenEndpoint)
-      && resp.request().method() === 'POST'
-      && resp.status() === 200,
-    { timeout: 30000 },
-  );
+  // Direct API call (faster than UI magic-link flow)
+  // Use config.baseUrl/v1 to ensure full URL (not relative path)
+  const apiSigninUrl = `${config.baseUrl}/api/v1/auth/signin`;
+  const response = await page.request.post(apiSigninUrl, {
+    data: credentials,
+  });
 
-  // Use LoginPage ATC - triggers NextAuth sign-in + token fetch
-  await ui.login.loginSuccessfully(credentials);
-  console.log('[UI Setup] UI login successful');
+  if (!response.ok()) {
+    const errorBody = await response.text();
+    throw new Error(`Auth failed (${response.status()}): ${errorBody}`);
+  }
 
-  // Capture JWT token from intercepted response
-  console.log('[UI Setup] Intercepting token from login response...');
-  const response = await tokenPromise;
   const tokenData = (await response.json()) as TokenResponse;
 
   // Attach to Allure for debugging
@@ -77,7 +71,7 @@ setup('UI Setup: authenticate via UI', async ({ ui, page }) => {
     throw new Error('Token response missing access_token');
   }
 
-  console.log('[UI Setup] Token intercepted successfully');
+  console.log('[UI Setup] API authentication successful');
 
   // Save storage state (cookies + localStorage) for UI tests
   await page.context().storageState({ path: storageStateFile });
@@ -86,16 +80,16 @@ setup('UI Setup: authenticate via UI', async ({ ui, page }) => {
   // Save the token for API calls within E2E tests
   const apiState: ApiState = {
     token: tokenData.access_token,
-    tokenType: tokenData.token_type,
+    tokenType: tokenData.token_type || 'Bearer',
     expiresIn: tokenData.expires_in,
-    refreshToken: tokenData.refresh_token ?? null,
+    refreshToken: tokenData.refresh_token || null,
     source: 'ui-login',
     createdAt: new Date().toISOString(),
   };
 
   writeFileSync(apiStateFile, JSON.stringify(apiState, null, 2));
-  console.log(`[UI Setup] API token saved to ${apiStateFile}`);
+  console.log(`[UI Setup] API token (PAT) saved to ${apiStateFile}`);
 
   console.log('[UI Setup] Authentication successful');
-  console.log(`[UI Setup] Current URL: ${page.url()}`);
+  console.log(`[UI Setup] Session established for ${credentials.email}`);
 });

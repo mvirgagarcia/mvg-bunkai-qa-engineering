@@ -2,16 +2,14 @@
  * KATA Architecture - Layer 3: Login Page Component
  *
  * UI component for authentication via the login page.
- * Handles login flows for E2E tests.
+ * Handles magic-link flows for E2E tests.
  *
  * TODO: Replace 'PROJ' in @atc IDs with your Jira project key (e.g., @atc('UPEX-101'))
  *
- * Page: /login (UPEX Dojo)
+ * Page: /login (Bunkai TMS)
  * Locators (data-testid):
- * - Email: [data-testid="login-email-input"]
- * - Password: [data-testid="login-password-input"]
- * - Submit: [data-testid="login-submit-button"]
- * - Error: [data-testid="login-error"]
+ * - Email: [data-testid="login-email"]
+ * - Submit: [data-testid="login-submit"]
  */
 
 import type { TestContextOptions } from '@TestContext';
@@ -26,11 +24,10 @@ import { atc, step } from '@utils/decorators';
 
 /**
  * Login credentials for UI authentication
- * Note: UPEX Dojo uses 'email' field instead of 'username'
+ * Note: Bunkai TMS uses magic-link (email only)
  */
 export interface LoginCredentials {
   email: string
-  password: string
 }
 
 // ============================================
@@ -48,12 +45,11 @@ export class LoginPage extends UiBase {
 
   /**
    * Fill login form and submit
-   * Helper that combines fill + submit actions
+   * Helper that combines fill + submit actions (magic-link flow)
    */
   private async fillAndSubmitLoginForm(credentials: LoginCredentials): Promise<void> {
-    await this.page.locator('[data-testid="login-email-input"]').fill(credentials.email);
-    await this.page.locator('[data-testid="login-password-input"]').fill(credentials.password);
-    await this.page.locator('[data-testid="login-submit-button"]').click();
+    await this.page.locator('[data-testid="login-email"]').fill(credentials.email);
+    await this.page.locator('[data-testid="login-submit"]').click();
   }
 
   // ============================================
@@ -77,9 +73,9 @@ export class LoginPage extends UiBase {
    * ATC: Login with valid credentials - expects success
    *
    * IMPORTANT: Call goto() before this ATC.
-   * Fills credentials, submits, and verifies redirect away from login page.
+   * Fills email, submits, and verifies redirect away from login page.
    *
-   * @param credentials - Email and password
+   * @param credentials - Email (magic-link flow)
    */
   @atc('PROJ-101')
   async loginSuccessfully(credentials: LoginCredentials): Promise<void> {
@@ -96,13 +92,13 @@ export class LoginPage extends UiBase {
    * IMPORTANT: Call goto() before this ATC.
    * Fills invalid credentials, submits, and verifies error message.
    *
-   * @param credentials - Invalid email or password
+   * @param credentials - Invalid email
    */
   @atc('PROJ-102')
   async loginWithInvalidCredentials(credentials: LoginCredentials): Promise<void> {
     await this.fillAndSubmitLoginForm(credentials);
 
-    // Fixed assertion - error should be visible (UPEX Dojo uses data-testid="login-error")
+    // Error should be visible (Bunkai TMS uses data-testid="login-error")
     const errorIndicator = this.page.locator('[data-testid="login-error"]');
     await expect(errorIndicator).toBeVisible({ timeout: 5000 });
     await expect(this.page).toHaveURL(/.*\/login.*/);

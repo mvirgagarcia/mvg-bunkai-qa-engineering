@@ -80,3 +80,11 @@ docs/mcp/
 # ===== Synced from boilerplate v7.0 =====
 # ----- 2026-05-31 (sync) -----
 .claude/worktrees/
+
+# ----- 2026-06-04 (sync) -----
+api/openapi*
+api/.openapi-config.json
+.playwright-mcp/
+
+# ----- 2026-06-06 (sync) -----
+.backups/

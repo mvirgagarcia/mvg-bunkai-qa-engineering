@@ -1,138 +1,299 @@
-# Product Backlog Items (PBI)
+# Product Backlog Items (PBI) — Backlog Access Recipe
 
-This directory contains User Stories, module-level test planning, and automation tracking for the testing project.
+| Field | Value |
+|---|---|
+| **PM Tool** | Jira Cloud |
+| **Project Key** | BK |
+| **Access Method** | `/acli` CLI (primary) · Atlassian MCP (fallback) |
+| **Last Updated** | 2026-05-31 |
 
-## Structure
+---
 
-```
-PBI/
-├── README.md                           # This file
-├── templates/                          # Templates for per-module structure
-│   ├── module-context-template.md      # Module technical context
-│   ├── ROADMAP-template.md             # Module roadmap with phases
-│   └── PROGRESS-template.md            # Cross-session progress tracker
-│
-├── ── PER-STORY (simple) ────────────
-├── {TICKET-ID}-feature-name.md         # User Story with ticket ID
-│
-├── ── PER-MODULE (complex) ──────────
-├── {module-name}/                      # Module-level testing folder
-│   ├── {module}-test-plan.md           # Master module test plan
-│   ├── TK-{id}-{feature}/             # Per-ticket context
-│   │   ├── context.md                  # AC summary, code locations, test data
-│   │   └── evidence/                   # Screenshots, logs (gitignored)
-│   └── test-specs/                     # Unified test specifications + implementation
-│       ├── ROADMAP.md                  # Roadmap with phases + dependencies
-│       ├── PROGRESS.md                 # Session-by-session progress tracker
-│       └── {PREFIX}-T01-{name}/        # Ticket directory (one per functional area)
-│           ├── spec.md                 # Business-level: TCs in Gherkin
-│           ├── implementation-plan.md  # Technical-level: KATA components, fixtures
-│           └── atc/                    # Individual ATC specs (for complex ATCs)
-│               └── {TICKET-ID}-{name}.md
-│
-├── ── REAL EXAMPLE ──────────────────
-└── auth/                               # Complete example: Auth module
-    ├── auth-test-plan.md
-    └── test-specs/
-        ├── ROADMAP.md
-        ├── PROGRESS.md
-        └── AUTH-T01-user-session-validation/
-            ├── spec.md
-            ├── implementation-plan.md
-            └── atc/
-                ├── UPEX-101-authenticate-successfully.md
-                └── UPEX-105-login-successfully.md
+## Backlog Location
+
+| Field | Value |
+|---|---|
+| **URL** | https://upexgalaxy67.atlassian.net/ |
+| **Project Key** | BK |
+| **Workflow Scheme** | UPEX PROGRAM Workflow Scheme |
+| **Board Name/Type** | Discovery Gap — board name not verified (see §Discovery Gaps) |
+
+---
+
+## Access Configuration
+
+### Primary: `/acli` CLI Skill
+
+Load the `/acli` skill before running any Jira commands.
+
+```bash
+# Verify access
+acli jira issue list --project BK --jql "project = BK ORDER BY updated DESC" --limit 5
 ```
 
-## When to Use Each Structure
+Setup steps:
+1. Ensure `.env` contains all three required credential vars (see §Credentials)
+2. Load `/acli` skill in the AI session
+3. Verify with `acli jira issue list --project BK`
 
-| Structure | When | Example |
-|-----------|------|---------|
-| **Per-Story** | Single story, few TCs, no cross-session tracking needed | Bug fix, small feature |
-| **Per-Module** | Module with multiple tickets, many TCs, multi-session automation | Dashboard, checkout flow, admin panel |
+### Fallback: Atlassian MCP
 
-## Templates
+Used when `acli` is unavailable or when rich schema-aware queries are needed.
+Configured via `.mcp.json` — consumes the same `ATLASSIAN_URL`, `ATLASSIAN_EMAIL`, `ATLASSIAN_API_TOKEN` env vars.
 
-Templates are provided for the per-module structure. Use them as reference when generating your module folder contents.
-
-| Template | Purpose | Copy To |
-|----------|---------|---------|
-| `module-context-template.md` | Technical context: routes, APIs, DB, business rules | `{module}/` |
-| `ROADMAP-template.md` | Roadmap with phases, dependencies, TC counts | `{module}/test-specs/ROADMAP.md` |
-| `PROGRESS-template.md` | Track progress across AI sessions | `{module}/test-specs/PROGRESS.md` |
-
-### Workflow
+### Required env vars
 
 ```
-1. Create module folder: .context/PBI/{module-name}/
-2. Copy templates into the folder structure above
-3. Fill in module-context and roadmap
-4. At the start of each AI session, invoke `/test-automation` (or describe what you want --
-   the skill auto-triggers from natural language). It reads PROGRESS.md + ROADMAP.md and
-   resumes work from the right ticket.
-5. AI updates PROGRESS.md at end of each session
+ATLASSIAN_URL=
+ATLASSIAN_EMAIL=
+ATLASSIAN_API_TOKEN=
 ```
 
-## Real Example: Auth Module
+These live in `.env` (never committed). Names are the single source of truth — no `JIRA_*` aliases.
 
-The `auth/` directory contains a complete, real example of the per-module structure applied to the authentication module. Use it as a reference for:
+---
 
-| Document | Path | Purpose |
-|----------|------|---------|
-| Master test plan | `auth/auth-test-plan.md` | How the module was analyzed |
-| Business spec | `auth/test-specs/AUTH-T01-.../spec.md` | TC definitions in Gherkin |
-| Implementation plan | `auth/test-specs/AUTH-T01-.../implementation-plan.md` | KATA components and architecture |
-| ATC spec (API) | `auth/test-specs/AUTH-T01-.../atc/UPEX-101-*.md` | Individual ATC contract |
-| ATC spec (UI) | `auth/test-specs/AUTH-T01-.../atc/UPEX-105-*.md` | Individual ATC contract |
+## Project Structure
 
-## Test Specs: Unified Documentation
+### Issue Types
 
-Each ticket directory in `test-specs/` contains **both** levels of documentation:
+| Issue Type | Jira ID | Workflow | Role |
+|---|---|---|---|
+| Story | 10005 | UPEX Feature (US) Workflow | User story / feature work item |
+| Bug | 10107 | UPEX BUG/DEFECT LIFE CYCLE | Defect report |
+| Test | 10100 | UPEX Test (TC) Workflow | Test case (used by TMS / Xray) |
+| Epic | — | — | Feature theme / module container |
 
-| File | Level | Created By | When |
-|------|-------|------------|------|
-| `spec.md` | Business (QUE testear) | Test-Manager Agent | During test planning |
-| `implementation-plan.md` | Technical (COMO implementar) | Test-Automation Agent | Before coding |
-| `atc/*.md` | ATC contract (method spec) | Test-Automation Agent | For complex ATCs only |
+> Note: Epic, Task, and Sub-task presence not verified from create-meta — see §Discovery Gaps.
 
-## Per-Story File Format
+### Story Workflow
 
-Each PBI should follow this format:
+```mermaid
+stateDiagram-v2
+    [*] --> Backlog : Create
 
-```markdown
-# {TICKET-ID} User Story Title
+    Backlog --> Shift_Left_QA : analyze
+    Backlog --> Estimation : ready_to_estimate
+    Backlog --> ABORTED : aborted
 
-## User Story
-As a [role]
-I want [action]
-So that [benefit]
+    Shift_Left_QA --> Estimation : estimate
+    Shift_Left_QA --> Backlog : back
 
-## Acceptance Criteria
-- [ ] AC1: Criteria description
-- [ ] AC2: Criteria description
+    Estimation --> Ready_For_Dev : estimated_and_ready_to_work
+    Estimation --> Backlog : back_from_estimation
+    Estimation --> Shift_Left_QA : needs_quality
 
-## Test Scenarios
-| ID | Scenario | Expected Result | Priority |
-|----|----------|-----------------|----------|
-| TS-001 | ... | ... | High |
+    Ready_For_Dev --> In_Progress : start_working
 
-## Notes
-Additional information relevant for testing.
+    In_Progress --> In_Review : pull_request
+    In_Progress --> Ready_For_QA : pushed
+    In_Progress --> Ready_For_Dev : back_from_in_progress
+
+    In_Review --> Ready_For_QA : deployed
+
+    Ready_For_QA --> In_Test : start_testing
+
+    In_Test --> QA_Approved : qa_sign_off
+    In_Test --> BLOCKED : defect_reported
+    In_Test --> Ready_For_QA : back_from_in_test
+
+    BLOCKED --> In_Progress : fix_defect
+    BLOCKED --> In_Test : back_from_blocked
+
+    QA_Approved --> Ready_For_Release : include_in_release
+    QA_Approved --> In_Test : back_from_qa_approved
+
+    Ready_For_Release --> Deployed_To_Production : released
+
+    Deployed_To_Production --> [*]
+    QA_Approved --> [*]
+    ABORTED --> Ready_For_Dev : recover
+    ABORTED --> [*]
 ```
 
-## Usage with AI
+### Bug Workflow
 
-Files in this directory are used as context by the AI to:
-- Generate test cases based on ACs
-- Create page object components
-- Design precondition flows
-- Document test scenarios
-- Track automation progress across sessions
-- Resume work without losing context
+```mermaid
+stateDiagram-v2
+    [*] --> Open : Create / Re-Open
 
-## Conventions
+    Open --> In_Progress : start_fixing
+    Open --> Cannot_Reproduce : is_cnr
+    Open --> Deferred : defer
+    Open --> Duplicated : is_duplicated
+    Open --> REJECTED : is_wad
+    Open --> Enhancement : is_not_a_bug
+    Open --> ABORTED : aborted
 
-- **Prefix**: Use your Jira project key as prefix — `{{PROJECT_KEY}}-` (declared in `.agents/project.yaml`).
-- **Names**: Use kebab-case for file names
-- **Status**: Mark ACs as `[x]` when covered by tests
-- **Evidence**: Add `evidence/` to `.gitignore` (screenshots, logs are ephemeral)
+    In_Progress --> In_Review : pull_request
+    In_Progress --> Ready_For_QA : hard_pushed
+
+    In_Review --> Ready_For_QA : fixed_and_deployed
+
+    Ready_For_QA --> Closed : retest_passed
+    Closed --> Ready_For_QA : back
+
+    Deferred --> In_Progress : resume_fix
+
+    Closed --> [*]
+    Cannot_Reproduce --> [*]
+    Duplicated --> [*]
+    REJECTED --> [*]
+    Enhancement --> [*]
+    ABORTED --> [*]
+```
+
+### Test Case Workflow
+
+```mermaid
+stateDiagram-v2
+    [*] --> Draft : Create
+
+    Draft --> In_Design : start_design
+    Draft --> In_Review : automation_review_from_draft
+
+    In_Design --> READY : ready_to_run
+    In_Design --> Draft : back_from_in_design
+
+    READY --> In_Review : automation_review_from_ready
+    READY --> MANUAL : for_manual
+    READY --> In_Design : back_from_ready
+
+    In_Review --> Candidate : approve_to_automate
+    In_Review --> READY : back_from_in_review
+
+    Candidate --> In_Automation : start_automation
+    Candidate --> MANUAL : manual_execution_from_candidate
+    Candidate --> In_Review : back_from_candidate
+
+    In_Automation --> Pull_Request : create_pr
+    In_Automation --> Candidate : back_from_in_automation
+
+    Pull_Request --> AUTOMATED : merged
+    Pull_Request --> In_Automation : back_from_pull_request
+
+    AUTOMATED --> MANUAL : manual_execution_from_automated
+    AUTOMATED --> Pull_Request : fix
+    MANUAL --> In_Review : automation_review_from_manual
+    MANUAL --> Candidate : for_automation
+    MANUAL --> AUTOMATED : automated_from_manual
+
+    AUTOMATED --> [*]
+    MANUAL --> [*]
+    DEPRECATED --> Draft : recover
+    note right of DEPRECATED : Global transition from any state
+```
+
+### Sprint Cadence
+
+Discovery Gap — sprint length, active sprint name, and cadence not verified from files. See §Discovery Gaps.
+
+---
+
+## Common Queries (JQL)
+
+### 1. Current sprint ready for QA
+
+```jql
+project = BK AND sprint in openSprints() AND status = "Ready For QA" ORDER BY priority DESC
+```
+
+**acli equivalent:**
+```bash
+acli jira issue list --project BK --jql 'project = BK AND sprint in openSprints() AND status = "Ready For QA"'
+```
+
+### 2. All open bugs
+
+```jql
+project = BK AND issuetype = Bug AND resolution = Unresolved ORDER BY priority DESC
+```
+
+**acli equivalent:**
+```bash
+acli jira issue list --project BK --jql 'project = BK AND issuetype = Bug AND resolution = Unresolved ORDER BY priority DESC'
+```
+
+### 3. My testing tasks
+
+```jql
+project = BK AND status = "In Test" AND assignee = currentUser()
+```
+
+**acli equivalent:**
+```bash
+acli jira issue list --project BK --jql 'project = BK AND status = "In Test" AND assignee = currentUser()'
+```
+
+### 4. Recently updated
+
+```jql
+project = BK AND updated >= -1d ORDER BY updated DESC
+```
+
+**acli equivalent:**
+```bash
+acli jira issue list --project BK --jql 'project = BK AND updated >= -1d ORDER BY updated DESC'
+```
+
+---
+
+## Integration with KATA
+
+| Trigger | Action | Local Output |
+|---|---|---|
+| `/sprint-testing` starts | Fetch ticket by key via `acli jira issue get BK-XXX` | `.context/PBI/epics/EPIC-BK-*/stories/STORY-BK-XXX-*/` |
+| Bug triage | Query open bugs JQL above | Review in Jira; file via `acli jira issue create` |
+| `/test-documentation` | Fetch story + linked TCs | Update `acceptance_test_plan` / `acceptance_test_results` custom fields |
+| `/test-automation` resume | Read PROGRESS.md + ROADMAP.md | No Jira fetch needed — local cache used |
+| Automation handoff | Transition TC to `Candidate` or `In Automation` | `acli jira issue transition BK-XXX "start automation"` |
+| Regression run | Query sprint stories in `QA Approved` or `In Test` | Cross-reference with Allure report |
+
+### Local Storage Layout
+
+```
+.context/PBI/
++-- README.md                         permanent -- backlog access recipe + common queries (this file)
++-- templates/                        permanent -- format-reference guides only (NOT per-ticket targets)
+|   +-- user-story.md                 format reference: role/action/benefit + AC skeleton
+|   +-- bug-report.md                 format reference: severity guide + evidence block
+|   `-- test-plan.md                  format reference: AC->TC mapping + scope + risks
+`-- epics/                            synced from Jira by /sprint-testing -- read-only cache, NOT created here
+    `-- EPIC-BK-100-<slug>/
+        `-- stories/
+            `-- STORY-BK-123-<slug>/
+                `-- ...               materialized by `bun run jira:sync-issues get <KEY> --include-comments`
+```
+
+> The `epics/` tree is synced from Jira on demand by `/sprint-testing` (Module = Epic, 1:1).
+> It is a read-only cache — Jira is the source of truth. This README and the `templates/` files
+> are the ONLY Phase 4 outputs. Per-ticket content is never authored here.
+
+---
+
+## Credentials
+
+Required env vars in `.env` (never commit this file):
+
+```
+ATLASSIAN_URL=          # e.g. https://upexgalaxy67.atlassian.net/
+ATLASSIAN_EMAIL=        # Atlassian account email
+ATLASSIAN_API_TOKEN=    # Generated at https://id.atlassian.com/manage-profile/security/api-tokens
+```
+
+**Rules:**
+- No `JIRA_*` aliases. These three keys are the single source of truth.
+- MCP, acli, xray-cli, and sync scripts all consume the same vars.
+- If a credential error occurs mid-session, stop immediately, fix `.env`, and restart the agent session (env is cached at MCP-spawn time — no mid-session refresh).
+
+---
+
+## Discovery Gaps
+
+| Gap | Impact | How to Resolve |
+|---|---|---|
+| Board name and type (Scrum vs Kanban) not verified | Sprint queries may need adjustment if board is Kanban | Run `acli jira board list --project BK` once credentials are active |
+| Sprint cadence (length, current sprint name) not verified | Cannot confirm sprint naming convention | Check Jira board + run `acli jira sprint list --board <BOARD_ID>` |
+| Epic and Task issue type IDs not confirmed from create-meta | Epic Link field usage may differ | Run `acli jira issue createmeta --project BK` to enumerate all types |
+| Sub-task usage not confirmed | Sub-task hierarchy may exist under Stories | Verify by listing recent story children in Jira |
+| Required custom fields for ticket creation not fully verified | CLI issue creation may fail without required fields | Run `bun run jira:check` to validate against `jira-required.yaml` |

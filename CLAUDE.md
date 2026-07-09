@@ -380,3 +380,53 @@ Self-check after every task: *did I make decision, fix bug, learn something non-
 ---
 
 *AI persistent memory. Update when behaviors / skills / rules change.*
+
+---
+
+## Project Assessment (Phase 1)
+
+Assessment Date: 2026-05-31
+
+### Testing Maturity: 0/4
+- Current state: None
+- Test files: 0 (confirmed — `find <repo> -name "*.test.*" -o -name "*.spec.*" | wc -l` → 0)
+- Frameworks: None configured (no Jest, Vitest, Playwright in devDependencies)
+- Coverage: Unknown — no test runner configured
+
+### Documentation State: Good
+- README: yes — comprehensive setup + prerequisites guide (`README.md`)
+- API docs: yes — Scalar UI at `/api/docs`, OpenAPI spec at `/api/openapi` (auto-generated via `@asteasolutions/zod-to-openapi`)
+- Architecture: yes — `CONTEXT.md` (Context Engineering map) + `DESIGN.md` (design system spec) + migration comments in `supabase/migrations/`
+- Setup guide: yes — `README.md` covers setup, `.env.example` covers all required env vars
+
+### Code Quality
+- [x] ESLint: configured — `eslint.config.js` present, `@antfu/eslint-config` + `@next/eslint-plugin-next`
+- [x] Prettier: configured — `.prettierignore` referenced in `package.json` scripts
+- [x] TypeScript: strict — `tsconfig.json` has `"strict": true`; `bun run typecheck` script present
+- [x] Pre-commit hooks: configured — Husky ^9.1.7 + lint-staged ^16.2.7 (ESLint fix on `.ts/.tsx`, Prettier on config/markup files)
+
+### CI/CD Maturity: None
+- No `.github/workflows/` directory found in the target repo
+- No automated build, lint, test, or deploy pipeline
+
+### Identified Risks
+
+| Risk | Severity | Mitigation |
+|------|----------|------------|
+| No tests at all (0 test files) | HIGH | QA engineering goal — Phase 4 of discovery → `/test-automation` |
+| No CI/CD pipeline | MEDIUM | Add GitHub Actions workflow; blocking for automated regression |
+| No test runner in devDependencies | HIGH | Must add Playwright + test dependencies before `/test-automation` can run |
+| Auth is magic-link (passwordless) — headless testing requires PAT bootstrap | MEDIUM | Headless path documented in `app/qa/qa-config.ts`; `POST /api/v1/auth/signup` provisions a password-based QA bot |
+| Secret tables split pattern (0011/0012 migrations) — QA roles cannot read `access_token_secrets`, `magic_link_token_secrets`, `workspace_invite_secrets` | LOW | By design; QA accesses only public-facing columns; documented in `app/qa/qa-config.ts` db.revokedColumns |
+
+### Phase Prioritization
+
+- Phase 1: Normal — Constitution complete; all 4 outputs generated
+- Phase 2: Normal — PRD/SRS can proceed; DESIGN.md and CONTEXT.md provide strong architectural context
+- Phase 3: Normal — Infrastructure documented; DBHub MCP configured but needs `DBHUB_*` env vars
+- Phase 4: Extended — No tests exist; KATA framework setup + Playwright installation required before any automation
+
+### Blockers
+- [ ] HIGH: Zero test files — must install Playwright + configure test runner before Phase 4 (run `/adapt-framework` after Phase 4 discovery)
+- [ ] MEDIUM: No CI/CD — GitHub Actions workflow needed for automated regression (`/regression-testing` will have no CI target)
+- [ ] INFO: `DBHUB_*` env vars must be populated from BK-29 before DBHub MCP can connect

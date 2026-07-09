@@ -26,6 +26,15 @@
  *                      Validating that those declared slugs actually exist in
  *                      the user's Jira (`.agents/jira-fields.json`) is owned by
  *                      `bun run jira:check`.
+ *   4a. {{jira.link_types.<slug>}} and {{jira.link_types.<slug>.<sub>}} —
+ *                      link-type reference. <slug> must resolve to a key under
+ *                      `link_types.required:` or `link_types.optional:` in
+ *                      `.agents/jira-required.yaml`. The optional <sub> segment
+ *                      (name / outward / inward / fallback) must be in the
+ *                      allowed sub-field set. Validating that those declared
+ *                      slugs actually resolve in the workspace catalog
+ *                      (`.agents/jira-link-types.json`) is owned by
+ *                      `bun run jira:check`.
  *
  * Exit code: 0 if no ERRORs, 1 otherwise. WARNs do not affect exit code.
  */
@@ -61,6 +70,7 @@ const SKIP_DIRS = new Set([
   'node_modules',
   '.git',
   'worktrees', // git worktrees under .claude/ are another branch's checkout — not this tree
+  'PBI', // [SYNC] files owned by sync-jira-issues.ts — Jira data cache, never contain {{VAR}} / <<VAR>> / {{jira.*}} syntax. Skipping avoids walking thousands of synced .md files in mature projects.
   '.scratch',
   'tests',
   'api',
@@ -84,6 +94,8 @@ const DOC_META_ALLOWLIST: Array<[string, string]> = [
   ['VAR', 'CLAUDE.md'],
   // §Tool Resolution pseudocode type list: "`{{PROJECT_VAR}}` (from `.agents/project.yaml`)"
   ['PROJECT_VAR', 'CLAUDE.md'],
+  // §3.5 Validate / §Verify checklist: adapt-framework.md documents the {{VAR}} syntax inside vars:check comments
+  ['VAR', 'adapt-framework.md'],
 ];
 
 // -----------------------------------------------------------------------------
@@ -126,6 +138,9 @@ function loadDeclaredVariables(yamlPath: string): DeclaredVars {
   const envCatalog = new Map<string, Set<string>>();
 
   for (const [sectionName, sectionVal] of Object.entries(root)) {
+    // `git_strategy` is read DIRECTLY by the git-flow-master skill — its leaves are NOT
+    // {{VAR}} template variables, so they must not be harvested as declared vars.
+    if (sectionName === 'git_strategy') { continue; }
     if (sectionName === 'environments') {
       // Nested: each child is an environment whose leaves are env-scoped vars.
       if (!sectionVal || typeof sectionVal !== 'object' || Array.isArray(sectionVal)) {
@@ -145,9 +160,13 @@ function loadDeclaredVariables(yamlPath: string): DeclaredVars {
       }
       continue;
     }
-    // Flat section: each child is a flat leaf.
+    // Flat section: each SCALAR child is a flat {{VAR}} leaf. Nested-mapping leaves
+    // (e.g. `qa.qa_epics`) are structured config read DIRECTLY by skills, not {{VAR}}
+    // template variables, so they are NOT harvested as declared vars (same rationale
+    // as the `git_strategy` carve-out above).
     if (sectionVal && typeof sectionVal === 'object' && !Array.isArray(sectionVal)) {
-      for (const leafKey of Object.keys(sectionVal as Record<string, unknown>)) {
+      for (const [leafKey, leafVal] of Object.entries(sectionVal as Record<string, unknown>)) {
+        if (leafVal !== null && typeof leafVal === 'object') { continue; }
         flat.add(leafKey.toUpperCase());
       }
     }
@@ -173,6 +192,8 @@ interface ManifestSlugs {
   unmapped: number
   /** `work_types.<slug>` map. Empty if the manifest has no `work_types:` section. */
   workTypes: Map<string, WorkTypeManifestEntry>
+  /** `link_types.required.*` + `link_types.optional.*` slugs. Empty if no `link_types:` section. */
+  linkTypes: Set<string>
 }
 
 /**
@@ -214,6 +235,11 @@ function loadManifestSlugs(yamlPath: string): ManifestSlugs {
     ...Object.keys(unmapped),
   ]);
 
+  const linkTypesRaw = (root.link_types ?? {}) as Record<string, unknown>;
+  const ltReq = (linkTypesRaw.required ?? {}) as Record<string, unknown>;
+  const ltOpt = (linkTypesRaw.optional ?? {}) as Record<string, unknown>;
+  const linkTypes = new Set<string>([...Object.keys(ltReq), ...Object.keys(ltOpt)]);
+
   const workTypes = parseManifestWorkTypes(text);
 
   return {
@@ -222,6 +248,7 @@ function loadManifestSlugs(yamlPath: string): ManifestSlugs {
     optional: Object.keys(optional).length,
     unmapped: Object.keys(unmapped).length,
     workTypes,
+    linkTypes,
   };
 }
 
@@ -522,6 +549,17 @@ interface TransitionHit {
   line: number
 }
 
+interface LinkTypeHit {
+  /** Link-type slug (e.g. `test`, `problem_incident`). */
+  slug: string
+  /** Optional sub-field: name / outward / inward / fallback. Undefined for bare refs. */
+  sub?: string
+  /** Verbatim reference (without surrounding `{{` / `}}`). Used in error messages. */
+  raw: string
+  file: string
+  line: number
+}
+
 interface ScanResult {
   projectVarHits: ProjectVarHit[]
   explicitEnvHits: ExplicitEnvHit[]
@@ -531,6 +569,7 @@ interface ScanResult {
   workTypeHits: WorkTypeHit[]
   statusHits: StatusHit[]
   transitionHits: TransitionHit[]
+  linkTypeHits: LinkTypeHit[]
   metaSkippedCount: number
 }
 
@@ -553,13 +592,24 @@ const JIRA_RE = /\{\{jira\.([a-z_][a-z0-9_]*)(?:\.([a-z_][a-z0-9_]*)(?:\.([a-z_]
 const JIRA_WORK_TYPE_RE = /\{\{jira\.work_type\.([a-z_][a-z0-9_]*)\}\}/g;
 const JIRA_STATUS_RE = /\{\{jira\.status\.([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)(?:\.([a-z_][a-z0-9_]*))?\}\}/g;
 const JIRA_TRANSITION_RE = /\{\{jira\.transition\.([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)(?:\.([a-z_][a-z0-9_]*))?\}\}/g;
+// `{{jira.link_types.<slug>}}` (bare) OR `{{jira.link_types.<slug>.<sub>}}`
+// (sub-field lookup). Anchored on the literal `link_types.` so JIRA_RE never
+// mis-counts it as a custom-field reference (see JIRA_RESERVED_SLUGS).
+const JIRA_LINK_TYPE_RE = /\{\{jira\.link_types\.([a-z_][a-z0-9_]*)(?:\.([a-z_][a-z0-9_]*))?\}\}/g;
 const SESSION_RE = /<<([A-Z_][A-Z0-9_]*)>>/g;
+
+// Valid sub-fields when a {{jira.link_types.<slug>.<sub>}} reference is used.
+// `name` is the workspace label resolved against `.agents/jira-link-types.json`;
+// `outward`/`inward` are the directional phrasings; `fallback` is the slug to
+// degrade to when the workspace lacks the link type. All four are declared per
+// link-type entry in `.agents/jira-required.yaml`.
+const LINK_TYPE_SUBFIELDS = new Set(['name', 'outward', 'inward', 'fallback']);
 
 /**
  * Reserved first-segment slugs that JIRA_RE must NOT count as custom-field
  * references. They belong to the dedicated regexes above.
  */
-const JIRA_RESERVED_SLUGS = new Set(['work_type', 'status', 'transition']);
+const JIRA_RESERVED_SLUGS = new Set(['work_type', 'status', 'transition', 'link_types']);
 
 function isAllowlisted(varName: string, filePath: string): boolean {
   return DOC_META_ALLOWLIST.some(
@@ -576,6 +626,7 @@ function scanFiles(files: string[]): ScanResult {
   const workTypeHits: WorkTypeHit[] = [];
   const statusHits: StatusHit[] = [];
   const transitionHits: TransitionHit[] = [];
+  const linkTypeHits: LinkTypeHit[] = [];
   let metaSkippedCount = 0;
 
   for (const file of files) {
@@ -655,6 +706,22 @@ function scanFiles(files: string[]): ScanResult {
         });
       }
 
+      // --- jira link-type refs (anchored on literal `link_types.`)
+      JIRA_LINK_TYPE_RE.lastIndex = 0;
+      for (;;) {
+        const m = JIRA_LINK_TYPE_RE.exec(line);
+        if (m === null) { break; }
+        const segments = ['jira', 'link_types', m[1]];
+        if (m[2]) { segments.push(m[2]); }
+        linkTypeHits.push({
+          slug: m[1],
+          sub: m[2],
+          raw: segments.join('.'),
+          file,
+          line: i + 1,
+        });
+      }
+
       // --- jira refs (custom-field option-value lookup); skip reserved-slug
       // matches because JIRA_*_RE already counted those above.
       JIRA_RE.lastIndex = 0;
@@ -693,6 +760,7 @@ function scanFiles(files: string[]): ScanResult {
     workTypeHits,
     statusHits,
     transitionHits,
+    linkTypeHits,
     metaSkippedCount,
   };
 }
@@ -809,6 +877,38 @@ function main(): void {
   }
   const invalidJiraHits = jiraIssues;
   const validJiraCount = result.jiraSlugHits.length - invalidJiraHits.length;
+
+  // Link-type reference validation. Two failure modes:
+  //   1. slug not declared under link_types.required: / link_types.optional:
+  //                                                       → UNDECLARED link-type slug
+  //   2. {{jira.link_types.<slug>.<sub>}}: sub not in the allowed set
+  //      (name / outward / inward / fallback)             → UNKNOWN sub-field
+  // Resolving declared slugs against the workspace catalog
+  // (`.agents/jira-link-types.json`) is owned by `bun run jira:check`.
+  interface LinkTypeIssue {
+    kind: 'undeclared-link-type' | 'unknown-link-type-sub'
+    hit: LinkTypeHit
+    detail: string
+  }
+  const linkTypeIssues: LinkTypeIssue[] = [];
+  for (const hit of result.linkTypeHits) {
+    if (!manifest.linkTypes.has(hit.slug)) {
+      linkTypeIssues.push({
+        kind: 'undeclared-link-type',
+        hit,
+        detail: 'not declared under link_types.required: / link_types.optional:',
+      });
+      continue;
+    }
+    if (hit.sub !== undefined && !LINK_TYPE_SUBFIELDS.has(hit.sub)) {
+      linkTypeIssues.push({
+        kind: 'unknown-link-type-sub',
+        hit,
+        detail: `unknown link-type sub-field '${hit.sub}' (allowed: ${[...LINK_TYPE_SUBFIELDS].join(', ')})`,
+      });
+    }
+  }
+  const validLinkTypeCount = result.linkTypeHits.length - linkTypeIssues.length;
 
   // ---------------------------------------------------------------------------
   // Work-type / status / transition validation (PR-B substrate).
@@ -989,7 +1089,7 @@ function main(): void {
 
   const filesWithProjectHits = new Set(result.projectVarHits.map(h => h.file)).size;
 
-  const totalErrors = undeclared.length + invalidExplicitEnv.length + invalidJiraHits.length + workTypeIssues.length;
+  const totalErrors = undeclared.length + invalidExplicitEnv.length + invalidJiraHits.length + workTypeIssues.length + linkTypeIssues.length;
 
   // ----- output -----
   const envList = [...declared.envNames].sort().join(', ') || '(none)';
@@ -1002,7 +1102,7 @@ function main(): void {
     `Declared in project.yaml:        ${declared.flat.size} flat + ${declared.envScoped.size} env-scoped `
     + `(across ${declared.envNames.size} envs: ${envList}) = ${declaredTotal} variables`,
   );
-  console.log(`Declared in jira-required.yaml:  ${manifest.all.size} slugs (${manifest.required} required + ${manifest.optional} optional + ${manifest.unmapped} unmapped) + ${manifest.workTypes.size} work_type(s)`);
+  console.log(`Declared in jira-required.yaml:  ${manifest.all.size} slugs (${manifest.required} required + ${manifest.optional} optional + ${manifest.unmapped} unmapped) + ${manifest.workTypes.size} work_type(s) + ${manifest.linkTypes.size} link_type(s)`);
   console.log(`Catalog jira-fields.json:               ${catalog === null ? 'absent (option-value checks skipped — run `bun run jira:sync-fields`)' : `${Object.keys(catalog).length} fields available for option-value lookup`}`);
   console.log(`Catalog jira-workflows.json:     ${workflows === null ? 'absent (workflow checks skipped — run `bun run jira:sync-workflows`)' : `${Object.keys(workflows).length} work_type(s) available for status/transition lookup`}`);
   console.log('');
@@ -1053,6 +1153,16 @@ function main(): void {
       }
       console.log(`  - ${label}: ${ref} at ${rel}:${issue.line}  (${issue.detail})`);
     }
+    for (const issue of linkTypeIssues) {
+      const rel = relative(REPO_ROOT, issue.hit.file);
+      const ref = `{{${issue.hit.raw}}}`;
+      if (issue.kind === 'undeclared-link-type') {
+        console.log(`  - UNDECLARED: ${ref} at ${rel}:${issue.hit.line}  (${issue.detail})`);
+      }
+      else {
+        console.log(`  - UNKNOWN sub-field: ${ref} at ${rel}:${issue.hit.line}  (${issue.detail})`);
+      }
+    }
   }
   console.log('');
 
@@ -1099,9 +1209,9 @@ function main(): void {
   const validWorkTypeCount = result.workTypeHits.length - invalidWorkTypeRefs;
   const validStatusCount = result.statusHits.length - invalidStatusRefs;
   const validTransitionCount = result.transitionHits.length - invalidTransitionRefs;
-  const totalValidJira = validJiraCount + validWorkTypeCount + validStatusCount + validTransitionCount;
-  const totalInvalidJira = invalidJiraHits.length + workTypeIssues.length;
-  console.log(`  - ${totalValidJira} valid {{jira.*}} references (${optionRefCount} option-value refs, ${cascadingRefCount} cascading, ${validWorkTypeCount} work_type refs, ${validStatusCount} status refs, ${validTransitionCount} transition refs); ${totalInvalidJira} invalid (errors above)`);
+  const totalValidJira = validJiraCount + validWorkTypeCount + validStatusCount + validTransitionCount + validLinkTypeCount;
+  const totalInvalidJira = invalidJiraHits.length + workTypeIssues.length + linkTypeIssues.length;
+  console.log(`  - ${totalValidJira} valid {{jira.*}} references (${optionRefCount} option-value refs, ${cascadingRefCount} cascading, ${validWorkTypeCount} work_type refs, ${validStatusCount} status refs, ${validTransitionCount} transition refs, ${validLinkTypeCount} link_type refs); ${totalInvalidJira} invalid (errors above)`);
   console.log(`  - ${result.metaSkippedCount} documentation meta-references skipped (allowlisted)`);
 
   process.exit(totalErrors > 0 ? 1 : 0);

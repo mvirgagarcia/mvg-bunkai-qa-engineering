@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "generatedAt": "2026-05-21T08:28:54.468Z",
+  "generatedAt": "2026-07-09T22:43:54.561Z",
   "components": {
     "api": [
       {
@@ -69,12 +69,144 @@
           {
             "id": "PROJ-101",
             "method": "loginSuccessfully",
-            "line": 84
+            "line": 80
           },
           {
             "id": "PROJ-102",
             "method": "loginWithInvalidCredentials",
-            "line": 101
+            "line": 97
+          }
+        ]
+      },
+      {
+        "name": "ProjectEnvironmentsPage",
+        "file": "ProjectEnvironmentsPage.ts",
+        "relativePath": "tests/components/ui/ProjectEnvironmentsPage.ts",
+        "atcs": [
+          {
+            "id": "BK-148: TC#1",
+            "method": "validateListIsScoped",
+            "line": 38
+          },
+          {
+            "id": "BK-148: TC#10",
+            "method": "validateRenameSucceeds",
+            "line": 147
+          },
+          {
+            "id": "BK-148: TC#11",
+            "method": "validateRenameDuplicateRejected",
+            "line": 162
+          },
+          {
+            "id": "BK-148: TC#12",
+            "method": "validateRenameCrossProjectAllowed",
+            "line": 177
+          },
+          {
+            "id": "BK-148: TC#13",
+            "method": "validateRenameWhitespaceTrimmed",
+            "line": 204
+          },
+          {
+            "id": "BK-148: TC#14",
+            "method": "validateRenameIdempotent",
+            "line": 224
+          },
+          {
+            "id": "BK-148: TC#15",
+            "method": "validateDeleteSucceedsWithoutRuns",
+            "line": 240
+          },
+          {
+            "id": "BK-148: TC#16",
+            "method": "validateDeleteBlockedWithActiveRun",
+            "line": 254
+          },
+          {
+            "id": "BK-148: TC#17",
+            "method": "validateDeleteBlockedWithMultipleActiveRuns",
+            "line": 266
+          },
+          {
+            "id": "BK-148: TC#18",
+            "method": "validateDeleteSucceedsWithCompletedRuns",
+            "line": 278
+          },
+          {
+            "id": "BK-148: TC#19",
+            "method": "validatePageLoadTime",
+            "line": 294
+          },
+          {
+            "id": "BK-148: TC#2",
+            "method": "validateCrossWorkspaceMutationBlocked",
+            "line": 47
+          },
+          {
+            "id": "BK-148: TC#20",
+            "method": "validateCreateViaUI",
+            "line": 303
+          },
+          {
+            "id": "BK-148: TC#21",
+            "method": "validateRenameViaUI",
+            "line": 313
+          },
+          {
+            "id": "BK-148: TC#22",
+            "method": "validateDeleteViaUI",
+            "line": 328
+          },
+          {
+            "id": "BK-148: TC#23",
+            "method": "validateValidationErrorToastDisplays",
+            "line": 342
+          },
+          {
+            "id": "BK-148: TC#24",
+            "method": "validateConflictErrorToastDisplays",
+            "line": 353
+          },
+          {
+            "id": "BK-148: TC#25",
+            "method": "validateInUseErrorToastDisplays",
+            "line": 365
+          },
+          {
+            "id": "BK-148: TC#3",
+            "method": "validateViewerRoleCannotMutate",
+            "line": 55
+          },
+          {
+            "id": "BK-148: TC#4",
+            "method": "validateCreateNewEnvironmentSucceeds",
+            "line": 65
+          },
+          {
+            "id": "BK-148: TC#5",
+            "method": "validateCreateDuplicateRejected",
+            "line": 75
+          },
+          {
+            "id": "BK-148: TC#6",
+            "method": "validateCrossProjectDuplicationAllowed",
+            "line": 87
+          },
+          {
+            "id": "BK-148: TC#7",
+            "method": "validateWhitespaceTrimmed",
+            "line": 108
+          },
+          {
+            "id": "BK-148: TC#8",
+            "method": "validateEmptyNameRejected",
+            "line": 122
+          },
+          {
+            "id": "BK-148: TC#9",
+            "method": "validateNameLengthLimit",
+            "line": 133
           }
         ]
       }
@@ -82,10 +214,10 @@
   },
   "preconditions": [],
   "summary": {
-    "totalComponents": 4,
-    "totalATCs": 9,
+    "totalComponents": 5,
+    "totalATCs": 34,
     "apiComponents": 2,
-    "uiComponents": 2,
+    "uiComponents": 3,
     "preconditionModules": 0
   }
 }

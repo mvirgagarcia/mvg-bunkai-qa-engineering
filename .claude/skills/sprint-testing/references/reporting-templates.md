@@ -7,12 +7,29 @@ Stage 3 Reporting artifacts for in-sprint QA: ATR Test Report body, bug report t
 This reference is for manual, in-sprint reporting RIGHT NOW. It does NOT cover Stage 4 formal TMS documentation or ROI scoring (see `test-documentation`), Bug Analysis *planning* variant inside an ATP (see `acceptance-test-planning.md`), or automation review artifacts (see `test-automation`).
 
 > **Before publishing ATR / bug-report / QA comment bodies to Jira rich-text fields**, read `../../agentic-qa-core/references/jira-publishing-gotchas.md` — covers the two ADF conversion gotchas (`md-to-adf` mark collision + MCP batched custom-field rejection) that silently fail HTTP 400.
+> **And format for readability** per `../../acli/references/adf-authoring-style.md` — an ATR reads far better as a table (test case → status) with a `[!WARNING]` / `[!ERROR]` panel for blockers than as flat indented prose; steps-to-reproduce read best as an ordered list or table.
 
 ---
 
 ## 1. Bug Report Template
 
 > **Prerequisite**: Load `/acli` skill before executing any `[ISSUE_TRACKER_TOOL]` call in this section (duplicate search, Create issue, comment back-reference, search fields). Skip if Session Start §0.1 in `SKILL.md` already loaded it.
+
+### 1.0 Classify and frame the report first (Bug vs Defect vs Improvement)
+
+This template files all three sibling types — they share one Jira workflow. Before filing, settle the **upstream decisions** per `agentic-qa-core/references/defect-management-doctrine.md` (the canonical, shared doctrine — do not re-derive it here):
+
+- **Issue type** (Part 1) — classify by the affected **FEATURE's lifecycle stage, not where the problem was found** (you may reproduce on localhost/qa yet the feature is pre-release → Defect):
+  - **Bug** — feature already live above Staging (production / superior env, end-user visible) — escaped the sprint gate.
+  - **Defect** — feature still pre-release (Staging or below); found during sprint testing — the normal output of in-sprint QA (contained, not escaped).
+  - **Improvement** — not a broken AC: an enhancement, or an under-specified / absent AC surfaced by a test-beyond-AC.
+  The create call (`--type`) follows this classification — do NOT hardcode `Bug`.
+- **Components** (Part 3) — native, MANDATORY: set the affected product module / Epic (must pre-exist in the Jira Components module). The `<COMPONENT>` token in the §1.2 summary is a title string; the native `components` field is set separately.
+- **Three-axis parenting** (Part 4) — **parent** the issue to the **QA Defect Management** process epic (`qa.qa_epics.defect_epic`, found-or-created — NEVER a product/dev epic and NEVER the Story); KEEP the **source-Story link** for traceability (§1.13); **components** carries the product area. Keep the three axes separate.
+- **QA Assignee** (Part 2) — self-assign, never-overwrite; set per §1.13.
+- **Priority** (Part 5.1) — auto-derived from Severity (§1.5), written to native `priority`.
+
+Write mechanics (acli `workitem create --from-json` for create-time customfields + native `components`; REST `PUT` for edits) → doctrine Part 6 + `/acli`.
 
 ### 1.1 When to file a bug
 
@@ -71,6 +88,15 @@ _RELATED STORIES_
 * Blocks: [other issues]
 ```
 
+**Attach visual evidence** (screenshot of the failing UI, console capture, repro recording). `![](path)` does NOT embed in Jira — use the bundled helper, which uploads the file and posts it inline as a real image:
+
+```bash
+bun .claude/skills/acli/scripts/jira-attach-media.ts {{PROJECT_KEY}}-<bug> ./evidence/repro-step-3.png \
+  --caption "Step 3 — validation error not shown" --publish
+```
+
+One call per evidence file (the image is embedded as a comment on the bug). Full recipe + when-to-use in `../../acli/references/adf-authoring-style.md` §media. This is the high-value case: a reviewer sees the failing screen inline instead of clicking through to the Attachments panel.
+
 ### 1.4 Severity matrix
 
 | Severity | Criteria | Examples |
@@ -90,6 +116,8 @@ _RELATED STORIES_
 | Moderate | Medium |
 | Minor | Low |
 | Trivial | Lowest |
+
+Priority is **auto-derived** from Severity by this matrix and written to the **native `priority`** field. Override only with a one-line justification when business urgency diverges from technical severity (e.g. a `Trivial` typo in the landing hero warranting `High`). See `agentic-qa-core/references/defect-management-doctrine.md` Part 5.1.
 
 ### 1.6 Error type (infer from behaviour)
 
@@ -119,8 +147,8 @@ _RELATED STORIES_
 | Value | When |
 |-------|------|
 | Code Error | Logic bug in source |
-| Config/Env Error | Env var, feature flag, config |
-| Environment Error | Infra / deploy / CI |
+| Configuration Error | Env var, feature flag, config |
+| Infrastructure Error | Infra / deploy / CI |
 | Requirement Error | Spec wrong or ambiguous |
 | Working As Designed (WAD) | Not a bug |
 | Third-Party Error | Library / framework defect |
@@ -226,15 +254,28 @@ There are two distinct failure modes:
 
 Use absolute paths under the ticket's `evidence/` folder. Supported: `.png`, `.jpg`, `.gif`, `.mp4`, `.log`, `.txt`, `.pdf`. Provide the 1-2 most informative screenshots (the bug state, not navigation screens).
 
+**Evidence file naming (mandatory).** Name every file in `evidence/` as `{KEY}-step{NN}-{action}.{ext}` — `{KEY}` = the ticket key, `step{NN}` = zero-padded step number tying the file to a specific reproduction / test step, `{action}` = short kebab-case description, `{ext}` ∈ `png` · `jpg` · `gif` · `mp4` · `log` · `txt` · `pdf` (plus capture-format extensions such as `har` for network traces). Examples: `UPEX-411-step1-form-validation.png`, `UPEX-101-step3-error-shown.png`, `GX-202-step2-network-trace.har`. The `step{NN}` token lets bug reports (§1.3 Steps to Reproduce) and regression analysis reference each piece of evidence by step.
+
 ### 1.12 Human confirmation gate
 
 Before calling `[ISSUE_TRACKER_TOOL] Create issue`, present the full draft (title, severity, error type, environment, custom-field summary, attachments list) and wait for user OK. Never skip this gate.
 
 ### 1.13 Post-creation
 
-1. Comment on the related story with a back-reference: `Bug found during exploratory testing: {BUG-KEY} - {title}`.
-2. Assign if user specifies, otherwise leave for triage.
-3. Update the ticket's PBI `context.md` with the new bug key.
+1. **Create the traceability link — Story `causes` Bug.** The `_RELATED STORIES_` prose in the description (§1.3) is human-readable documentation only; the operational edge is a real Jira issuelink. When the Bug is filed against a Story under test, create:
+
+   ```
+   [ISSUE_TRACKER_TOOL] Link Issues:
+     linkType: {{jira.link_types.problem_incident.name}}   # Story causes Bug
+     # Story is the outward party (causes); Bug is the inward party (is caused by)
+     story: {STORY_KEY}
+     bug:   {BUG-KEY}
+   ```
+
+   Resolve the `problem_incident` link type by slug only, create one edge, then run the mandatory direction check (confirm the Story's outward partner is the Bug under `causes`) — full mechanics in `agentic-qa-core/references/traceability-linking.md` (§2 slug resolution, §4 directionality + verification). Defer the `--out`/`--in` flag handling to `/acli` per `[ISSUE_TRACKER_TOOL]`.
+2. Comment on the related story with a back-reference: `Bug found during exploratory testing: {BUG-KEY} - {title}`.
+3. **Set QA Assignee = self** (`{{jira.qa_assignee}}`) — the authenticated session user who filed the report (the same identity that becomes `reporter`). **Never-overwrite**: read the current value first; write only if empty, or on an explicit, justified handover. This is the QA owner of the issue and is DISTINCT from the native dev `assignee` (which stays free for dev triage — do NOT set it). Per `agentic-qa-core/references/defect-management-doctrine.md` Part 2; customfield write mechanics (REST `PUT`, read-before-write) → Part 6 + `/acli`.
+4. Update the ticket's PBI `context.md` with the new bug key.
 
 ---
 
@@ -286,6 +327,8 @@ RECOMMENDATIONS
 Apply the branch that matches the resolved modality (do not mix).
 
 > **Prerequisite (both modalities)**: Load `/acli` skill before any `[ISSUE_TRACKER_TOOL]` call below. In Modality jira-xray additionally load `/xray-cli` for `[TMS_TOOL] Update Run` and `[TMS_TOOL] Import Results`. Skip if Session Start §0.1 in `SKILL.md` already loaded them.
+
+> **ATR item (excellence default)** — by excellence the ATR is the **Test Execution** issue titled `ATR: {STORY-KEY}: Story Testing` (the Story-level run, named **Story Testing**, runs ONCE per sprint), created in Stage 1 and parented to the **QA Test Artifacts** epic; Stage 3 fills its body + run results below. The Story custom field (`{{jira.acceptance_test_results}}`) is a **fallback ONLY** when the Test Execution work type is unavailable.
 
 #### Modality jira-xray (ATR = Test Execution)
 
@@ -476,9 +519,11 @@ After posting any Template A-D comment, surface 1-2 screenshot paths so the user
 Comment posted to TMS.
 
 Evidence screenshots to attach:
-1. {abs-path-to-evidence}/{{PROJECT_KEY}}-{number}-{primary}.png — {desc}
-2. {abs-path-to-evidence}/{{PROJECT_KEY}}-{number}-{secondary}.png — {desc, if applicable}
+1. {abs-path-to-evidence}/{KEY}-step{NN}-{action}.png — {desc}
+2. {abs-path-to-evidence}/{KEY}-step{NN}-{action}.png — {desc, if applicable}
 ```
+
+Evidence files in the ticket's `evidence/` folder follow the mandatory naming rule `{KEY}-step{NN}-{action}.{ext}` (see §1.11) — `{KEY}` = ticket key, `step{NN}` = zero-padded step number, `{action}` = short kebab description, `{ext}` ∈ {png, jpg, gif, mp4, log, txt, pdf}. Examples: `UPEX-411-step1-form-validation.png`, `UPEX-101-step3-error-shown.png`. The `step{NN}` token ties each shot to the step it evidences.
 
 Rules: pick the most informative 1-2 shots; for bugs show the fix working (Template C) or the persisting failure (Template D); for stories show key ACs verified; never list intermediate navigation shots.
 
@@ -531,9 +576,20 @@ Record the gate outcome (hypothesis, cited fact, decision) in the ATR Observatio
 2. QA comment posted (Template A, B, C or D) via `[ISSUE_TRACKER_TOOL]`.
 3. Evidence screenshots surfaced to the user with absolute paths.
 4. Ticket transitioned — Story PASSED -> `{{jira.status.story.qa_approved}}` (via `{{jira.transition.story.qa_sign_off}}`); Bug VERIFIED -> `{{jira.status.bug.closed}}` (via `{{jira.transition.bug.retest_passed}}`); Story FAILED **(run the §5.0 recalibration gate first for any security/auth/framework-default FAIL — a recalibrated finding becomes GO-with-debt and takes the PASSED path, not a blocking transition)** with `{{FORMAL_BLOCKED_GATE}}=true` -> `{{jira.status.story.blocked}}` (via `{{jira.transition.story.defect_reported}}`); Story FAILED non-strict -> left in `{{jira.status.story.in_test}}` with linked bug; Bug NOT FIXED -> left in `{{jira.status.bug.ready_for_qa}}` pending dev. See `sprint-orchestration.md` Briefing 4 Step 5 for the full decision tree.
-5. PBI `context.md` updated with `Final Status` block.
-6. Commit the synced `acceptance-test-results.md` + `context.md` changes on branch `test/{JIRA_KEY}/{short-desc}`, message `test({JIRA_KEY}): add Stage 3 test report for {brief-title}`. Never push to `main` without user confirmation.
-7. For batch-sprint mode, only now is the `SPRINT-{N}-TESTING.md` framework file updated (Stage-3 gate).
+5. **Create the blocking traceability link — Story `is blocked by` Bug.** Whenever the `defect_reported` → `blocked` gate fires (`{{FORMAL_BLOCKED_GATE}}=true`), the status transition alone does not record the dependency; create the issuelink so the block gate and coverage consumers can walk it:
+
+   ```
+   [ISSUE_TRACKER_TOOL] Link Issues:
+     linkType: {{jira.link_types.blocks.name}}   # Bug blocks Story → Story is blocked by Bug
+     # The Bug is the outward party (blocks); the Story is the inward party (is blocked by)
+     bug:   {BUG-KEY}
+     story: {STORY_KEY}
+   ```
+
+   Resolve the `blocks` link type by slug only, create one edge, then run the mandatory direction check (confirm the Story's inward partner is the Bug under `is blocked by`) — full mechanics in `agentic-qa-core/references/traceability-linking.md` (§2 slug resolution, §4 directionality + verification, §6 never degrade a `blocks` edge to `relates` silently). Defer `--out`/`--in` flag handling to `/acli` per `[ISSUE_TRACKER_TOOL]`.
+6. PBI `context.md` updated with `Final Status` block.
+7. Commit the synced `acceptance-test-results.md` + `context.md` changes on branch `test/{JIRA_KEY}/{short-desc}`, message `test({JIRA_KEY}): add Stage 3 test report for {brief-title}`. Never push to `main` without user confirmation.
+8. For batch-sprint mode, only now is the `SPRINT-{N}-TESTING.md` framework file updated (Stage-3 gate).
 
 ### 5.2 Next stage routing
 

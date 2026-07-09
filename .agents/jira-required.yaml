@@ -157,6 +157,20 @@ required:
     options: [blocked, failed, n_r, passed]
     description: Per-Test issue execution status (Jira-native TMS).
     used_by: [test-documentation]
+  # ---- Cross-work-type QA ownership (consumed by every work-type skill) ----
+  qa_assignee:
+    name: QA Assignee
+    type: user
+    fallback: { target: comment, label: QA Assignee }
+    description: |
+      The QA who owns testing for a work item — the QA-lane parallel of the native
+      `assignee` (dev owner), distinct from `reporter` (who raised it ≠ who retests it).
+      Set on EVERY work-type issue (story / tech_story / tech_debt / bug / defect /
+      improvement) to the authenticated session user (self-assign); NEVER overwrite an
+      existing owner except on an explicit, justified handover. Doctrine:
+      agentic-qa-core/references/defect-management-doctrine.md (Part 2).
+    used_by:
+      [sprint-testing, test-documentation, test-automation, regression-testing, shift-left-testing]
 
 optional:
   # Fields that enhance the workflow but won't break it if missing.
@@ -186,7 +200,7 @@ unmapped:
 # discovered by the sync.
 work_types:
   story:
-    jira_issue_type: Story
+    jira_issue_type: Historia
     description: User story / feature work item
     required_statuses:
       backlog: { description: Initial state for a freshly created story }
@@ -416,3 +430,23 @@ work_types:
       deprecated: { from: any, to: deprecated, description: Retire the TC (global transition) }
       recover: { from: deprecated, to: draft, description: Restore a deprecated TC back to draft }
     used_by: [test-documentation, test-automation]
+
+# Link types used by skills for linking issues together (stories to tests, tests to defects, etc.)
+link_types:
+  required: []
+  optional:
+    test:
+      description: Links an issue to a Test (usually story → test case)
+      used_by: [shift-left-testing, sprint-testing, test-documentation]
+    blocks:
+      description: Links a defect to a story it blocks (defect → story)
+      used_by: [sprint-testing]
+    problem_incident:
+      description: Links a bug/defect to a problem or incident
+      used_by: [sprint-testing]
+    test_design:
+      description: Links a Test to its design/specification
+      used_by: [test-documentation]
+    test_execute:
+      description: Links a Test Execution to its Test definition
+      used_by: [test-documentation]
