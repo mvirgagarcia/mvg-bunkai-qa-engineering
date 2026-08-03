@@ -29,6 +29,7 @@ This skill does NOT orchestrate workflows, does NOT generate files, and does NOT
 | `references/skill-resolver.md` | Skills that resolve composable skills at runtime via the registry | Skill Resolver Protocol used by sub-agent launches. Companion: `scripts/build-skill-registry.ts` → `.claude/skills/REGISTRY.md`. |
 | `references/preflight-gate.md` | `shift-left-testing`, `sprint-testing`, `test-documentation`, `test-automation`, `regression-testing`, `framework-development` | Readiness Preflight Gate doctrine — probe tools/MCPs/CLIs/credentials and surface a user checklist BEFORE a skill starts its real work. Owns the secret/token handling + OpenAPI `api-login` → RESTART flow. |
 | `references/adr-doctrine.md` | `project-discovery`, `framework-development`, `sprint-testing`, `test-automation` | When a test-architecture decision earns an ADR (two-gate test: architectural AND hard-to-reverse) + the detect → draft → record procedure. Test architecture = runner/framework choice, Page-Object vs Screenplay, fixture/data strategy, isolation & parallelization, auth-in-tests, selector contract, exploratory-vs-scripted boundary, reporting/CI sharding, flake-retry policy. |
+| `references/api-testing-doctrine.md` | `sprint-testing`, `test-automation`, `test-documentation` | **Canonical API-testing maneuver** (agentic level, not KATA code): the three-tool split — OpenAPI MCP = schema READ-ONLY (discover endpoints/schemas), `bun run api:login` = mint token only (→ `.auth/tokens.env` env var `API_TOKEN_<ROLE>_<ENV>` + `.auth/tokens.json` keyed `<ROLE>_<ENV>`), curl = authenticated execution. Covers the schema-drift caveat (dev/latest vs target env), token-freshness checks, and the "shell env vars don't persist across the agent's Bash calls → `source` per curl call" rule. |
 
 When a skill cites one of these, it includes a Dependencies block at the top so the AI knows to load `agentic-qa-core` before continuing.
 
@@ -40,12 +41,11 @@ When a skill cites one of these, it includes a Dependencies block at the top so 
 
 | File | Language |
 |------|----------|
-| `naming-conventions.html` | English |
-| `naming-conventions.es.html` | Spanish |
+| `naming-conventions.es.html` | Spanish (technical terms in English) |
 
 It is the human-facing mirror of the naming rules that live in prose across the workflow skills' `references/*.md` (TC titles, `@atc` decorator, `describe()`/Test Set grouping, KATA components, tags, branch/commit/PR shapes, the PBI tree). Open it in a browser (arrow keys navigate; `O` = overview; `F` = fullscreen). Offer to open it when a user asks how artifacts are named or wants to review the conventions visually.
 
-**Keep it canonical**: when a naming rule changes, edit the owning skill's `references/*.md`, regenerate `REGISTRY.md` (`bun run skills:registry`), then refresh BOTH decks so the codex never drifts from the prose source.
+**Keep it canonical**: when a naming rule changes, edit the owning skill's `references/*.md`, regenerate `REGISTRY.md` (`bun run skills:registry`), then refresh the deck (both the skill-side copy and `packages/decks/agentic-qa-core/`) so the codex never drifts from the prose source.
 
 ---
 

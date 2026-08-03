@@ -143,3 +143,7 @@ dbhub.local.toml
 # ===== Temporary Worktrees =====
 # Temporary git worktrees created by agents during execution
 .claude/worktrees/
+
+# ----- 2026-07-10 (sync) -----
+/.allure/
+/.agents/prompts/
