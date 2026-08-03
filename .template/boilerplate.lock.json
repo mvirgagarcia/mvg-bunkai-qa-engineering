@@ -4,16 +4,16 @@
   "templateCommit": "e4454b5efc107b2c13f5462d429279eb1efb0aed",
   "perComponentCommit": {
     "claude-config": "5a07dfc9a19ae042b3072a58acc4ed652ee70132",
-    "skills": "11dc054a68dedcc01cf8e4635fff8a42ab18e8d7",
-    "commands": "11dc054a68dedcc01cf8e4635fff8a42ab18e8d7",
-    "scripts": "11dc054a68dedcc01cf8e4635fff8a42ab18e8d7",
-    "docs": "11dc054a68dedcc01cf8e4635fff8a42ab18e8d7",
+    "skills": "78597763963061453470eebd872be393157f2adc",
+    "commands": "78597763963061453470eebd872be393157f2adc",
+    "scripts": "78597763963061453470eebd872be393157f2adc",
+    "docs": "78597763963061453470eebd872be393157f2adc",
     "cli": "e4454b5efc107b2c13f5462d429279eb1efb0aed",
     "vscode": "06f22a35ba95efd9ea9ccdeeb1e7cfd89685b689",
     "husky": "360de0496c740c3190e920a7d134f8f08d6883c3",
     "agents-docs": "1ea2f055afee2518ef5e771d6a872752be73011c",
     "tooling": "e4454b5efc107b2c13f5462d429279eb1efb0aed",
-    "env-template": "11dc054a68dedcc01cf8e4635fff8a42ab18e8d7"
+    "env-template": "78597763963061453470eebd872be393157f2adc"
   },
   "syncedComponents": [],
   "ignoreFileSync": {
@@ -29,11 +29,12 @@
       ]
     },
     ".gitignore": {
-      "lastSyncedSha": "f52255194b1b13012d8dbafc6dcaf20d7ce49ccd",
+      "lastSyncedSha": "36a1a683d89bb8c2c9376a25ec204cbbdfd4c5a4",
       "appendedLines": [
         ".template/claude-md.upstream.sha",
         "/.allure/",
-        "/.agents/prompts/"
+        "/.agents/prompts/",
+        ".template/upstream-sha/"
       ]
     }
   },
@@ -55,6 +56,6 @@
     }
   },
   "cliVersion": "7.0",
-  "lastSyncedAt": "2026-07-10T20:49:20.351Z",
+  "lastSyncedAt": "2026-08-03T18:02:58.954Z",
   "variableSystemVersion": 1
 }
