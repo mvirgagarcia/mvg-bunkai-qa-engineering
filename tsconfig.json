@@ -3,7 +3,6 @@
     "target": "ESNext",
     "lib": ["ESNext", "DOM"],
     "moduleDetection": "force",
-    "baseUrl": ".",
     "module": "ESNext",
     "moduleResolution": "bundler",
     "paths": {
@@ -51,6 +50,7 @@
     "node_modules",
     "packages/*/node_modules",
     "packages/*/dist",
+    "packages/kata-academy",
     "playwright-report",
     "test-results",
     "allure-results",
