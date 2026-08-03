@@ -79,29 +79,32 @@ environments:
 # updater (bootstrapOnly), so each project keeps its own. Filled by git-flow-master, NOT by
 # `agents:setup`. These leaves are read directly (not {{VAR}} template vars) → skipped by vars:check.
 git_strategy:
-  strategy: solo-main # null until Strategy Setup runs; then one of: solo-main | main-integration | enterprise | trunk-based | gitflow | github-flow | gitlab-flow | sdet
+  strategy: sdet # null until Strategy Setup runs; then one of: solo-main | main-integration | enterprise | trunk-based | gitflow | github-flow | gitlab-flow | sdet
   description: >
-    Single long-lived branch (main); single maintainer (this repo is the boilerplate
-    template itself). Work is committed and pushed directly to main (PRs optional).
-    Every push to main is effectively a release of the template. No integration branch,
-    no promotion path, no hotfix ceremony.
+    SDET integration-trunk model for chained test-automation suites. main is permanent and
+    holds only confirmed regression-ready tests. Each suite gets an ephemeral integration
+    trunk (test/<module>-suite) created on demand; per-ticket branches (test/{KEY}-{slug})
+    are cut from the trunk, PR'd back into it, and merged with --no-ff so every ticket stays
+    visible inside the suite. One final reviewed PR promotes the trunk into main. Opt-in only,
+    never auto-detected; setup materializes no branches (main only) — the trunk is created
+    per-suite by the Branch operation.
   branches:
     production: main # release / default branch
     integration: null # long-lived integration branch name (e.g. staging), or null
-    ephemeral_pattern: null # on-demand trunk pattern (e.g. "test/<module>-suite" for sdet), or null
+    ephemeral_pattern: 'test/<module>-suite' # on-demand trunk pattern (e.g. "test/<module>-suite" for sdet), or null
   protected: [main] # branches requiring explicit confirm before a direct push
   decisions: # captured by the Strategy Setup questionnaire (Q1/Q2/Q3)
     promote_method: n/a # ff-only | merge-commit | squash | n/a
-    feature_merge: n/a # merge-commit | squash | rebase-merge | n/a
+    feature_merge: merge-commit # FIXED for sdet: --no-ff, never squash (defining property)
     hotfix_policy: n/a # branch-off-prod-backmerge | via-integration | none | n/a
   policy: # how strictly protected branches are guarded (set by Strategy Setup Q4; defaults are safe)
-    direct_push_to_protected: allowed # forbidden | confirm | allowed (solo-main = allowed)
-    admin_bypass: true # team POLICY: may a repo admin bypass PR/protection for urgent changes? actual capability still depends on the GitHub user's role — the skill re-confirms at runtime
-    require_pr_reviews: 0 # null | 0 | N — min approvals before merge to a protected branch (informational)
+    direct_push_to_protected: confirm # forbidden | confirm | allowed (sdet = confirm)
+    admin_bypass: false # team POLICY: may a repo admin bypass PR/protection for urgent changes? actual capability still depends on the GitHub user's role — the skill re-confirms at runtime
+    require_pr_reviews: 0 # min approvals for ticket→trunk PRs; the final trunk→main promotion PR requires 1
   branch_prefixes:
     precedence: [feat, fix, refactor, test, docs, chore]
     naming_with_key: '{prefix}/{ISSUE-KEY}-{kebab-slug}'
     naming_without_key: '{prefix}/{kebab-slug}'
   meta:
-    setup_version: 1
-    created: 2026-06-20 # YYYY-MM-DD stamped by Strategy Setup
+    setup_version: 2
+    created: 2026-07-11 # YYYY-MM-DD stamped by Strategy Setup
