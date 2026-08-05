@@ -91,7 +91,7 @@ git_strategy:
   branches:
     production: main # release / default branch
     integration: null # long-lived integration branch name (e.g. staging), or null
-    ephemeral_pattern: 'test/<module>-suite' # on-demand trunk pattern (e.g. "test/<module>-suite" for sdet), or null
+    ephemeral_pattern: test/<module>-suite # on-demand trunk pattern (e.g. "test/<module>-suite" for sdet), or null
   protected: [main] # branches requiring explicit confirm before a direct push
   decisions: # captured by the Strategy Setup questionnaire (Q1/Q2/Q3)
     promote_method: n/a # ff-only | merge-commit | squash | n/a
