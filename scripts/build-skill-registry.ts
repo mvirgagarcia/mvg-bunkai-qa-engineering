@@ -1,23 +1,43 @@
 #!/usr/bin/env bun
 /**
- * build-skill-registry.ts — emits `.claude/skills/REGISTRY.md`.
+ * build-skill-registry.ts — emits `.agents/skills/REGISTRY.md`.
  *
  * Token-saving cache for the Skill Resolver protocol. Scans
- * `.claude/skills/*\/SKILL.md`, extracts a 5-15-line "Compact Rules" block per
+ * `.agents/skills/*\/SKILL.md`, extracts a 5-15-line "Compact Rules" block per
  * skill, and writes a single registry file the orchestrator pastes into every
  * subagent briefing under `## Project Standards (auto-resolved)`.
  *
  * Subagents trust the compact rules and DO NOT re-read full SKILL.md unless
  * the briefing explicitly says so. Protocol:
- *   `.claude/skills/agentic-qa-core/references/skill-resolver.md`.
+ *   `.agents/skills/agentic-qa-core/references/skill-resolver.md`.
  *
  * Extraction strategies (per skill):
- *   - A (preferred): if the SKILL.md body contains a section literally titled
- *     `## Compact Rules` or `## Standards`, use the bullets from that section
- *     verbatim.
+ *   - frontmatter (authoritative): if the SKILL.md frontmatter carries a
+ *     `compact_rules:` field, its rules are used VERBATIM — no extraction, no
+ *     cap, no truncation. The author owns the block. Accepted shapes:
+ *       compact_rules:            # YAML list — one string per rule
+ *         - >-
+ *           rule text ...
+ *       compact_rules: |          # block scalar — one `- rule` per line
+ *         - rule text ...
+ *     (in the block-scalar shape each non-empty line is one rule; a leading
+ *     `- ` is stripped).
+ *   - A (body section): if the SKILL.md body contains a section literally
+ *     titled `## Compact Rules` or `## Standards`, use the bullets from that
+ *     section verbatim, capped at 15 rules (truncation appends a marker).
  *   - B (fallback): pick the first 15 bullets from any list in the body, or
  *     the first 15 non-empty lines of the first content section if no bullets.
- *   - Always cap at 15 rules. If truncated, append a marker bullet.
+ *     Same 15-rule cap.
+ *
+ * Strategy B blocks are stamped LOW-CONFIDENCE. The scrape is blind: it takes
+ * whichever bullets come first, so a dependency list, a table row, or half of a
+ * prohibition whose governing sentence sits in the preceding paragraph all land
+ * in the registry looking exactly like an authored rule — and from there go
+ * into subagent briefings that AGENTS.md §3 calls authoritative. The marker is
+ * the FIRST line of the emitted block (not only the trailing `Source:` footer)
+ * so it survives a copy-paste of the block into a briefing. The fix for a
+ * marked skill is to author a `## Compact Rules` section in it, which moves it
+ * to Strategy A and drops the marker.
  *
  * Idempotency: re-running on an unchanged repo produces a byte-identical file.
  *
@@ -32,19 +52,21 @@
  *
  * Exit codes:
  *   0 — registry written (or printed with --dry-run)
- *   1 — fatal error (no .claude/skills/, write failure, etc.)
+ *   1 — fatal error (no .agents/skills/, write failure, etc.)
  */
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 
+import { relativePosix } from './lib/posix-path';
+
 // -----------------------------------------------------------------------------
 // Config
 // -----------------------------------------------------------------------------
 
 const REPO_ROOT = process.cwd();
-const SKILLS_DIR = join(REPO_ROOT, '.claude', 'skills');
+const SKILLS_DIR = join(REPO_ROOT, '.agents', 'skills');
 const CACHE_DIR = SKILLS_DIR;
 const CACHE_FILE = join(CACHE_DIR, 'REGISTRY.md');
 
@@ -55,12 +77,15 @@ const _MIN_RULES = 5; // informational; Strategy B may emit fewer.
 // Types
 // -----------------------------------------------------------------------------
 
-type Strategy = 'A' | 'B' | 'none';
+type Strategy = 'frontmatter' | 'A' | 'B' | 'none';
 
 interface SkillFrontmatter {
   name?: string
   description?: string
   phase?: string
+  /** `metadata.kind` is the purpose axis (context / workflow / utility / core); `stage_owner` flags a stage-owning workflow skill. Both gated by `skills:check`. */
+  metadata?: { kind?: string, stage_owner?: boolean }
+  compact_rules?: unknown
 }
 
 interface SkillEntry {
@@ -82,8 +107,8 @@ function printHelp(): void {
   console.log(`Usage: bun scripts/build-skill-registry.ts [--check] [--dry-run] [--verbose] [--help]
 
 Builds the per-session skill registry consumed by the Skill Resolver protocol.
-Scans .claude/skills/*/SKILL.md, extracts compact rules per skill, and writes
-.claude/skills/REGISTRY.md.
+Scans .agents/skills/*/SKILL.md, extracts compact rules per skill, and writes
+.agents/skills/REGISTRY.md.
 
 Flags:
   --check      Verify REGISTRY.md is in sync with current SKILL.md content.
@@ -135,7 +160,7 @@ function listSkillDirs(): string[] {
   const dirs: string[] = [];
   for (const e of entries) {
     // Accept directories AND symlinks-to-directories (some skills are
-    // symlinked from outside the repo, e.g. .claude/skills/playwright-cli ->
+    // symlinked from outside the repo, e.g. .agents/skills/playwright-cli ->
     // an external clone).
     if (!e.isDirectory() && !e.isSymbolicLink()) { continue; }
     const skillPath = join(SKILLS_DIR, e.name, 'SKILL.md');
@@ -178,6 +203,38 @@ function bulletText(line: string): string | null {
   // (otherwise the prior [ \t]+ and (.+) overlap on space chars).
   const m = line.match(/^[ \t]*(?:[-*]|\d+\.)[ \t]+(\S.*)$/);
   return m === null ? null : m[1].trim();
+}
+
+/**
+ * Frontmatter-first: a `compact_rules:` frontmatter field is authoritative.
+ * Accepted shapes (see header comment):
+ *   - YAML list of strings → each item is one rule, used verbatim.
+ *   - Block-scalar string  → each non-empty line is one rule; an optional
+ *     leading `- ` is stripped.
+ * Returns null when the field is absent or yields no rules — extraction
+ * (Strategy A/B) then applies as usual. Never capped, never truncated: the
+ * skill author owns the block.
+ */
+function rulesFromFrontmatter(fm: SkillFrontmatter): string[] | null {
+  const raw = fm.compact_rules;
+  if (raw === undefined || raw === null) { return null; }
+
+  let rules: string[] = [];
+  if (Array.isArray(raw)) {
+    rules = raw
+      .filter((r): r is string => typeof r === 'string')
+      .map(r => r.trim())
+      .filter(r => r.length > 0);
+  }
+  else if (typeof raw === 'string') {
+    rules = raw
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0)
+      .map(line => bulletText(line) ?? line);
+  }
+
+  return rules.length > 0 ? rules : null;
 }
 
 /**
@@ -284,29 +341,39 @@ function processSkill(slug: string): SkillEntry {
   let rules: string[] = [];
   let truncated = false;
 
-  const a = extractStrategyA(body);
-  if (a !== null && a.rules.length > 0) {
-    strategy = 'A';
-    rules = a.rules;
-    truncated = a.truncated;
+  const fmRules = rulesFromFrontmatter(frontmatter);
+  if (fmRules !== null) {
+    strategy = 'frontmatter';
+    rules = fmRules;
+    // Frontmatter rules are verbatim + uncapped: never truncated.
   }
   else {
-    const b = extractStrategyB(body);
-    if (b.rules.length > 0) {
-      strategy = 'B';
-      rules = b.rules;
-      truncated = b.truncated;
+    const a = extractStrategyA(body);
+    if (a !== null && a.rules.length > 0) {
+      strategy = 'A';
+      rules = a.rules;
+      truncated = a.truncated;
+    }
+    else {
+      const b = extractStrategyB(body);
+      if (b.rules.length > 0) {
+        strategy = 'B';
+        rules = b.rules;
+        truncated = b.truncated;
+      }
     }
   }
 
   const readFullWhen = extractReadFullWhen(body);
   const purpose = distillPurpose(frontmatter.description);
 
-  vlog(`[${slug}] strategy=${strategy} rules=${rules.length}${truncated ? ' (truncated)' : ''}`);
+  vlog(`[${slug}] ${strategy === 'frontmatter' ? 'source=frontmatter' : `strategy=${strategy}`} rules=${rules.length}${truncated ? ' (truncated)' : ''}`);
 
   return {
     slug,
-    path: relative(REPO_ROOT, skillPath),
+    // `/`-separated: this lands in the tracked REGISTRY.md, which
+    // `skills:registry:check` compares as full text.
+    path: relativePosix(REPO_ROOT, skillPath),
     frontmatter,
     purpose,
     rules,
@@ -320,10 +387,22 @@ function processSkill(slug: string): SkillEntry {
 // Render
 // -----------------------------------------------------------------------------
 
+/**
+ * Banner stamped on every Strategy-B block, as its first line, so a block
+ * pasted into a briefing carries its own warning even when the trailing
+ * `Source: … · extraction strategy: B` footer is cropped.
+ */
+const LOW_CONFIDENCE_MARKER
+  = '> ⚠ LOW-CONFIDENCE (extraction strategy B): bullets scraped without context — read the full SKILL.md before relying on any rule below.';
+
 function renderEntry(entry: SkillEntry): string {
   const lines: string[] = [];
   lines.push(`## Skill: ${entry.slug}`);
   lines.push('');
+  if (entry.strategy === 'B') {
+    lines.push(LOW_CONFIDENCE_MARKER);
+    lines.push('');
+  }
   lines.push(`**Purpose**: ${entry.purpose}`);
   lines.push('');
 
@@ -342,7 +421,10 @@ function renderEntry(entry: SkillEntry): string {
   lines.push('');
   lines.push(`**Read full SKILL.md when**: ${entry.readFullWhen}`);
   lines.push('');
-  lines.push(`> Source: \`${entry.path}\` · phase: \`${entry.frontmatter.phase ?? 'unknown'}\` · extraction strategy: ${entry.strategy}`);
+  const strategyLabel = entry.strategy === 'frontmatter'
+    ? 'source: frontmatter `compact_rules` (verbatim)'
+    : `extraction strategy: ${entry.strategy}`;
+  lines.push(`> Source: \`${entry.path}\` · phase: \`${entry.frontmatter.phase ?? 'unknown'}\` · kind: \`${entry.frontmatter.metadata?.kind ?? 'unknown'}\`${entry.frontmatter.metadata?.stage_owner ? ' · stage owner' : ''} · ${strategyLabel}`);
   return lines.join('\n');
 }
 
@@ -353,7 +435,7 @@ function renderRegistry(entries: SkillEntry[]): string {
     '',
     `> Generated: \`${generated}\``,
     '> Generator: `bun scripts/build-skill-registry.ts`',
-    '> Protocol: `.claude/skills/agentic-qa-core/references/skill-resolver.md`',
+    '> Protocol: `.agents/skills/agentic-qa-core/references/skill-resolver.md`',
     '',
     'This file is the per-session compact-rules cache for the Skill Resolver protocol.',
     'The orchestrator copies one or more `## Skill: <slug>` blocks below into every subagent briefing under `## Project Standards (auto-resolved)`.',
@@ -414,6 +496,7 @@ function main(): void {
 
   const summary = [
     `Indexed ${entries.length} skills`,
+    `Source frontmatter: ${entries.filter(e => e.strategy === 'frontmatter').length}`,
     `Strategy A: ${entries.filter(e => e.strategy === 'A').length}`,
     `Strategy B: ${entries.filter(e => e.strategy === 'B').length}`,
     `No rules:   ${entries.filter(e => e.strategy === 'none').length}`,

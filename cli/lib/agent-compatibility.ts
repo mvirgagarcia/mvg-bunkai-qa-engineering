@@ -1,0 +1,499 @@
+/**
+ * @fileoverview Cross-harness compatibility engine — Claude skills alias,
+ * hook adapters and MCP parity.
+ *
+ * WHY THIS LIVES IN `cli/lib/` AND NOT IN `scripts/`:
+ * `cli/` is the updater's self-update component (`selfUpdateComponent: 'cli'`).
+ * The updater refreshes `cli/` in place and re-execs itself BEFORE `scripts/`
+ * is synced, so anything `cli/` imports must travel with `cli/`. When this
+ * module lived in `scripts/`, a repo several releases behind downloaded the new
+ * `cli/`, re-exec'd, and died on `Cannot find module '../scripts/…'` — with
+ * `bun run up`, `--rollback`, `setup` and `setup:doctor` all dead at once,
+ * because the failure is at module load.
+ *
+ * The invariant is enforced by the `no-restricted-imports` block scoped to
+ * `cli/**` in `eslint.config.js`: NOTHING under `cli/` may import from a
+ * sibling top-level directory.
+ *
+ * `scripts/agent-compatibility.ts` remains the `bun run agents:compat`
+ * entrypoint and re-exports this module.
+ */
+
+import type { Stats } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join, normalize, relative, resolve } from 'node:path';
+
+import { validateEslintBlockWiring, validateHookCompatibility, validateMcpParity } from './agent-compatibility-contracts.ts';
+
+export const CLAUDE_INSTRUCTIONS_SHIM = '@AGENTS.md\n';
+
+/**
+ * Line endings as this module generates them, so a comparison survives a
+ * checkout that does not have `.gitattributes`.
+ *
+ * Every generated surface here is written with pure `\n`, but `.gitattributes`
+ * is a file a downstream project can delete, and under `core.autocrlf=true`
+ * git then hands back `\r\n`. Without this, the shim comparison THROWS —
+ * taking down `agents:compat`, `agents:compat:check`, `repo:check` and the
+ * pre-push hook at once.
+ * `updater-harness-migration.ts` already keeps a loose comparison for exactly
+ * this reason; this is the same defence, stated once.
+ */
+export function normalizeNewlines(text: string): string {
+  return text.replace(/\r\n/g, '\n');
+}
+
+/** OS-generated files that never count as skill content. */
+export const OS_METADATA_FILES = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini']);
+export const POSIX_CLAUDE_SKILLS_TARGET = '../.agents/skills';
+/**
+ * The harness command directories (Claude Code, OpenCode). The boilerplate
+ * ships no command files: a skill is invoked by its own name plus a mode. What
+ * a project keeps here is its own, with one exception the check refuses: a
+ * command whose name equals a repo skill. Claude Code registers both under the
+ * same slash name, and the command body wins, so the AI would follow the
+ * command's instructions instead of the skill's.
+ */
+export const HARNESS_COMMAND_DIRS = ['.claude/commands', '.opencode/commands'] as const;
+/** Where `removeShadowingCommands` moves a shadowing command (gitignored by the `.backups*` rule). */
+export const SHADOWING_COMMANDS_BACKUP_DIR = '.backups/shadowing-commands';
+/**
+ * The retired alias overlay. Nothing reads it any more; the updater names it
+ * once (informational) so a project knows its declared commands are now plain
+ * harness command files it edits by hand.
+ */
+export const RETIRED_COMMAND_ALIAS_OVERLAY = '.agents/compatibility/command-aliases.project.json';
+/** The check's message when `.claude/skills` does not exist and nothing says it should not yet. */
+export const SKILLS_ALIAS_MISSING_ERROR = 'Claude skills alias missing: .claude/skills';
+/**
+ * Written by `repairAgentSurfaces({ deferSkillsAlias: true })` on the run that
+ * applies the cross-harness migration, under the gitignored marker directory
+ * the updater already owns. While it exists the check reports the alias as
+ * `deferred` instead of missing, so the migration commit passes the pre-commit
+ * gate; the next `repairClaudeSkillsAlias` (`bun run agents:compat`) creates
+ * the alias and removes it.
+ */
+export const SKILLS_ALIAS_DEFERRED_MARKER = '.template/upstream-sha/claude-skills-alias.deferred';
+
+export interface CompatibilityPaths {
+  root: string
+  instructions: string
+  claudeShim: string
+  canonicalSkills: string
+  claudeSkills: string
+}
+
+export interface AliasStatus {
+  path: string
+  target: string
+  type: 'symlink' | 'junction'
+  status: 'created' | 'repaired' | 'valid'
+}
+
+export interface CompatibilityCheck {
+  ok: boolean
+  errors: string[]
+  /** `deferred`: absent on purpose until the migration commit (see SKILLS_ALIAS_DEFERRED_MARKER). */
+  alias: Omit<AliasStatus, 'status'> & { status: 'missing' | 'invalid' | 'valid' | 'deferred' }
+}
+
+/** The surface a compatibility error belongs to, so a report can group them. */
+export type CompatibilityErrorGroup = 'alias' | 'commands' | 'hooks' | 'mcp' | 'lint' | 'instructions';
+
+export const COMPATIBILITY_GROUP_ORDER: CompatibilityErrorGroup[] = ['instructions', 'alias', 'commands', 'hooks', 'mcp', 'lint'];
+
+export const COMPATIBILITY_GROUP_LABEL: Record<CompatibilityErrorGroup, string> = {
+  instructions: 'Instructions (AGENTS.md + CLAUDE.md shim, canonical skills)',
+  alias: 'Claude skills alias (.claude/skills)',
+  commands: 'Commands shadowing a skill (.claude/commands, .opencode/commands)',
+  hooks: 'Hook adapters',
+  mcp: 'MCP parity (.mcp.json, opencode.jsonc, .codex/config.toml)',
+  lint: 'Lint config wiring (eslint.config.js <- eslint.config.base.js)',
+};
+
+/** Classify one error message by its wording (the messages are ours). */
+export function compatibilityErrorGroup(message: string): CompatibilityErrorGroup {
+  if (/\bMCP\b/.test(message)) { return 'mcp'; }
+  if (/command shadows skill/i.test(message)) { return 'commands'; }
+  if (/skills alias|\.claude\/skills/i.test(message)) { return 'alias'; }
+  if (/hook/i.test(message)) { return 'hooks'; }
+  // A synced block that the project-owned consumer never wired: the rule is
+  // on disk and enforcing nothing. Not an instructions problem.
+  if (/eslint\.config/i.test(message)) { return 'lint'; }
+  return 'instructions';
+}
+
+/** Errors bucketed per surface, in `COMPATIBILITY_GROUP_ORDER`; empty groups omitted. */
+export function groupCompatibilityErrors(errors: readonly string[]): Array<{ group: CompatibilityErrorGroup, label: string, errors: string[] }> {
+  const buckets = new Map<CompatibilityErrorGroup, string[]>();
+  for (const error of errors) {
+    const group = compatibilityErrorGroup(error);
+    buckets.set(group, [...(buckets.get(group) ?? []), error]);
+  }
+  return COMPATIBILITY_GROUP_ORDER
+    .filter(group => buckets.has(group))
+    .map(group => ({ group, label: COMPATIBILITY_GROUP_LABEL[group], errors: buckets.get(group)! }));
+}
+
+/**
+ * One line about the alias, printed whatever the overall verdict: "alias
+ * pending the migration commit" and "MCP drift" must never collapse into one
+ * flat failure.
+ */
+export function describeAliasStatus(alias: CompatibilityCheck['alias'] | AliasStatus): string {
+  const where = `${alias.path} -> ${alias.target} (${alias.type})`;
+  switch (alias.status) {
+    case 'created': return `Claude skills alias created: ${where}`;
+    case 'repaired': return `Claude skills alias repaired: ${where}`;
+    case 'valid': return `Claude skills alias OK: ${where}`;
+    case 'deferred': return 'Claude skills alias deferred until the migration commit (`bun run agents:compat` creates it afterwards).';
+    case 'missing': return `Claude skills alias missing: ${alias.path} (run \`bun run agents:compat\`).`;
+    case 'invalid': return `Claude skills alias invalid: ${alias.path} is not the generated ${alias.type} to ${alias.target}.`;
+  }
+}
+
+export function compatibilityPaths(root = process.cwd()): CompatibilityPaths {
+  const resolvedRoot = resolve(root);
+  return {
+    root: resolvedRoot,
+    instructions: join(resolvedRoot, 'AGENTS.md'),
+    claudeShim: join(resolvedRoot, 'CLAUDE.md'),
+    canonicalSkills: join(resolvedRoot, '.agents', 'skills'),
+    claudeSkills: join(resolvedRoot, '.claude', 'skills'),
+  };
+}
+
+function aliasType(platform: NodeJS.Platform): AliasStatus['type'] {
+  return platform === 'win32' ? 'junction' : 'symlink';
+}
+
+function desiredAliasTarget(paths: CompatibilityPaths, platform: NodeJS.Platform): string {
+  return platform === 'win32' ? paths.canonicalSkills : POSIX_CLAUDE_SKILLS_TARGET;
+}
+
+/**
+ * Whether a junction target points at the canonical skills directory.
+ *
+ * Called only from the `win32` branches, where the filesystem is
+ * case-insensitive: `readlinkSync` can return a drive-letter (or any segment)
+ * cased differently from `process.cwd()`, and a case-SENSITIVE comparison then
+ * reports an unexpected target and makes the repair unlink and recreate a
+ * junction that was already correct. Case-fold both sides.
+ */
+function resolvesToCanonical(
+  linkPath: string,
+  actualTarget: string,
+  canonicalTarget: string,
+): boolean {
+  const resolvedTarget = isAbsolute(actualTarget)
+    ? resolve(actualTarget)
+    : resolve(join(linkPath, '..'), actualTarget);
+  const fold = (path: string): string => normalize(path).toLowerCase();
+  return fold(resolvedTarget) === fold(resolve(canonicalTarget));
+}
+
+function lstatIfPresent(path: string): Stats | null {
+  try {
+    return lstatSync(path);
+  }
+  catch (error) {
+    const code = error instanceof Error && 'code' in error ? error.code : undefined;
+    if (code === 'ENOENT') { return null; }
+    throw error;
+  }
+}
+
+/**
+ * True when `.claude/skills` is a real directory holding NOTHING but symlinks that
+ * resolve inside `.agents/skills` — i.e. the shim the `skills` CLI writes.
+ *
+ * `bunx skills add` (project level) installs the skill body into `.agents/skills/<slug>/`
+ * and then, for Claude Code compatibility, creates `.claude/skills/` as a REAL directory
+ * containing one symlink per skill. That collides head-on with our single directory-level
+ * alias: `bun run setup` installs community skills BEFORE repairing compatibility, so a
+ * clean clone hit "Refusing to replace" and the install aborted.
+ *
+ * Reclaiming that specific shape is lossless — every entry is a pointer, the bodies live
+ * in the canonical store and are untouched. Anything else (a real subdirectory, a file, a
+ * symlink aiming outside `.agents/skills`) means somebody put real work there, and the
+ * caller must still refuse rather than delete it.
+ */
+function isSkillsCliShim(claudeSkills: string, canonicalSkills: string): boolean {
+  let entries: string[];
+  try { entries = readdirSync(claudeSkills); }
+  catch { return false; }
+
+  const canonical = resolve(canonicalSkills);
+  return entries.every((entry) => {
+    // Finder/Explorer leftovers carry no content: they must not make an otherwise
+    // reclaimable shim look like a directory holding somebody's work.
+    if (OS_METADATA_FILES.has(entry)) { return true; }
+    const child = join(claudeSkills, entry);
+    const stats = lstatIfPresent(child);
+    if (stats === null || !stats.isSymbolicLink()) { return false; }
+    const resolved = resolve(claudeSkills, readlinkSync(child));
+    return isInside(resolved, canonical);
+  });
+}
+
+/**
+ * True when `target` is `parent` itself or sits under it.
+ *
+ * Uses `relative()` rather than a string prefix on purpose. `resolve()` returns
+ * `C:\repo\.agents\skills` on Windows, so comparing against `` `${parent}/` `` never
+ * matches there — every legitimate per-skill symlink would read as "content", the
+ * alias repair would refuse, and a clean Windows install would abort. Same class of
+ * separator bug a downstream user hit on Windows-with-bash, where `process.platform`
+ * is still `win32` even though the shell is not.
+ */
+export function isInside(target: string, parent: string): boolean {
+  const rel = relative(resolve(parent), resolve(target));
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+export function validateCanonicalSources(root = process.cwd()): string[] {
+  const paths = compatibilityPaths(root);
+  try {
+    assertCanonicalSources(paths);
+    return [];
+  }
+  catch (error) {
+    return [error instanceof Error ? error.message : String(error)];
+  }
+}
+
+function assertCanonicalSources(paths: CompatibilityPaths): void {
+  if (!existsSync(paths.instructions) || !lstatSync(paths.instructions).isFile()) {
+    throw new Error(`Canonical instructions missing: ${relative(paths.root, paths.instructions)}`);
+  }
+  if (!existsSync(paths.canonicalSkills) || !lstatSync(paths.canonicalSkills).isDirectory()) {
+    throw new Error(`Canonical skills directory missing: ${relative(paths.root, paths.canonicalSkills)}`);
+  }
+  if (!existsSync(paths.claudeShim) || !lstatSync(paths.claudeShim).isFile()) {
+    throw new Error(`Claude instruction shim missing: ${relative(paths.root, paths.claudeShim)}`);
+  }
+  const shim = normalizeNewlines(readFileSync(paths.claudeShim, 'utf8'));
+  if (shim !== CLAUDE_INSTRUCTIONS_SHIM) {
+    throw new Error('CLAUDE.md must contain exactly `@AGENTS.md` followed by one newline.');
+  }
+}
+
+/** Slugs of the repo skills: every `.agents/skills/<slug>/` that holds a `SKILL.md`. */
+function repoSkillSlugs(canonicalSkills: string): Set<string> {
+  let entries: string[];
+  try { entries = readdirSync(canonicalSkills); }
+  catch { return new Set(); }
+  return new Set(entries.filter(entry => existsSync(join(canonicalSkills, entry, 'SKILL.md'))));
+}
+
+/** Every `*.md` under one command directory, recursively (Claude namespaces subdirectories, the name is still the file's). */
+function commandFiles(root: string, directory: string): string[] {
+  const out: string[] = [];
+  const walk = (relDir: string): void => {
+    let entries: string[];
+    try { entries = readdirSync(join(root, relDir)); }
+    catch { return; }
+    for (const entry of entries.sort()) {
+      if (OS_METADATA_FILES.has(entry)) { continue; }
+      const rel = `${relDir}/${entry}`;
+      const stats = lstatIfPresent(join(root, rel));
+      if (stats === null) { continue; }
+      if (stats.isDirectory()) { walk(rel); }
+      else if (entry.endsWith('.md')) { out.push(rel); }
+    }
+  };
+  walk(directory);
+  return out;
+}
+
+/**
+ * Harness command files whose name equals a repo skill, as repo-relative paths
+ * with the skill they shadow. A same-name command replaces the skill's
+ * instructions with its own body on Claude Code, and on OpenCode it offers a
+ * second, divergent entry point: either way the AI stops reading the skill.
+ */
+export function commandsShadowingSkills(root = process.cwd()): Array<{ path: string, skill: string }> {
+  const paths = compatibilityPaths(root);
+  const skills = repoSkillSlugs(paths.canonicalSkills);
+  if (skills.size === 0) { return []; }
+  const shadowing: Array<{ path: string, skill: string }> = [];
+  for (const directory of HARNESS_COMMAND_DIRS) {
+    for (const file of commandFiles(paths.root, directory)) {
+      const name = file.slice(file.lastIndexOf('/') + 1, -'.md'.length);
+      if (skills.has(name)) { shadowing.push({ path: file, skill: name }); }
+    }
+  }
+  return shadowing;
+}
+
+function validateNoShadowingCommands(root: string): string[] {
+  return commandsShadowingSkills(root).map(({ path, skill }) =>
+    `Command shadows skill ${skill}: ${path}; a command with a skill's name hides the skill's instructions (\`bun run agents:compat\` moves it to ${SHADOWING_COMMANDS_BACKUP_DIR}/)`);
+}
+
+/**
+ * Move every command that shadows a skill to `SHADOWING_COMMANDS_BACKUP_DIR`,
+ * keeping its repo-relative path, and return what moved. A move, never a
+ * delete: the file is the project's, and its body may hold something worth
+ * porting into the skill. An existing backup of the same path is overwritten.
+ */
+export function removeShadowingCommands(root = process.cwd()): string[] {
+  const resolvedRoot = resolve(root);
+  const moved: string[] = [];
+  for (const { path } of commandsShadowingSkills(resolvedRoot)) {
+    const backup = join(resolvedRoot, SHADOWING_COMMANDS_BACKUP_DIR, path);
+    mkdirSync(join(backup, '..'), { recursive: true });
+    writeFileSync(backup, readFileSync(join(resolvedRoot, path)));
+    unlinkSync(join(resolvedRoot, path));
+    moved.push(path);
+  }
+  return moved;
+}
+
+export function claudeSkillsAliasPlan(
+  root = process.cwd(),
+  platform: NodeJS.Platform = process.platform,
+): Omit<AliasStatus, 'status'> {
+  const paths = compatibilityPaths(root);
+  return {
+    path: paths.claudeSkills,
+    target: desiredAliasTarget(paths, platform),
+    type: aliasType(platform),
+  };
+}
+
+export function checkAgentCompatibility(
+  root = process.cwd(),
+  platform: NodeJS.Platform = process.platform,
+): CompatibilityCheck {
+  const paths = compatibilityPaths(root);
+  const type = aliasType(platform);
+  const target = desiredAliasTarget(paths, platform);
+  const errors: string[] = [];
+
+  try {
+    assertCanonicalSources(paths);
+    errors.push(...validateNoShadowingCommands(paths.root));
+    errors.push(...validateHookCompatibility(paths.root));
+    errors.push(...validateMcpParity(paths.root));
+    errors.push(...validateEslintBlockWiring(paths.root));
+  }
+  catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error));
+  }
+
+  const entry = lstatIfPresent(paths.claudeSkills);
+  if (entry === null) {
+    if (existsSync(join(paths.root, SKILLS_ALIAS_DEFERRED_MARKER))) {
+      return { ok: errors.length === 0, errors, alias: { path: paths.claudeSkills, target, type, status: 'deferred' } };
+    }
+    errors.push(SKILLS_ALIAS_MISSING_ERROR);
+    return { ok: false, errors, alias: { path: paths.claudeSkills, target, type, status: 'missing' } };
+  }
+
+  if (!entry.isSymbolicLink()) {
+    errors.push('Refusing compatibility state: .claude/skills exists but is not a generated symlink or junction.');
+    return { ok: false, errors, alias: { path: paths.claudeSkills, target, type, status: 'invalid' } };
+  }
+
+  const actualTarget = readlinkSync(paths.claudeSkills);
+  const exactTarget = platform === 'win32'
+    ? resolvesToCanonical(paths.claudeSkills, actualTarget, paths.canonicalSkills)
+    : actualTarget === POSIX_CLAUDE_SKILLS_TARGET;
+  if (!exactTarget) {
+    errors.push(`Claude skills alias has unexpected target: ${actualTarget}`);
+    return { ok: false, errors, alias: { path: paths.claudeSkills, target, type, status: 'invalid' } };
+  }
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    alias: { path: paths.claudeSkills, target, type, status: 'valid' },
+  };
+}
+
+export interface AgentSurfaceRepair {
+  /** Null when the alias was deferred (see `deferSkillsAlias`). */
+  alias: AliasStatus | null
+  /** Commands that shadowed a skill, moved to `SHADOWING_COMMANDS_BACKUP_DIR` by this repair. */
+  shadowingCommandsMoved: string[]
+  check: CompatibilityCheck
+  aliasDeferred: boolean
+}
+
+/**
+ * What `bun run up` does after every apply, and `bun run agents:compat` on
+ * demand: repair the alias, move any command that shadows a skill out of the
+ * way, run the check.
+ *
+ * `deferSkillsAlias` is for the run in which the cross-harness migration just
+ * unindexed a committed `.claude/skills/` tree: those deletions are staged, and
+ * git refuses to touch an index entry behind a symlink (`is beyond a symbolic
+ * link`), so creating the alias now would break lint-staged on the very commit
+ * that records the migration. The alias waits for `bun run agents:compat`
+ * after that commit; the marker makes the check (and the pre-commit gate that
+ * runs it) treat its absence as expected rather than as a broken contract, and
+ * every other contract is still enforced.
+ */
+export function repairAgentSurfaces(
+  root = process.cwd(),
+  options: { deferSkillsAlias?: boolean } = {},
+  platform: NodeJS.Platform = process.platform,
+): AgentSurfaceRepair {
+  const resolvedRoot = resolve(root);
+  let alias: AliasStatus | null = null;
+  if (options.deferSkillsAlias) {
+    const marker = join(resolvedRoot, SKILLS_ALIAS_DEFERRED_MARKER);
+    mkdirSync(join(marker, '..'), { recursive: true });
+    writeFileSync(marker, `${new Date().toISOString()}\n`);
+  }
+  else {
+    alias = repairClaudeSkillsAlias(resolvedRoot, platform);
+  }
+  const shadowingCommandsMoved = removeShadowingCommands(resolvedRoot);
+  const check = checkAgentCompatibility(resolvedRoot, platform);
+  return { alias, shadowingCommandsMoved, check, aliasDeferred: options.deferSkillsAlias === true };
+}
+
+export function repairClaudeSkillsAlias(
+  root = process.cwd(),
+  platform: NodeJS.Platform = process.platform,
+): AliasStatus {
+  const paths = compatibilityPaths(root);
+  assertCanonicalSources(paths);
+  mkdirSync(join(paths.root, '.claude'), { recursive: true });
+  // The alias exists (or is about to) from here on: the deferral is over.
+  rmSync(join(paths.root, SKILLS_ALIAS_DEFERRED_MARKER), { force: true });
+
+  const target = desiredAliasTarget(paths, platform);
+  const type = aliasType(platform);
+  let status: AliasStatus['status'] = 'created';
+
+  const entry = lstatIfPresent(paths.claudeSkills);
+  if (entry !== null) {
+    if (!entry.isSymbolicLink()) {
+      // Reclaim the `skills` CLI's per-skill symlink shim (see isSkillsCliShim);
+      // refuse anything holding real content.
+      if (entry.isDirectory() && isSkillsCliShim(paths.claudeSkills, paths.canonicalSkills)) {
+        rmSync(paths.claudeSkills, { recursive: true, force: true });
+        symlinkSync(target, paths.claudeSkills, platform === 'win32' ? 'junction' : 'dir');
+        return { path: paths.claudeSkills, target, type, status: 'repaired' };
+      }
+      throw new Error('Refusing to replace .claude/skills because it is a real directory or file, not a generated alias.');
+    }
+
+    const actualTarget = readlinkSync(paths.claudeSkills);
+    const isExpected = platform === 'win32'
+      ? resolvesToCanonical(paths.claudeSkills, actualTarget, paths.canonicalSkills)
+      : actualTarget === POSIX_CLAUDE_SKILLS_TARGET;
+    if (isExpected) {
+      return { path: paths.claudeSkills, target, type, status: 'valid' };
+    }
+
+    unlinkSync(paths.claudeSkills);
+    status = 'repaired';
+  }
+
+  symlinkSync(target, paths.claudeSkills, platform === 'win32' ? 'junction' : 'dir');
+  return { path: paths.claudeSkills, target, type, status };
+}

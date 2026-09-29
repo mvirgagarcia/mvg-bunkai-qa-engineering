@@ -9,7 +9,7 @@
  *     1-repo-verify     Verify repo root (package.json name / installer.lock.json)
  *     2-gentle-ai-detect  Detect gentle-ai (presence + version)
  *     3-gentle-ai-install gentle-ai install / skip decision
- *     4-agent-detect    Detect agents (Claude Code / OpenCode) and prompt selection
+ *     4-agent-detect    Detect agents (Claude Code / OpenCode / Codex) and prompt selection
  *
  *   PHASE 2 — INSTALLATION
  *     5-deps-install    Install dependencies (`bun install`)
@@ -49,7 +49,7 @@
  *   bun run setup --validate-skills
  *
  * Non-interactive env vars:
- *   INSTALL_AGENTS=claude-code,opencode   Comma-list of agents to configure
+ *   INSTALL_AGENTS=claude-code,opencode,codex   Comma-list of agents to configure
  *   INSTALL_SKIP_GENTLE_AI=1              Treat gentle-ai as skipped
  *   INSTALL_SKIP_DEPS=1                   Skip `bun install`
  *   INSTALL_SKIP_PLAYWRIGHT=1             Skip `bun run pw:install`
@@ -71,15 +71,28 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
 import { checkbox, password } from '@inquirer/prompts';
+import {
+  checkAgentCompatibility,
+  removeShadowingCommands,
+  repairClaudeSkillsAlias,
+  SHADOWING_COMMANDS_BACKUP_DIR,
+} from './lib/agent-compatibility.ts';
+import {
+  resolveAtlassianInstance,
+  toSiteSlug,
+  writeAtlassianUrlToYaml,
+} from './lib/atlassian-instance.ts';
+import { CLI_LOGINS, HARNESS_LEVEL_HOWTO, HARNESS_LEVEL_MCPS } from './lib/harness-level-mcps.ts';
+import { playwrightBrowsersInstalled } from './lib/playwright-cache.ts';
 import * as tui from './lib/tui.ts';
 import { runVariablesFlow } from './lib/variables-flow.ts';
-import { criticalVars, nonCriticalVars, varsFor } from './lib/variables-manifest.ts';
+import { criticalVars, nonCriticalVars, valueSourceOf, VAR_MANIFEST, varsFor } from './lib/variables-manifest.ts';
 
 // ============================================================================
 // Types
 // ============================================================================
 
-type AgentId = 'claude-code' | 'opencode';
+export type AgentId = 'claude-code' | 'opencode' | 'codex';
 
 type InstallStatus = 'installed' | 'skipped' | 'failed';
 
@@ -94,9 +107,11 @@ interface GentleAiInfo {
   status: 'installed' | 'missing' | 'skipped' | 'incompatible'
 }
 
-interface AgentDetection {
+export interface AgentDetection {
   claudeCode: boolean
   opencode: boolean
+  codexCli: boolean
+  codexConfigured: boolean
 }
 
 interface OptionalBootstrapStatus {
@@ -142,6 +157,22 @@ interface InstallState {
    */
   steps: Record<string, string>
   skills: Record<string, InstallStatus>
+  /**
+   * The upstream ref each PROJECT-level community skill was installed from,
+   * keyed by slug. The skills CLI records a CONTENT hash in
+   * `skills-lock.json`, which pins what is on disk but cannot be compared
+   * against a remote without cloning it — so `bun run setup:doctor` would have
+   * no way to tell a scaffold-day skill from a current one. These three skills
+   * are gitignored and sit outside the updater's surface, so nothing else
+   * would ever notice.
+   *
+   * Recorded on a successful install, and only reported afterwards: doctor
+   * never offers to reinstall, because an overwrite of a gitignored skill has
+   * no backup to restore from and would destroy a local patch unrecoverably.
+   * Absent for a repo installed before this existed — that reads as "not
+   * tracked", never as "current".
+   */
+  communitySkillRefs?: Record<string, CommunitySkillRef>
   mcps: Record<string, McpStatus>
   externalClis: Record<string, CliStatus>
   pendingEnvVars: string[]
@@ -163,6 +194,7 @@ const REPO_ROOT = resolve(import.meta.dir, '..');
 const STATE_PATH = join(REPO_ROOT, '.template', 'installer.state.json');
 const CLAUDE_MCP_PATH = join(REPO_ROOT, '.mcp.json');
 const OPENCODE_CONFIG_PATH = join(REPO_ROOT, 'opencode.jsonc');
+const CODEX_CONFIG_PATH = join(REPO_ROOT, '.codex', 'config.toml');
 const ENV_PATH = join(REPO_ROOT, '.env');
 const ENV_EXAMPLE_PATH = join(REPO_ROOT, '.env.example');
 
@@ -180,7 +212,7 @@ const ENGRAM_COMPONENT = 'engram';
  * test-automation, test-documentation, regression-testing) already provide
  * Plan → Code → Verify natively. SDD-* skills target software-design workflows
  * (specs, archives, strict TDD) that don't apply to E2E/API test authoring.
- * The vendored `judgment-day` skill (committed under .claude/skills/) provides
+ * The vendored `judgment-day` skill (committed under .agents/skills/) provides
  * adversarial dual-review without needing the SDD bundle.
  *
  * If you want the full SDD suite for `/framework-development` framework
@@ -188,13 +220,16 @@ const ENGRAM_COMPONENT = 'engram';
  *   gentle-ai install --agent <a> --components engram,sdd
  */
 
+// The servers the three project MCP files declare. Remote servers whose only
+// project-side content was an API key (web search, Postman) are not here any
+// more: they run at harness level, connected once per machine, and the skills
+// resolve them by capability (ADR-0005, D3; the list of moved servers lives in
+// cli/lib/harness-level-mcps.ts).
 const CANONICAL_MCPS = [
   'context7',
-  'tavily',
   'playwright',
   'dbhub',
   'openapi',
-  'postman',
 ] as const;
 
 // External CLIs are NEVER installed by this script — install commands depend on
@@ -213,8 +248,19 @@ const EXTERNAL_CLIS: ReadonlyArray<{ name: string, install?: string, docs: strin
     purpose: 'GitHub CLI — repos, PRs, releases, gh api',
   },
   {
+    // Both permission allowlists already grant `Bash(rg *)`, and agents reach for it
+    // constantly. Claude Code ships its own copy, so this never surfaced there — but
+    // OpenCode and Codex fall through to the system binary, and a downstream user hit
+    // exactly that while running /git-flow-master. Declaring it is the point of
+    // supporting three harnesses.
+    name: 'rg',
+    install: 'brew install ripgrep   # or: apt install ripgrep · winget install BurntSushi.ripgrep.MSVC',
+    docs: 'https://github.com/BurntSushi/ripgrep#installation',
+    purpose: 'ripgrep — fast repo search. Bundled with Claude Code; OpenCode and Codex use the system binary',
+  },
+  {
     // Promoted to the sole default tool for Jira/Confluence/TMS work
-    // (Atlassian MCP is opt-in via docs/mcp/).
+    // (Atlassian MCP is opt-in via .agents/skills/agentic-qa-core/references/mcp-atlassian-optin.md).
     name: 'acli',
     docs: 'https://developer.atlassian.com/cloud/acli/guides/install-acli/',
     purpose: 'Atlassian (Jira/Confluence) CLI — used by /acli skill',
@@ -239,24 +285,95 @@ const EXTERNAL_CLIS: ReadonlyArray<{ name: string, install?: string, docs: strin
     docs: 'https://resend.com/docs/cli',
     purpose: 'email development + transactional sending',
   },
+  {
+    // The STANDALONE binary. The repo also pins `varlock` as a devDependency,
+    // which is what `bun run vars:schema:check`, the pre-push warning and
+    // `setup:doctor` run through `bunx`; that copy is NOT on the PATH a
+    // harness gives an MCP server (measured: `bunx varlock` resolves from the
+    // project, a bare `varlock` does not). The binary is optional until the
+    // MCP wrapping phase makes it the server command on every host.
+    //
+    // Install paths, per varlock.dev and the 1.20.0 release assets:
+    //   macOS        brew install dmno-dev/tap/varlock
+    //   Linux/macOS  curl -sSfL https://varlock.dev/install.sh | sh -s
+    //   Windows      no PowerShell installer is published; Git Bash runs the
+    //                same install.sh (msys/mingw are recognised, installs
+    //                varlock.exe), and `npm i -g varlock` / `bun add -g varlock`
+    //                put a shim on PATH for PowerShell and cmd.
+    //                (documented, not measured on Windows)
+    name: 'varlock',
+    install: 'brew install dmno-dev/tap/varlock   # macOS. Linux: curl -sSfL https://varlock.dev/install.sh | sh -s · Windows: npm i -g varlock',
+    docs: 'https://varlock.dev/getting-started/installation',
+    purpose: 'env schema validation + secret injection (optional standalone; the devDependency covers the gates)',
+  },
+  {
+    // Desktop app (Orca ADE) that also ships a scriptable `orca` CLI. Fully
+    // optional: enables `/orca-orchestration` multi-session coordination.
+    // The boilerplate works identically without it — one-shot subagents
+    // (AGENTS.md §3) remain the default executor.
+    name: 'orca',
+    install: 'brew install --cask stablyai/orca/orca   # macOS. Windows/Linux: download from https://www.onorca.dev/docs/install',
+    docs: 'https://www.onorca.dev/docs/cli/overview',
+    purpose: 'multi-session agent orchestration (optional) — used by /orca-orchestration',
+  },
 ];
 
-interface CommunitySkill {
+export interface CommunitySkill {
   package: string // git URL or shorthand 'owner/repo'
   skill?: string // omit or '*' to install all skills from the package
 }
 
+export interface CommunitySkillRef {
+  /** The package the skill came from, as declared in PROJECT_LEVEL_SKILLS. */
+  package: string
+  /** Remote HEAD commit at install time, or null when the remote was unreachable. */
+  ref: string | null
+  recordedAt: string
+}
+
+/**
+ * The remote's current HEAD commit, via a single `git ls-remote` — no clone.
+ * Null on any failure (offline, private repo, not a git remote): an unknown
+ * baseline must read as unknown, never as up to date.
+ */
+export function remoteHeadRef(
+  packageUrl: string,
+  run: (binary: string, args: string[]) => { ok: boolean, stdout: string } = tryRun,
+): string | null {
+  const result = run('git', ['ls-remote', packageUrl, 'HEAD']);
+  if (!result.ok) { return null; }
+  const sha = result.stdout.trim().split(/\s+/)[0];
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+}
+
+export function buildCommunitySkillArgs(
+  item: CommunitySkill,
+  level: 'project' | 'global',
+  agents: AgentId[],
+): string[] {
+  const args = ['skills', 'add', item.package];
+  if (item.skill && item.skill !== '*') { args.push('--skill', item.skill); }
+  if (level === 'global') {
+    args.push('--global');
+    for (const agent of agents) { args.push('--agent', agent); }
+  }
+  args.push('--yes');
+  return args;
+}
+
+export const PROJECT_SKILL_DESTINATION = '.agents/skills';
+
 /**
  * Community skills installed at PROJECT level (`bunx skills add`).
  * Hosts third-party skills that are critical to this QA stack. They land in
- * .claude/skills/ alongside our committed skills — the boilerplate scaffolds
+ * .agents/skills/ alongside our committed skills — the boilerplate scaffolds
  * the full skill set into the consumer repo, so a fresh clone has everything
  * needed. Skills authored by us (sprint-testing, test-automation,
  * agentic-qa-core, project-discovery, regression-testing, test-documentation,
  * agentic-qa-onboard, acli, xray-cli, git-flow-master) live committed under
- * .claude/skills/ and are NOT listed here.
+ * .agents/skills/ and are NOT listed here.
  */
-const PROJECT_LEVEL_SKILLS: ReadonlyArray<CommunitySkill> = [
+export const PROJECT_LEVEL_SKILLS: ReadonlyArray<CommunitySkill> = [
   // playwright-cli (Microsoft): browser automation CLI used by /sprint-testing
   // and /test-automation as the primary [AUTOMATION_TOOL].
   { package: 'https://github.com/microsoft/playwright-cli', skill: 'playwright-cli' },
@@ -264,9 +381,15 @@ const PROJECT_LEVEL_SKILLS: ReadonlyArray<CommunitySkill> = [
   // fixtures reference loaded by /test-automation during the Code phase.
   { package: 'https://github.com/currents-dev/playwright-best-practices-skill', skill: 'playwright-best-practices' },
   // resend-cli (resend.com): email testing flows. Pairs with the `resend`
-  // external CLI verified in step 11 — see CLAUDE.md §6.5 CLI→Skill auto-load.
+  // external CLI verified in step 11 — see AGENTS.md §6.5 CLI→Skill auto-load.
   // Project-level because email provider choice varies per project.
   { package: 'https://github.com/resend/resend-skills', skill: 'resend-cli' },
+  // skill-creator (Anthropic): the builder of every skill this repo scaffolds.
+  // Project-level since the context-skills layer: `/framework-development`
+  // (when the change IS a skill) and `project-context` mode `context-skill`
+  // (a consumer's `<aspect>-context`) both scaffold through it, so a clone
+  // without it would silently skip the description pass and the test prompts.
+  { package: 'https://github.com/anthropics/skills', skill: 'skill-creator' },
 ];
 
 /**
@@ -278,21 +401,20 @@ const PROJECT_LEVEL_SKILLS: ReadonlyArray<CommunitySkill> = [
  * generation. bun is the runtime used across all projects.
  */
 const USER_LEVEL_SKILLS: ReadonlyArray<CommunitySkill> = [
-  { package: 'https://github.com/anthropics/skills', skill: 'skill-creator' },
   { package: 'https://github.com/vercel-labs/skills', skill: 'find-skills' },
   { package: 'https://github.com/xixu-me/skills', skill: 'github-actions-docs' },
-  { package: 'https://github.com/obra/superpowers', skill: 'brainstorming' },
   { package: 'https://github.com/lewislulu/html-ppt-skill', skill: 'html-ppt' },
   { package: 'https://bun.sh/docs', skill: 'bun' },
-  // Cross-project human-in-the-loop feedback CLI (`toki`): a blocking browser UI
-  // the AI drives mid-conversation to collect structured, anchored answers.
-  { package: 'https://github.com/upex-galaxy/agentic-user-skills', skill: 'wokitoki' },
+  // Cross-project decision-deck CLI (`mkd`, Make Decision): the AI writes a spec
+  // of items (decision / question / report / table) and the user answers in a
+  // browser deck, pasting the Result JSON back into the chat (non-blocking).
+  { package: 'https://github.com/upex-galaxy/agentic-user-skills', skill: 'mkd' },
 ];
 
 // Matches Claude Code ${VAR} and ${VAR:-default} placeholders in .mcp.json.
-const MCP_VAR_PATTERN = /\$\{([A-Z][A-Z0-9_]*)(?::-[^}]*)?\}/g;
+export const MCP_VAR_PATTERN = /\$\{([A-Z][A-Z0-9_]*)(?::-[^}]*)?\}/g;
 // Matches OpenCode {env:VAR} placeholders in opencode.jsonc.
-const OPENCODE_VAR_PATTERN = /\{env:([A-Z][A-Z0-9_]*)\}/g;
+export const OPENCODE_VAR_PATTERN = /\{env:([A-Z][A-Z0-9_]*)\}/g;
 const SECRET_NAME_HINTS = ['TOKEN', 'KEY', 'SECRET', 'PASSWORD'];
 
 // Map MCP server → env vars its secrets depend on. Servers with empty arrays
@@ -301,32 +423,29 @@ const SECRET_NAME_HINTS = ['TOKEN', 'KEY', 'SECRET', 'PASSWORD'];
 // `dbhub` is intentionally NOT managed by the installer or doctor — the user
 // must edit `dbhub.toml` manually based on the target project's database
 // (sqlserver/postgres/mysql/sqlite/mariadb). Marked as `placeholder` always.
-const MCP_SERVER_SECRETS: Record<string, readonly string[]> = {
+export const MCP_SERVER_SECRETS: Record<string, readonly string[]> = {
   context7: [],
-  tavily: ['TAVILY_API_KEY'],
   playwright: [],
-  dbhub: ['DBHUB_HOST', 'DBHUB_DATABASE', 'DBHUB_USER', 'DBHUB_PASSWORD'],
+  // All six that `dbhub.toml` interpolates. PORT and TYPE were missing until
+  // 2026-09-20: the configs referenced them, this hand-written map did not, so
+  // the installer never prompted for them and a fresh project hit a dbhub that
+  // would not connect. Found by the generator's scan-vs-declared cross-check,
+  // which is the whole reason that cross-check exists.
+  dbhub: ['DBHUB_TYPE', 'DBHUB_HOST', 'DBHUB_PORT', 'DBHUB_DATABASE', 'DBHUB_USER', 'DBHUB_PASSWORD'],
   openapi: ['API_BASE_URL', 'OPENAPI_SPEC_PATH'],
-  postman: ['POSTMAN_API_KEY'],
 };
 
 // Vars discovered from committed MCP configs that the installer should NOT
-// prompt for at install time — they are project-bound (require an existing
-// backend / Postman workspace / DB connection) and are surfaced later by
-// `bun run doctor` once the user has the necessary external resources.
-const INSTALLER_DEFERRED_VARS = new Set<string>([
-  'API_BASE_URL',
-  'OPENAPI_SPEC_PATH',
-  'POSTMAN_API_KEY',
-  'DBHUB_HOST',
-  'DBHUB_DATABASE',
-  'DBHUB_USER',
-  'DBHUB_PASSWORD',
-]);
+// prompt for at install time: everything that is not CORE. A project var
+// needs a backend or a database the installer cannot know about, and a
+// tooling var is a tool's own business; both are surfaced by
+// `bun run setup:doctor` with their scope. Derived from the manifest so a new
+// project var never needs a hand-list entry to be deferred.
+const INSTALLER_DEFERRED_VARS = new Set<string>(VAR_MANIFEST.filter(s => s.scope !== 'core').map(s => s.name));
 
-// The CRITICAL set (project-independent tool credentials) is owned by the day-0
-// credentials step. configureMcps skips any of these it encounters (e.g.
-// TAVILY_API_KEY surfaced from .mcp.json) so the user is asked exactly once.
+// The OFFERED set (manifest `critical: true`) is owned by the day-0 credentials
+// step. configureMcps skips any of these it encounters so the user is asked
+// exactly once.
 const CRITICAL_VAR_NAMES = new Set<string>(criticalVars().map(s => s.name));
 
 // ============================================================================
@@ -366,9 +485,9 @@ const SKIP_PLAYWRIGHT = process.env.INSTALL_SKIP_PLAYWRIGHT === '1';
 const SKIP_AGENTS_SETUP = process.env.INSTALL_SKIP_AGENTS_SETUP === '1';
 const FORCE_AGENTS_SETUP = process.env.INSTALL_FORCE_AGENTS_SETUP === '1';
 const FORCE_GENTLE_AI = process.env.INSTALL_FORCE_GENTLE_AI === '1';
-// --sync-skills: standalone repair mode — re-installs community skills targeting
-// the selected agent(s) so they land in each agent's own skills dir (e.g. Claude
-// Code's `.claude/skills/`). Implies a forced community re-run.
+// --sync-skills: standalone repair mode. Re-installs project community skills
+// into `.agents/skills/` and global community skills into each selected
+// harness's user-level store. Implies a forced community re-run.
 const SYNC_SKILLS = process.argv.includes('--sync-skills');
 const FORCE_COMMUNITY = process.env.INSTALL_FORCE_COMMUNITY === '1' || SYNC_SKILLS;
 const FORCE_GITHUB = process.env.INSTALL_FORCE_GITHUB === '1';
@@ -594,36 +713,54 @@ async function handleMissingGentleAi(): Promise<'show-and-exit' | 'skip'> {
 // Phase 1 — Step 4 (4-agent-detect): detect agents
 // ============================================================================
 
-async function detectAgents(): Promise<AgentDetection> {
-  const claudePath = join(homedir(), '.claude');
-  const opencodePath = join(homedir(), '.config', 'opencode');
+export async function detectAgents(options: {
+  home?: string
+  root?: string
+  binaryExists?: (binary: string) => boolean
+} = {}): Promise<AgentDetection> {
+  const home = options.home ?? homedir();
+  const root = options.root ?? REPO_ROOT;
+  const binaryExists = options.binaryExists ?? (binary => which(binary) !== null);
+  const claudePath = join(home, '.claude');
+  const opencodePath = join(home, '.config', 'opencode');
 
-  const [claude, opencode] = await Promise.all([
-    stat(claudePath).then(
-      s => s.isDirectory(),
-      () => false,
-    ),
-    stat(opencodePath).then(
-      s => s.isDirectory(),
-      () => false,
-    ),
+  const [claudeDirectory, opencodeDirectory] = await Promise.all([
+    stat(claudePath).then(s => s.isDirectory(), () => false),
+    stat(opencodePath).then(s => s.isDirectory(), () => false),
   ]);
 
-  return { claudeCode: claude, opencode };
+  return {
+    claudeCode: claudeDirectory || binaryExists('claude'),
+    opencode: opencodeDirectory || binaryExists('opencode'),
+    codexCli: binaryExists('codex'),
+    codexConfigured: existsSync(join(root, '.codex', 'config.toml')),
+  };
 }
 
-function parseAgentsEnv(): AgentId[] | null {
-  const raw = process.env.INSTALL_AGENTS;
+export function parseAgentsEnv(raw = process.env.INSTALL_AGENTS): AgentId[] | null {
   if (!raw) { return null; }
   const parts = raw.split(',').map(s => s.trim()).filter(Boolean);
-  const valid: AgentId[] = [];
+  const valid = new Set<AgentId>();
   for (const p of parts) {
-    if (p === 'claude-code' || p === 'opencode') { valid.push(p); }
+    if (p === 'claude-code' || p === 'opencode' || p === 'codex') { valid.add(p); }
   }
-  return valid;
+  return [...valid];
 }
 
 async function promptAgentSelection(detected: AgentDetection): Promise<AgentId[]> {
+  // A validation, not a prompt — it must run in both modes. Skipping it in
+  // non-interactive mode would let the installer proceed with zero agents and
+  // silently configure nothing.
+  const codexAvailable = detected.codexCli || detected.codexConfigured;
+  if (!detected.claudeCode && !detected.opencode && !codexAvailable) {
+    log.error('No agent executable or Codex repository configuration detected.');
+    log.dim('  Claude Code: https://docs.claude.com/en/docs/claude-code');
+    log.dim('  OpenCode:    https://opencode.ai/docs');
+    log.dim('  Codex:       https://developers.openai.com/codex/');
+    log.dim('  Then re-run: bun run setup');
+    process.exit(1);
+  }
+
   if (NON_INTERACTIVE) {
     const fromEnv = parseAgentsEnv();
     if (fromEnv && fromEnv.length > 0) { return fromEnv; }
@@ -631,34 +768,24 @@ async function promptAgentSelection(detected: AgentDetection): Promise<AgentId[]
     const out: AgentId[] = [];
     if (detected.claudeCode) { out.push('claude-code'); }
     if (detected.opencode) { out.push('opencode'); }
+    if (codexAvailable) { out.push('codex'); }
     return out;
   }
 
-  if (!detected.claudeCode && !detected.opencode) {
-    log.error('No agents detected. Install Claude Code or OpenCode and re-run.');
-    log.dim('  Claude Code: https://docs.claude.com/en/docs/claude-code');
-    log.dim('  OpenCode:    https://opencode.ai/docs');
-    log.dim('  Then re-run: bun run setup');
-    process.exit(1);
-  }
-
-  if (detected.claudeCode && !detected.opencode) {
-    const ok = await tui.confirm({ message: 'Detected Claude Code. Configure for it?', initialValue: true });
-    if (tui.isCancel(ok)) { throw Object.assign(new Error('Aborted by user.'), { name: 'ExitPromptError' }); }
-    return ok ? ['claude-code'] : [];
-  }
-
-  if (detected.opencode && !detected.claudeCode) {
-    const ok = await tui.confirm({ message: 'Detected OpenCode. Configure for it?', initialValue: true });
-    if (tui.isCancel(ok)) { throw Object.assign(new Error('Aborted by user.'), { name: 'ExitPromptError' }); }
-    return ok ? ['opencode'] : [];
-  }
-
   const selected = await checkbox<AgentId>({
-    message: 'Detected both agents. Which to configure?',
+    message: 'Which detected/configured agents should this repository support?',
     choices: [
-      { name: 'Claude Code', value: 'claude-code', checked: true },
-      { name: 'OpenCode', value: 'opencode', checked: true },
+      ...(detected.claudeCode ? [{ name: 'Claude Code (executable/config found)', value: 'claude-code' as const, checked: true }] : []),
+      ...(detected.opencode ? [{ name: 'OpenCode (executable/config found)', value: 'opencode' as const, checked: true }] : []),
+      ...(codexAvailable
+        ? [{
+            name: detected.codexCli
+              ? 'Codex (CLI found; Desktop uses the same repository config)'
+              : 'Codex Desktop target (repository configured; CLI not found)',
+            value: 'codex' as const,
+            checked: true,
+          }]
+        : []),
     ],
     required: true,
   });
@@ -672,24 +799,6 @@ async function promptAgentSelection(detected: AgentDetection): Promise<AgentId[]
 
 function nodeModulesLooksReady(): boolean {
   return existsSync(join(REPO_ROOT, 'node_modules', '@playwright', 'test'));
-}
-
-// Playwright caches downloaded browsers in a per-OS directory. Detect any of
-// the documented locations as a proxy for "browsers installed". This avoids
-// spawning `bunx playwright --version` (which only verifies the package, not
-// the browsers themselves).
-function playwrightBrowsersInstalled(): boolean {
-  const overrides = [
-    process.env.PLAYWRIGHT_BROWSERS_PATH,
-  ].filter((p): p is string => Boolean(p) && p !== '0');
-  const home = homedir();
-  const candidates = [
-    ...overrides,
-    join(home, '.cache', 'ms-playwright'),
-    join(home, 'Library', 'Caches', 'ms-playwright'),
-    join(home, 'AppData', 'Local', 'ms-playwright'),
-  ];
-  return candidates.some(p => existsSync(p));
 }
 
 async function runDepsInstall(state: InstallState, forceKeys: Set<string>): Promise<void> {
@@ -894,24 +1003,11 @@ async function installCommunitySkills(
       log.dim(`  skipping ${slug} (already installed)`);
       continue;
     }
-    // Install into each selected agent's skills directory via `--agent`. Claude
-    // Code only discovers skills under `.claude/skills/` (plus ~/.claude/skills/,
-    // plugins, and --add-dir) — it NEVER scans `.agents/skills/`. Without an
-    // explicit `--agent`, `bunx skills add` writes only to `.agents/skills/` (the
-    // agent-agnostic store read by Copilot/OpenCode/Warp), so the skills stay
-    // invisible to Claude Code. Passing the selected agents lands each skill where
-    // that agent actually loads it.
-    const args = ['skills', 'add', item.package];
-    if (item.skill && item.skill !== '*') {
-      args.push('--skill', item.skill);
-    }
-    if (level === 'global') {
-      args.push('--global');
-    }
-    for (const agent of agents) {
-      args.push('--agent', agent);
-    }
-    args.push('--yes');
+    // Project skills install once into the canonical `.agents/skills/` store.
+    // Claude discovers that same tree through the generated `.claude/skills`
+    // alias. Global skills remain harness-specific, so only that level receives
+    // one `--agent` argument per selected agent.
+    const args = buildCommunitySkillArgs(item, level, agents);
 
     const s = tui.spinner();
     s.start(`Installing ${slug}…`);
@@ -919,6 +1015,15 @@ async function installCommunitySkills(
     if (result.ok) {
       s.stop(`Installed: ${slug}`);
       state.skills[stateKey] = 'installed';
+      // Only PROJECT level: these three are gitignored, re-fetched on every
+      // install and invisible to the updater, so they are the ones that can
+      // silently run their scaffold-day version forever.
+      if (level === 'project') {
+        state.communitySkillRefs = {
+          ...state.communitySkillRefs,
+          [slug]: { package: item.package, ref: remoteHeadRef(item.package), recordedAt: new Date().toISOString() },
+        };
+      }
     }
     else {
       s.stop(`Failed: ${slug} — ${(result.stderr || result.stdout).trim().slice(0, 120) || 'unknown error'}`);
@@ -950,16 +1055,41 @@ function stripJsoncComments(input: string): string {
     .replace(/^\s*\/\/.*$/gm, '');
 }
 
-async function discoverRequiredEnvVars(agents: AgentId[]): Promise<string[]> {
+function collectCodexMcpEnvVars(value: unknown, seen: Set<string>): void {
+  if (Array.isArray(value)) {
+    for (const entry of value) { collectCodexMcpEnvVars(entry, seen); }
+    return;
+  }
+  if (!value || typeof value !== 'object') { return; }
+  for (const [key, entry] of Object.entries(value)) {
+    if (key === 'bearer_token_env_var' && typeof entry === 'string') { seen.add(entry); }
+    else if (key === 'env_vars' && Array.isArray(entry)) {
+      for (const name of entry) { if (typeof name === 'string') { seen.add(name); } }
+    }
+    else { collectCodexMcpEnvVars(entry, seen); }
+  }
+}
+
+export async function discoverRequiredEnvVars(
+  agents: AgentId[],
+  root = REPO_ROOT,
+): Promise<string[]> {
   const seen = new Set<string>();
-  if (agents.includes('claude-code') && existsSync(CLAUDE_MCP_PATH)) {
-    const content = await readFile(CLAUDE_MCP_PATH, 'utf8');
+  const claudeMcpPath = root === REPO_ROOT ? CLAUDE_MCP_PATH : join(root, '.mcp.json');
+  const openCodeConfigPath = root === REPO_ROOT ? OPENCODE_CONFIG_PATH : join(root, 'opencode.jsonc');
+  const codexConfigPath = root === REPO_ROOT ? CODEX_CONFIG_PATH : join(root, '.codex', 'config.toml');
+  if (agents.includes('claude-code') && existsSync(claudeMcpPath)) {
+    const content = await readFile(claudeMcpPath, 'utf8');
     for (const m of content.matchAll(MCP_VAR_PATTERN)) { seen.add(m[1]); }
   }
-  if (agents.includes('opencode') && existsSync(OPENCODE_CONFIG_PATH)) {
-    const raw = await readFile(OPENCODE_CONFIG_PATH, 'utf8');
+  if (agents.includes('opencode') && existsSync(openCodeConfigPath)) {
+    const raw = await readFile(openCodeConfigPath, 'utf8');
     const content = stripJsoncComments(raw);
     for (const m of content.matchAll(OPENCODE_VAR_PATTERN)) { seen.add(m[1]); }
+  }
+  if (agents.includes('codex') && existsSync(codexConfigPath)) {
+    const parsed = Bun.TOML.parse(await readFile(codexConfigPath, 'utf8'));
+    collectCodexMcpEnvVars(parsed, seen);
   }
   return [...seen].sort();
 }
@@ -972,12 +1102,35 @@ export function parseEnvFile(content: string): Record<string, string> {
     const eq = line.indexOf('=');
     if (eq <= 0) { continue; }
     const key = line.slice(0, eq).trim();
-    let value = line.slice(eq + 1).trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"'))
-      || (value.startsWith('\'') && value.endsWith('\''))
-    ) {
+    // The comment scan runs on the RAW slice, BEFORE trimming. `.env.example`
+    // ships `DBHUB_TYPE=          # sqlserver | postgres`, and trimming first
+    // would delete the very whitespace that marks the `#` as a comment, leaving
+    // the comment itself as the value.
+    const rawValue = line.slice(eq + 1);
+    let value = rawValue.trim();
+    const quoted
+      = (value.startsWith('"') && value.endsWith('"') && value.length > 1)
+        || (value.startsWith('\'') && value.endsWith('\'') && value.length > 1);
+    if (quoted) {
       value = value.slice(1, -1);
+    }
+    else {
+      // Strip an inline comment from an UNQUOTED value. `.env.example` ships
+      // lines like `DBHUB_TYPE=          # sqlserver | postgres | mysql`, and
+      // without this the installer read the whole trailing string as the
+      // credential: a value that is wrong rather than missing, which fails at
+      // connect time looking like a broken database instead of a bad .env.
+      //
+      // Two things stay part of the value, and both are real:
+      //   - a `#` inside QUOTES, which is why this is the else branch
+      //   - a `#` with NO whitespace before it, because `PASS=pass#word` is a
+      //     password containing a hash, not a comment
+      // So the marker is whitespace-then-hash. Same rule as `stripInlineComments`
+      // in cli/lib/harness-env.ts, which is tested; kept as four characters of
+      // regex here rather than an import, because that module imports FROM this
+      // one and the dependency would be circular.
+      const comment = rawValue.search(/\s#/);
+      if (comment >= 0) { value = rawValue.slice(0, comment).trim(); }
     }
     out[key] = value;
   }
@@ -1085,15 +1238,16 @@ async function configureMcps(agents: AgentId[], state: InstallState): Promise<vo
       continue;
     }
     if (CRITICAL_VAR_NAMES.has(name)) {
-      // CRITICAL tool credentials (e.g. TAVILY_API_KEY) are owned by the day-0
-      // step, which prompts the whole critical set with the right context. Skip
-      // here to avoid double-asking; do NOT mark pending (day-0 collects it).
-      log.dim(`  ${name}: collected in the day-0 credentials step.`);
+      // OFFERED credentials are owned by the day-0 step, which prompts the
+      // whole set with the right context. Skip here to avoid double-asking; do
+      // NOT mark pending (day-0 offers it).
+      log.dim(`  ${name}: offered in the day-0 credentials step.`);
       continue;
     }
     if (INSTALLER_DEFERRED_VARS.has(name)) {
       stillPending.push(name);
-      log.dim(`  ${name}: deferred to \`bun run doctor\` (project-bound — needs backend / DB / workspace).`);
+      const scope = VAR_MANIFEST.find(s => s.name === name)?.scope ?? 'project';
+      log.dim(`  ${name}: deferred to \`bun run setup:doctor\` (${scope}-scoped: ${scope === 'project' ? 'needs your backend / DB' : 'a tool credential, optional'}).`);
       continue;
     }
     if (NON_INTERACTIVE) {
@@ -1133,37 +1287,40 @@ async function configureMcps(agents: AgentId[], state: InstallState): Promise<vo
 }
 
 // ----------------------------------------------------------------------------
-// Day-0 credentials (the CRITICAL set — project-INDEPENDENT tool credentials)
+// Day-0 credentials: the OFFERED set (manifest `critical: true`)
 // ----------------------------------------------------------------------------
 //
-// The installer prompts ONLY for the CRITICAL set (manifest `critical: true`),
-// identical across both boilerplates:
-//   - ATLASSIAN_URL / ATLASSIAN_EMAIL / ATLASSIAN_API_TOKEN — Jira/acli tool
-//   - RESEND_API_KEY — email-testing tool (also authenticates the resend CLI)
-//   - TAVILY_API_KEY — the pre-configured Tavily web-search MCP
-// These exist independent of any project-under-test, so a fresh clone can
-// provide them on day-0.
+// The installer OFFERS the credentials the manifest marks `critical` and never
+// requires one: skip is a first-class answer, and nothing later blocks on it
+// (ADR-0005). Which vars those are is the manifest's call (`criticalVars()`);
+// today it is the Atlassian pair plus the site host, which goes to
+// .agents/project.yaml rather than .env. A human is at the keyboard at day-0,
+// so it is the cheapest moment to paste a credential the Jira scripts will
+// need; that is the whole reason the offer exists.
 //
-// Everything else is NON-critical and is NEVER asked here (nor warned about):
+// Everything else is NEVER asked here (nor warned about):
 //   - TEST_ENV — written to its manifest default ("local") WITHOUT prompting.
-//   - LOCAL_USER_* / STAGING_USER_*, XRAY_*, DBHUB_*, API_*, POSTMAN_*, … —
-//     project-dependent; surfaced in the closing "Next steps" list, settable
+//   - every project-scoped var (your app's login, database, API) and every
+//     tooling var — listed by scope in the closing "Next steps", settable
 //     later via `bun run setup --variables`.
+//   - MCP servers that run at harness level (web search, Postman) and CLI
+//     logins (acli, resend) — printed as guidance at the close; nothing to
+//     type into .env.
 
-// Per-critical-var prompt context (grouped note shown before the prompt block).
+// Per-offered-var prompt context (grouped note shown before the prompt block).
 // Vars without an entry are prompted with just their name.
 const CRITICAL_VAR_NOTES: Record<string, { title: string, body: string }> = {
   ATLASSIAN_URL: {
+    title: 'Atlassian site host (Jira / acli)',
+    body: 'e.g. https://your-org.atlassian.net\n'
+      + 'Stored in .agents/project.yaml (versioned), NOT in .env — it is project\n'
+      + 'identity, and a stale copy in .env silently pointed the sync scripts and\n'
+      + 'the Jira-Direct TMS provider at a dead site. Read it back any time with\n'
+      + '`bun run --silent jira:url`.',
+  },
+  ATLASSIAN_EMAIL: {
     title: 'Atlassian credentials (Jira / acli)',
     body: 'Used by acli + scripts/sync-jira-*.ts. Get a token at: https://id.atlassian.com/manage-profile/security/api-tokens',
-  },
-  RESEND_API_KEY: {
-    title: 'Resend API key (email testing)',
-    body: 'Used for email-flow tests (signup, password reset, magic links). Get a key: https://resend.com/api-keys — Docs: https://resend.com/docs/api-reference/introduction',
-  },
-  TAVILY_API_KEY: {
-    title: 'Tavily API key (web-search MCP)',
-    body: 'Powers the pre-configured Tavily MCP for community-fix / troubleshooting research. Get a key: https://app.tavily.com',
   },
 };
 
@@ -1186,9 +1343,47 @@ async function configureDayZeroCredentials(state: InstallState): Promise<void> {
     log.dim(`  TEST_ENV: already set to "${currentTestEnv}".`);
   }
 
-  // ── CRITICAL tool credentials (idempotent, project-independent) ──────────
+  // ── OFFERED credentials (idempotent; skip is a first-class answer) ────────
   for (const spec of criticalVars()) {
     const name = spec.name;
+
+    // A var sourced outside `.env` is asked for here like any other, but
+    // PERSISTED to its own home. ATLASSIAN_URL goes to `.agents/project.yaml`:
+    // it is a public hostname and project identity, and while it lived in `.env`
+    // a stale copy inherited from the parent shell shadowed the file in silence.
+    if (valueSourceOf(spec) === 'atlassian-instance') {
+      let existing: string | null = null;
+      try { existing = resolveAtlassianInstance().baseUrl; }
+      catch { existing = null; }
+
+      if (existing !== null) {
+        log.dim(`  ${name}: already set (${existing}).`);
+        continue;
+      }
+      if (NON_INTERACTIVE) {
+        log.warn(
+          `${name}: the Atlassian host is not set in .agents/project.yaml and non-interactive mode `
+          + 'cannot prompt. Jira steps will be skipped — fix with `bun run agents:setup`.',
+        );
+        continue;
+      }
+      const noteInfo = CRITICAL_VAR_NOTES[name];
+      if (noteInfo) { tui.note(noteInfo.body, noteInfo.title); }
+      const value = await promptForVar(name);
+      if (value.length === 0) {
+        log.warn('  Atlassian host left empty — Jira steps will be skipped. Set it later with `bun run agents:setup`.');
+        continue;
+      }
+      try {
+        const written = writeAtlassianUrlToYaml(value);
+        log.dim(`  ${name} → .agents/project.yaml (${written}).`);
+      }
+      catch (err) {
+        log.warn(`  Could not write the Atlassian host: ${(err as Error).message}`);
+      }
+      continue;
+    }
+
     const fromFile = (envValues[name] ?? '').trim();
     const fromProcess = (process.env[name] ?? '').trim();
     if (fromFile.length > 0 || fromProcess.length > 0) {
@@ -1218,36 +1413,16 @@ async function configureDayZeroCredentials(state: InstallState): Promise<void> {
     log.success(`Wrote ${Object.keys(newValues).length} day-0 var(s) to .env: ${Object.keys(newValues).join(', ')}`);
   }
 
-  // Refresh MCP per-server status for any server whose secrets include a
-  // critical var we just collected (e.g. tavily ← TAVILY_API_KEY), since
-  // configureMcps deferred those to this step.
+  // Refresh MCP per-server status for any server whose secrets include an
+  // offered var we just collected, since configureMcps deferred those to this
+  // step. (No committed server depends on one today; kept so a project that
+  // adds such a server keeps an accurate status line.)
   const merged = { ...envValues, ...newValues };
   for (const [server, secrets] of Object.entries(MCP_SERVER_SECRETS)) {
     if (secrets.length === 0) { continue; }
     if (!secrets.some(s => CRITICAL_VAR_NAMES.has(s))) { continue; }
     const anyMissing = secrets.some(s => !merged[s] || merged[s].trim().length === 0);
     state.mcps[server] = anyMissing ? 'placeholder' : 'configured-with-key';
-  }
-
-  // ── Resend CLI authentication attempt ────────────────────────────────────
-  const resendToken = (process.env.RESEND_API_KEY ?? '').trim();
-  if (resendToken.length > 0 && !NON_INTERACTIVE) {
-    const resendBin = tryRun('resend', ['--version']);
-    if (!resendBin.ok) {
-      log.dim('  resend CLI not installed — skipping auto-login. Install: npm i -g resend-cli');
-    }
-    else {
-      const loginRes = spawnSync('resend', ['login', '--key', resendToken], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: 10000,
-      });
-      if (loginRes.status === 0) {
-        process.stdout.write(`${tui.statusIcon('ok')} resend CLI authenticated.\n`);
-      }
-      else {
-        process.stdout.write(`${tui.statusIcon('warn')} resend CLI auto-login failed (exit ${loginRes.status}). Run manually: resend login\n`);
-      }
-    }
   }
 }
 
@@ -1317,7 +1492,7 @@ async function offerDirenvAutoload(): Promise<void> {
 
   if (!info.installed) {
     log.info('direnv not installed (optional).');
-    log.dim('  Launch agents with: bun claude  /  bun opencode  (dotenv-cli loads .env automatically).');
+    log.dim('  Launch agents with: bun claude  /  bun opencode  /  bun codex  (dotenv-cli loads .env automatically).');
     log.dim(`  Or install direnv for shell autoload: ${installHintForPlatform()}`);
     return;
   }
@@ -1326,12 +1501,20 @@ async function offerDirenvAutoload(): Promise<void> {
     log.dim('  Tip: direnv on Windows works best in Git Bash. PowerShell support is experimental and requires direnv 2.37+.');
   }
 
+  // `direnv allow` approves a file that EXECUTES on every `cd`. An unattended
+  // run (an AI agent, CI) must not grant that on the human's behalf: skip and
+  // say so, instead of letting `maybeConfirm`'s default-yes approve it silently.
+  if (NON_INTERACTIVE) {
+    log.dim('  skipped (non-interactive): run `direnv allow` yourself if you want shell autoload.');
+    return;
+  }
+
   const proceed = await maybeConfirm(
     'Run `direnv allow` so the repo\'s .envrc auto-loads .env into your shell?',
     true,
   );
   if (!proceed) {
-    log.dim('  Skipped. Launch agents with: bun claude  /  bun opencode.');
+    log.dim('  Skipped. Launch agents with: bun claude  /  bun opencode  /  bun codex.');
     return;
   }
   const result = tryRun('direnv', ['allow', REPO_ROOT]);
@@ -1340,7 +1523,7 @@ async function offerDirenvAutoload(): Promise<void> {
     log.dim(`  Reminder: add this to your shell rc if not already done: ${shellHookHint(info)}`);
   }
   else {
-    log.warn('direnv allow failed. Launch agents with: bun claude  /  bun opencode.');
+    log.warn('direnv allow failed. Launch agents with: bun claude  /  bun opencode  /  bun codex.');
     log.dim(`  ${(result.stderr || result.stdout).trim().slice(0, 200)}`);
   }
 }
@@ -1665,11 +1848,18 @@ function verifyExternalClis(state: InstallState): CliResult[] {
 // State persistence
 // ============================================================================
 
+export function migrateAgentIds(value: unknown): AgentId[] {
+  if (!Array.isArray(value)) { return []; }
+  return [...new Set(value.filter((agent): agent is AgentId =>
+    agent === 'claude-code' || agent === 'opencode' || agent === 'codex'))];
+}
+
 async function loadPriorState(): Promise<InstallState | null> {
   if (!existsSync(STATE_PATH)) { return null; }
   try {
     const raw = await readFile(STATE_PATH, 'utf8');
     const parsed = JSON.parse(raw) as InstallState;
+    parsed.agents = migrateAgentIds(parsed.agents);
     // Back-fill postInstall for state files written before this field existed.
     parsed.postInstall ??= {
       agentsSetup: 'pending',
@@ -1694,7 +1884,7 @@ async function writeInstallState(state: InstallState): Promise<void> {
   log.success(`Wrote ${STATE_PATH}`);
 }
 
-function buildInitialState(prior: InstallState | null): InstallState {
+export function buildInitialState(prior: InstallState | null): InstallState {
   if (prior && prior.version === 1) {
     // Ensure all sections exist on older state files (forward-compat).
     prior.steps ??= {};
@@ -1738,6 +1928,7 @@ function buildInitialState(prior: InstallState | null): InstallState {
 
     return {
       ...prior,
+      agents: migrateAgentIds(prior.agents),
       steps: prior.steps,
       skills: prior.skills ?? {},
       mcps: prior.mcps ?? {},
@@ -1763,6 +1954,32 @@ function buildInitialState(prior: InstallState | null): InstallState {
       jiraCheck: 'pending',
     },
   };
+}
+
+export function launchCommandsForAgents(agents: AgentId[]): string[] {
+  return agents.map(agent => agent === 'claude-code' ? 'bun claude' : `bun ${agent}`);
+}
+
+function describeAgentDetection(detected: AgentDetection): string {
+  const codex = detected.codexCli
+    ? 'CLI found; Desktop uses repository config'
+    : detected.codexConfigured
+      ? 'repository configured for Desktop; CLI not found'
+      : 'not configured';
+  return `Claude Code: ${detected.claudeCode ? 'found' : 'not found'} | OpenCode: ${detected.opencode ? 'found' : 'not found'} | Codex: ${codex}`;
+}
+
+export function repairRepositoryCompatibility(
+  root = REPO_ROOT,
+  platform: NodeJS.Platform = process.platform,
+): { alias: ReturnType<typeof repairClaudeSkillsAlias>, shadowingCommandsMoved: string[] } {
+  const alias = repairClaudeSkillsAlias(root, platform);
+  const shadowingCommandsMoved = removeShadowingCommands(root);
+  const check = checkAgentCompatibility(root, platform);
+  if (!check.ok) {
+    throw new Error(`Agent compatibility repair incomplete:\n${check.errors.join('\n')}`);
+  }
+  return { alias, shadowingCommandsMoved };
 }
 
 // ============================================================================
@@ -1791,7 +2008,13 @@ export function reloadDotEnv(): void {
       if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith('\'') && v.endsWith('\''))) {
         v = v.slice(1, -1);
       }
-      // Don't overwrite an already-populated value with an empty one from .env.
+      // The FILE WINS over an inherited process value. This is deliberate and must
+      // not be "corrected" to the usual non-override dotenv default: a stale value
+      // inherited from whatever spawned this process (an agent session, a parent
+      // shell) would otherwise shadow a corrected `.env` in silence and survive an
+      // application restart. `bun run vars:env:check` guards the same class
+      // repo-wide; see `cli/lib/atlassian-instance.ts` for the incident this comes
+      // from. Only an EMPTY file value defers to an already-populated process value.
       if (k && (v !== '' || !process.env[k])) { process.env[k] = v; }
     }
   }
@@ -1801,17 +2024,20 @@ export function reloadDotEnv(): void {
 }
 
 /**
- * Interactive loop that checks Atlassian credentials (ATLASSIAN_URL /
- * ATLASSIAN_EMAIL / ATLASSIAN_API_TOKEN) and probes /rest/api/3/myself.
+ * Interactive loop that checks Atlassian access and probes /rest/api/3/myself.
+ * The HOST comes from `.agents/project.yaml`; only ATLASSIAN_EMAIL /
+ * ATLASSIAN_API_TOKEN are env vars.
  * Up to 5 attempts; lets the user skip at any time.
  */
 async function jiraAuthLoop(): Promise<'authenticated' | 'skipped'> {
   const probe = async (): Promise<{ ok: boolean, reason: string }> => {
-    const url = process.env.ATLASSIAN_URL;
+    let url: string | null = null;
+    try { url = resolveAtlassianInstance().baseUrl; }
+    catch { url = null; }
     const email = process.env.ATLASSIAN_EMAIL;
     const token = process.env.ATLASSIAN_API_TOKEN;
     const missing: string[] = [];
-    if (!url) { missing.push('ATLASSIAN_URL'); }
+    if (!url) { missing.push('issue_tracker.atlassian_url in .agents/project.yaml'); }
     if (!email) { missing.push('ATLASSIAN_EMAIL'); }
     if (!token) { missing.push('ATLASSIAN_API_TOKEN'); }
     if (missing.length > 0) {
@@ -1849,7 +2075,7 @@ async function jiraAuthLoop(): Promise<'authenticated' | 'skipped'> {
         [
           '1. Open .env in your editor.',
           '2. Set the three Atlassian variables:',
-          '     ATLASSIAN_URL=https://your-org.atlassian.net',
+          '     (the SITE HOST is not a .env var — set it with `bun run agents:setup`)',
           '     ATLASSIAN_EMAIL=your-email@example.com',
           '     ATLASSIAN_API_TOKEN=...',
           '     (Get a token at https://id.atlassian.com/manage-profile/security/api-tokens)',
@@ -2024,7 +2250,14 @@ async function runInitialConfigurationPhase(state: InstallState): Promise<void> 
   // ── Step 12.4: Atlassian credentials & acli authentication ──────────────
   tui.section('Step 12.4: Atlassian credentials & acli authentication');
 
-  const MANUAL_ACLI_LOGIN = 'echo "$ATLASSIAN_API_TOKEN" | acli jira auth login --site "$ATLASSIAN_URL" --email "$ATLASSIAN_EMAIL" --token';
+  // Recovery instruction printed whenever acli auth cannot complete. The command
+  // syntax differs per shell, so pick the form that matches the platform. The
+  // site is read from `.agents/project.yaml` via `jira:url --slug`: `--site`
+  // wants the BARE host, and the old hint interpolated an env var that both
+  // carried a scheme acli rejects and no longer exists.
+  const MANUAL_ACLI_LOGIN = process.platform === 'win32'
+    ? '$env:ATLASSIAN_API_TOKEN | acli jira auth login --site (bun run --silent jira:url --slug) --email $env:ATLASSIAN_EMAIL --token'
+    : 'echo "$ATLASSIAN_API_TOKEN" | acli jira auth login --site "$(bun run --silent jira:url --slug)" --email "$ATLASSIAN_EMAIL" --token';
 
   if (state.postInstall.acliAuth === 'completed') {
     process.stdout.write(`${tui.statusIcon('ok')} acli already authenticated in a prior run.\n`);
@@ -2033,52 +2266,57 @@ async function runInitialConfigurationPhase(state: InstallState): Promise<void> 
     state.postInstall.acliAuth = 'skipped-non-interactive';
     log.dim('  INSTALL_SKIP_JIRA=1, skipping acli authentication.');
   }
+  else if (AUTO_NON_INTERACTIVE) {
+    // Step 10b never prompted for the ATLASSIAN_* credentials (no TTY), so
+    // there is nothing to authenticate with. Skip like every other Phase-5
+    // step instead of aborting — a no-TTY run is normal in Git Bash on
+    // Windows, whose MSYS pty is a named pipe and reports isTTY false.
+    state.postInstall.acliAuth = 'skipped-non-interactive';
+    process.stdout.write(`${tui.statusIcon('warn')} Skipped (no TTY). Set the host with \`bun run agents:setup\` and ATLASSIAN_EMAIL / ATLASSIAN_API_TOKEN in .env, then re-run: bun run setup\n`);
+  }
   else {
     // ATLASSIAN_* credentials were collected during Step 10b (day-0 creds).
     // Here we only verify they're present and run the acli auth.
-    const ATLASSIAN_VARS = ['ATLASSIAN_URL', 'ATLASSIAN_EMAIL', 'ATLASSIAN_API_TOKEN'] as const;
-    const stillMissing = ATLASSIAN_VARS.filter(v => !(process.env[v] && process.env[v].trim().length > 0));
+    const ATLASSIAN_VARS = ['ATLASSIAN_EMAIL', 'ATLASSIAN_API_TOKEN'] as const;
+    const stillMissing: string[] = ATLASSIAN_VARS.filter(
+      v => !(process.env[v] && process.env[v].trim().length > 0),
+    );
+    // The host is NOT an env var — it comes from `.agents/project.yaml`.
+    // `--site` wants the BARE host: passing the yaml value verbatim would hand
+    // acli a scheme (and possibly a trailing slash) that it rejects.
+    let site = '';
+    try { site = toSiteSlug(resolveAtlassianInstance().baseUrl); }
+    catch { stillMissing.unshift('issue_tracker.atlassian_url (.agents/project.yaml)'); }
+    const email = process.env.ATLASSIAN_EMAIL ?? '';
+
     if (stillMissing.length > 0) {
+      // Jira auth is not a prerequisite for Steps 13-14, so record the gap and
+      // let Phase 5 finish writing its catalogs rather than aborting the run.
       state.postInstall.acliAuth = 'skipped-non-interactive';
-      process.stdout.write(`${tui.statusIcon('fail')} Cannot run acli auth — ATLASSIAN_* still missing: ${stillMissing.join(', ')}\n`);
-      process.stdout.write('    Set them in .env (re-run setup) or run manually:\n');
+      process.stdout.write(`${tui.statusIcon('warn')} Cannot run acli auth — still missing: ${stillMissing.join(', ')}\n`);
+      process.stdout.write('    Set the host with `bun run agents:setup`, the credentials in .env, then re-run `bun run setup` — or run manually:\n');
       process.stdout.write(`    ${MANUAL_ACLI_LOGIN}\n`);
       await writeInstallState(state);
-      process.exit(1);
     }
-
     // Probe existing session: a read-only Jira search returns exit 0 if a session exists.
-    const probe = spawnSync('acli', ['jira', 'workitem', 'search', '--jql', 'created >= -1d', '--limit', '1', '--json'], {
+    else if (spawnSync('acli', ['jira', 'workitem', 'search', '--jql', 'created >= -1d', '--limit', '1', '--json'], {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 8000,
-    });
-
-    if (probe.status === 0) {
+    }).status === 0) {
       state.postInstall.acliAuth = 'completed';
       process.stdout.write(`${tui.statusIcon('ok')} acli already authenticated (existing session detected).\n`);
     }
     else {
       // No session — run the login. Pipe the token via spawnSync `input` to
       // avoid shell injection risks (no `echo $TOKEN | ...` expansion).
-      const url = process.env.ATLASSIAN_URL;
-      const email = process.env.ATLASSIAN_EMAIL;
-      let token = process.env.ATLASSIAN_API_TOKEN;
-
-      if (!url || !email || !token) {
-        // Non-interactive without all three vars preloaded → hard fail.
-        state.postInstall.acliAuth = 'skipped-non-interactive';
-        process.stdout.write(`${tui.statusIcon('fail')} Cannot run acli auth login — ATLASSIAN_URL / ATLASSIAN_EMAIL / ATLASSIAN_API_TOKEN missing.\n`);
-        process.stdout.write(`    Manual auth: ${MANUAL_ACLI_LOGIN}\n`);
-        await writeInstallState(state);
-        process.exit(1);
-      }
+      let token = process.env.ATLASSIAN_API_TOKEN ?? '';
 
       const MAX_ATTEMPTS = 3;
       let success = false;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         const loginRes = spawnSync(
           'acli',
-          ['jira', 'auth', 'login', '--site', url, '--email', email, '--token'],
+          ['jira', 'auth', 'login', '--site', site, '--email', email, '--token'],
           {
             input: token,
             stdio: ['pipe', 'inherit', 'inherit'],
@@ -2108,11 +2346,13 @@ async function runInitialConfigurationPhase(state: InstallState): Promise<void> 
       }
 
       if (!success) {
+        // Record the failure and carry on: Steps 13-14 write the catalog
+        // placeholders the skills reference, and the closing summary reports
+        // acliAuth: failed. Aborting here left every re-run stuck at 12.4.
         state.postInstall.acliAuth = 'failed';
         process.stdout.write(`${tui.statusIcon('fail')} acli auth login failed after ${MAX_ATTEMPTS} attempts.\n`);
         process.stdout.write(`    Manual auth: ${MANUAL_ACLI_LOGIN}\n`);
         await writeInstallState(state);
-        process.exit(1);
       }
     }
   }
@@ -2294,14 +2534,15 @@ function statusFor(found: number, total: number): string {
 // ============================================================================
 
 /**
- * Print the "Next steps — finish later" block: every NON-critical manifest var
- * that is still empty in `.env`, each with its `obtainHint`. These are NEVER
- * asked at install and NEVER warned about — they live here so the user knows
- * where to get them and that `bun run setup --variables` sets them.
+ * Print the "Next steps — finish later" block: every non-offered manifest var
+ * that is still empty in `.env`, grouped by SCOPE (ADR-0005), each with its
+ * `obtainHint`. These are NEVER asked at install and NEVER warned about — they
+ * live here so the user knows where to get them and that `bun run setup
+ * --variables` sets them. The project block is titled as what it is: examples
+ * to rename or delete when the framework is adapted.
  *
- * Excluded: TEST_ENV (carries a default the installer already wrote). DEV-only
- * infra-autogenerated vars (Supabase/Vercel) do not exist in the QA manifest,
- * so nothing further to exclude here.
+ * Excluded: TEST_ENV (carries a default the installer already wrote) and
+ * GitHub-only vars (no `.env` slot; `setup --variables --remote` pushes them).
  */
 function printNonCriticalNextSteps(): void {
   let envValues: Record<string, string> = {};
@@ -2312,20 +2553,75 @@ function printNonCriticalNextSteps(): void {
 
   const pending = nonCriticalVars().filter((spec) => {
     if (spec.defaultValue !== undefined) { return false; } // e.g. TEST_ENV
+    if (!spec.destinations.includes('local')) { return false; }
     const value = (envValues[spec.name] ?? '').trim();
     return value.length === 0;
   });
 
   if (pending.length === 0) { return; }
 
-  tui.section('Next steps — finish later (non-critical vars)');
-  process.stdout.write(`  ${COLORS.dim}These are project-dependent — not needed to start. Set them with:${COLORS.reset}\n`);
+  tui.section('Next steps — finish later (optional vars, by scope)');
+  process.stdout.write(`  ${COLORS.dim}Nothing here blocks the agent. Set what your project needs with:${COLORS.reset}\n`);
   process.stdout.write(`      ${COLORS.cyan}bun run setup --variables${COLORS.reset}\n\n`);
-  for (const spec of pending) {
-    process.stdout.write(`  • ${COLORS.bold}${spec.name}${COLORS.reset}\n`);
-    process.stdout.write(`    ${COLORS.dim}${spec.obtainHint ?? ''}${COLORS.reset}\n`);
+  const groups: Array<{ scope: 'core' | 'tooling' | 'project', title: string }> = [
+    { scope: 'core', title: 'Framework (behind a feature switch: Xray sync, Jira host)' },
+    { scope: 'tooling', title: 'Tooling (optional; may be provided elsewhere)' },
+    { scope: 'project', title: 'Project-under-test examples: rename or delete when you adapt the framework' },
+  ];
+  for (const group of groups) {
+    const inScope = pending.filter(spec => spec.scope === group.scope);
+    if (inScope.length === 0) { continue; }
+    process.stdout.write(`  ${COLORS.bold}${group.title}${COLORS.reset}\n`);
+    for (const spec of inScope) {
+      process.stdout.write(`  • ${COLORS.bold}${spec.name}${COLORS.reset}${spec.featureGate ? `${COLORS.dim} (only when ${spec.featureGate} is on)${COLORS.reset}` : ''}\n`);
+      process.stdout.write(`    ${COLORS.dim}${spec.obtainHint ?? ''}${COLORS.reset}\n`);
+    }
+    process.stdout.write('\n');
   }
-  process.stdout.write('\n');
+}
+
+/**
+ * Print how to connect the tools that live OUTSIDE `.env`: the MCP servers
+ * that run at harness level (connected once per machine, resolved by
+ * capability) and the CLIs that keep their own login. Guidance only: nothing
+ * here is prompted, written or verified by the installer.
+ */
+function printHarnessLevelGuidance(): void {
+  tui.section('Tools that authenticate outside .env (connect once per machine)');
+  process.stdout.write(`  ${COLORS.dim}These MCP servers are not in .mcp.json on purpose: a remote server whose only project-side content is an API key is the harness's business. Skills resolve them by capability.${COLORS.reset}\n`);
+  for (const mcp of HARNESS_LEVEL_MCPS) {
+    process.stdout.write(`  • ${COLORS.bold}${mcp.id}${COLORS.reset}${mcp.capability ? ` (${mcp.capability})` : ''}: ${mcp.purpose}\n`);
+  }
+  for (const host of ['claude', 'opencode', 'codex'] as const) {
+    process.stdout.write(`    ${COLORS.cyan}${host}${COLORS.reset}: ${HARNESS_LEVEL_HOWTO[host].how}\n`);
+    process.stdout.write(`      ${COLORS.dim}${HARNESS_LEVEL_HOWTO[host].where}${COLORS.reset}\n`);
+  }
+  process.stdout.write(`  ${COLORS.dim}CLIs keep their own session:${COLORS.reset}\n`);
+  for (const cli of CLI_LOGINS) {
+    process.stdout.write(`  • ${COLORS.bold}${cli.cli}${COLORS.reset}: ${COLORS.cyan}${cli.login}${COLORS.reset}\n`);
+    process.stdout.write(`    ${COLORS.dim}${cli.note}${COLORS.reset}\n`);
+  }
+  process.stdout.write(`  ${COLORS.dim}bun run setup:doctor reports which of these servers your user-level harness config already declares.${COLORS.reset}\n\n`);
+}
+
+/**
+ * OFFERED manifest vars with no value yet, by NAME. Mirrors the day-0 step's
+ * own test: `.env` or the process for an env-file var, the yaml resolver for the
+ * Atlassian host. Never returns a value.
+ */
+function missingCriticalVarNames(): string[] {
+  let envValues: Record<string, string> = {};
+  if (existsSync(ENV_PATH)) {
+    try { envValues = parseEnvFile(readFileSync(ENV_PATH, 'utf8')); }
+    catch { /* unreadable .env → treat all as empty */ }
+  }
+  return criticalVars().filter((spec) => {
+    if (valueSourceOf(spec) === 'atlassian-instance') {
+      try { resolveAtlassianInstance(); return false; }
+      catch { return true; }
+    }
+    return (envValues[spec.name] ?? process.env[spec.name] ?? '').trim().length === 0;
+  }).map(spec => spec.name);
 }
 
 function printClosingSummary(state: InstallState): void {
@@ -2387,10 +2683,23 @@ function printClosingSummary(state: InstallState): void {
   const circled = ['⓪', '①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨'];
   let stepNum = 0;
 
-  if (state.pendingEnvVars.length > 0) {
+  // Non-interactive (an AI agent drove the install): nobody typed a credential,
+  // so the CRITICAL set is still empty too. Say exactly which keys the agent has
+  // to ask its human for, names only, instead of leaving it to infer them.
+  const askHuman = NON_INTERACTIVE ? [...new Set([...missingCriticalVarNames(), ...state.pendingEnvVars])] : [];
+
+  if (state.pendingEnvVars.length > 0 || askHuman.length > 0) {
     process.stdout.write(`${circled[stepNum]}  ${COLORS.bold}Fill missing env vars${COLORS.reset}  ${COLORS.yellow}(BLOCKS the agent from working with MCPs)${COLORS.reset}\n`);
-    process.stdout.write(`    ${COLORS.cyan}Edit .env → set: ${state.pendingEnvVars.join(', ')}${COLORS.reset}\n`);
-    process.stdout.write(`    ${COLORS.dim}Without these, MCP servers will 401/403 silently.${COLORS.reset}\n\n`);
+    if (askHuman.length > 0) {
+      process.stdout.write(`    ${COLORS.cyan}Ask the human for these ${askHuman.length} keys: ${askHuman.join(', ')}${COLORS.reset}\n`);
+      process.stdout.write(`    ${COLORS.dim}Then write them to .env (never paste a value into a chat or a commit).${COLORS.reset}\n`);
+    }
+    else {
+      process.stdout.write(`    ${COLORS.cyan}Edit .env → set: ${state.pendingEnvVars.join(', ')}${COLORS.reset}\n`);
+    }
+    process.stdout.write(`    ${COLORS.dim}Without these, MCP servers will 401/403 silently.${COLORS.reset}\n`);
+    process.stdout.write(`    ${COLORS.cyan}Then: bun run harness:env${COLORS.reset}  ${COLORS.dim}(regenerates the credential files Claude and OpenCode read at startup)${COLORS.reset}\n`);
+    process.stdout.write(`    ${COLORS.cyan}Then restart the agent session${COLORS.reset}  ${COLORS.dim}(MCP servers read credentials at startup, not later)${COLORS.reset}\n\n`);
     stepNum++;
   }
 
@@ -2403,7 +2712,7 @@ function printClosingSummary(state: InstallState): void {
 
   if (state.postInstall.acliAuth !== 'completed') {
     process.stdout.write(`${circled[stepNum]}  ${COLORS.bold}Authenticate acli (Atlassian CLI)${COLORS.reset}\n`);
-    process.stdout.write(`    ${COLORS.cyan}echo "$ATLASSIAN_API_TOKEN" | acli jira auth login --site "$ATLASSIAN_URL" --email "$ATLASSIAN_EMAIL" --token${COLORS.reset}\n`);
+    process.stdout.write(`    ${COLORS.cyan}echo "$ATLASSIAN_API_TOKEN" | acli jira auth login --site "$(bun run --silent jira:url --slug)" --email "$ATLASSIAN_EMAIL" --token${COLORS.reset}\n`);
     process.stdout.write(`    ${COLORS.dim}Writes a persistent session to ~/.config/acli/. The /acli skill needs this.${COLORS.reset}\n\n`);
     stepNum++;
   }
@@ -2432,7 +2741,8 @@ function printClosingSummary(state: InstallState): void {
   process.stdout.write(`${circled[stepNum]}  ${COLORS.bold}Open the agent${COLORS.reset}\n`);
   process.stdout.write(`    ${COLORS.cyan}bun claude${COLORS.reset}       ${COLORS.dim}(dotenv-cli loads .env)${COLORS.reset}\n`);
   process.stdout.write(`    ${COLORS.cyan}bun opencode${COLORS.reset}     ${COLORS.dim}(dotenv-cli loads .env)${COLORS.reset}\n`);
-  process.stdout.write(`    ${COLORS.dim}Or just \`claude\` / \`opencode\` if direnv autoload is set up.${COLORS.reset}\n\n`);
+  process.stdout.write(`    ${COLORS.cyan}bun codex${COLORS.reset}        ${COLORS.dim}(CLI; Codex Desktop opens this same repository)${COLORS.reset}\n`);
+  process.stdout.write(`    ${COLORS.dim}Or use the executable directly if direnv autoload is set up. Codex Desktop needs repository trust before hooks run.${COLORS.reset}\n\n`);
   stepNum++;
 
   process.stdout.write(`${circled[stepNum]}  ${COLORS.bold}Tour the stack${COLORS.reset}\n`);
@@ -2479,8 +2789,9 @@ function printClosingSummary(state: InstallState): void {
   process.stdout.write('  • Adapt KATA to your stack:      /adapt-framework\n');
   process.stdout.write('    (removes example tests + business maps; wires fixtures to your stack)\n\n');
 
-  // Next steps — non-critical vars still empty in .env (manifest-driven).
+  // Next steps — optional vars still empty in .env, by scope (manifest-driven).
   printNonCriticalNextSteps();
+  printHarnessLevelGuidance();
 
   // QA workflow quick reference
   tui.section('QA workflow quick reference');
@@ -2517,12 +2828,20 @@ function printClosingSummary(state: InstallState): void {
   process.stdout.write('→  caveman — token compression skill (recommended)\n');
   process.stdout.write(`   ${COLORS.dim}Cuts ~65-75% output tokens. Levels: lite | full (default) | ultra | wenyan.${COLORS.reset}\n`);
   process.stdout.write(`   ${COLORS.dim}Stop with: "normal mode" / "habla normal".${COLORS.reset}\n`);
+  // `--no-hooks` is deliberate. The installer defaults to `--all`, which installs
+  // the Claude Code plugin AND writes a second copy of the same two hooks into
+  // ~/.claude/settings.json — both fire every turn, injecting caveman twice per
+  // prompt. The flag keeps the plugin (it registers those hooks in its own
+  // plugin.json), the multi-agent coverage this repo needs for OpenCode, and the
+  // caveman-shrink MCP proxy. On Windows `irm | iex` cannot receive arguments
+  // (caveman #565), so we call the Node installer the script delegates to anyway.
   if (process.platform === 'win32') {
-    process.stdout.write('   irm https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.ps1 | iex\n');
+    process.stdout.write('   npx -y github:JuliusBrussee/caveman --no-hooks\n');
   }
   else {
-    process.stdout.write('   curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.sh | bash\n');
+    process.stdout.write('   curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.sh | bash -s -- --no-hooks\n');
   }
+  process.stdout.write(`   ${COLORS.dim}--no-hooks avoids a duplicate hook registration — see INSTALLER.md.${COLORS.reset}\n`);
   process.stdout.write(`   ${COLORS.dim}Docs: https://github.com/JuliusBrussee/caveman${COLORS.reset}\n\n`);
 
   process.stdout.write('→  ccstatusline — Claude Code statusline TUI configurator (cosmetic)\n');
@@ -2539,7 +2858,7 @@ function printClosingSummary(state: InstallState): void {
   process.stdout.write(`   ${COLORS.dim}Docs: https://docs.warp.dev/agent-platform/cli-agents/opencode/${COLORS.reset}\n\n`);
 
   // AI personality
-  process.stdout.write(`→  Curious who you're talking to? Read ${COLORS.cyan}docs/ai-personality.md${COLORS.reset}\n\n`);
+  process.stdout.write(`→  Curious who you're talking to? Run ${COLORS.cyan}bun run docs -- --page core/personalidad.html${COLORS.reset}\n\n`);
 
   // Reference
   tui.section('REFERENCE');
@@ -2688,9 +3007,7 @@ async function main(): Promise<void> {
     process.stdout.write(`${tui.headline('agentic-qa-boilerplate — sync community skills')}\n\n`);
     await verifyRepoRoot();
     const detected = await detectAgents();
-    log.info(
-      `Claude Code: ${detected.claudeCode ? 'found' : 'not found'} | OpenCode: ${detected.opencode ? 'found' : 'not found'}`,
-    );
+    log.info(describeAgentDetection(detected));
     const agents = await promptAgentSelection(detected);
     if (agents.length === 0) {
       log.warn('No agents selected — nothing to sync.');
@@ -2701,6 +3018,8 @@ async function main(): Promise<void> {
     const syncForceKeys = new Set<string>();
     await installCommunitySkills(agents, state, 'project', syncForceKeys);
     await installCommunitySkills(agents, state, 'global', syncForceKeys);
+    const compatibility = repairRepositoryCompatibility();
+    log.success(`Repository compatibility ready (Claude alias ${compatibility.alias.status}${compatibility.shadowingCommandsMoved.length > 0 ? `; moved ${compatibility.shadowingCommandsMoved.join(', ')} to ${SHADOWING_COMMANDS_BACKUP_DIR}/ because each shadowed a skill` : ''}).`);
     await writeInstallState(state);
     log.success(`Community skills synced to: ${agents.join(', ')}.`);
     process.exit(0);
@@ -2793,9 +3112,7 @@ async function main(): Promise<void> {
 
   tui.section('Step 4: Detecting agents');
   const detected = await detectAgents();
-  log.info(
-    `Claude Code: ${detected.claudeCode ? 'found' : 'not found'} | OpenCode: ${detected.opencode ? 'found' : 'not found'}`,
-  );
+  log.info(describeAgentDetection(detected));
   const agents = await promptAgentSelection(detected);
   state.agents = agents;
   if (agents.length === 0) {
@@ -2841,6 +3158,9 @@ async function main(): Promise<void> {
     await installCommunitySkills(agents, state, 'global', forceKeys);
   }
 
+  const compatibility = repairRepositoryCompatibility();
+  log.success(`Repository compatibility ready (Claude alias ${compatibility.alias.status}${compatibility.shadowingCommandsMoved.length > 0 ? `; moved ${compatibility.shadowingCommandsMoved.join(', ')} to ${SHADOWING_COMMANDS_BACKUP_DIR}/ because each shadowed a skill` : ''}).`);
+
   // ── PHASE 3 — CONFIGURATION ──────────────────────────────────────────────
   tui.phaseHeader(3, 'CONFIGURATION');
 
@@ -2871,25 +3191,73 @@ async function main(): Promise<void> {
   await runInitialConfigurationPhase(state);
   await writeInstallState(state);
 
+  // Per-harness credential surfaces. LAST, because it reads the `.env` every
+  // step above may have written to.
+  //
+  // Why the installer has to do this at all: a harness reads its config and
+  // spawns its MCP servers BEFORE any hook runs, so the only thing that reaches
+  // a server on a launch with no command line (a desktop harness, a natively
+  // launched supervised worker) is a file the harness reads at startup. And
+  // `opencode.jsonc` now points at `.auth/opencode/<VAR>` value files: measured
+  // on OpenCode 1.18.30, a MISSING `{file:}` target invalidates the WHOLE config
+  // and not just that one server, so those files have to exist before anyone
+  // runs `opencode`. This call is what guarantees they do on a fresh clone.
+  //
+  // DYNAMIC import on purpose: `cli/lib/harness-env.ts` imports the placeholder
+  // patterns from THIS file, and a static import here would close that cycle.
+  // Same pattern `cli/doctor.ts` already uses to reach this module.
+  await generateHarnessEnv();
+
   // Closing summary
   tui.section('Installation summary');
   printClosingSummary(state);
 }
 
-main().catch((err) => {
+/**
+ * Generate the per-harness credential surfaces. Never fatal: a failure here
+ * leaves the repo exactly as it was and the installer still finishes, because
+ * `bun run setup:doctor` reports the same drift and `bun run harness:env` fixes
+ * it. Prints variable NAMES only, never a value.
+ */
+async function generateHarnessEnv(): Promise<void> {
+  tui.section('Step 15: Harness credential surfaces');
+  try {
+    const { generate } = await import('./lib/harness-env.ts');
+    const result = generate();
+    log.success(
+      `${result.changed ? 'Wrote' : 'Already in sync:'} ${result.emitted.length} of `
+      + `${result.declared.length} declared variables `
+      + `(${result.excluded.length} not referenced by any MCP config, so not copied).`,
+    );
+    if (result.emitted.length > 0) {
+      process.stdout.write(`  emitted: ${result.emitted.join(', ')}\n`);
+    }
+    if (result.claude.skipped.length > 0) {
+      process.stdout.write(`  empty in .env, left out of the Claude env block: ${result.claude.skipped.join(', ')}\n`);
+    }
+  }
+  catch (err) {
+    log.warn(`Could not generate the harness credential surfaces: ${(err as Error).message}`);
+    process.stdout.write('  Run `bun run harness:env` once .env is in place; `bun run setup:doctor` reports the same gap.\n');
+  }
+}
+
+if (import.meta.main) {
+  void main().catch((err) => {
   // Handle both @inquirer ExitPromptError and our own clack cancel wrappers
-  const name = err && typeof err === 'object' && 'name' in err ? (err as { name: string }).name : '';
-  if (name === 'ExitPromptError' || (err instanceof Error && err.message === 'Aborted by user.')) {
-    tui.log.warn('Aborted by user.');
-    process.stdout.write('  To resume, re-run: bun run setup\n');
+    const name = err && typeof err === 'object' && 'name' in err ? (err as { name: string }).name : '';
+    if (name === 'ExitPromptError' || (err instanceof Error && err.message === 'Aborted by user.')) {
+      tui.log.warn('Aborted by user.');
+      process.stdout.write('  To resume, re-run: bun run setup\n');
+      process.stdout.write('  (Installer is idempotent — completed steps will skip on re-run.)\n');
+      process.exit(130);
+    }
+    tui.log.error(`Fatal: ${(err as Error).message ?? String(err)}`);
+    if (err instanceof Error && err.stack) {
+      process.stdout.write(`  ${err.stack}\n`);
+    }
+    tui.log.warn('Installation interrupted. To resume, re-run: bun run setup');
     process.stdout.write('  (Installer is idempotent — completed steps will skip on re-run.)\n');
-    process.exit(130);
-  }
-  tui.log.error(`Fatal: ${(err as Error).message ?? String(err)}`);
-  if (err instanceof Error && err.stack) {
-    process.stdout.write(`  ${err.stack}\n`);
-  }
-  tui.log.warn('Installation interrupted. To resume, re-run: bun run setup');
-  process.stdout.write('  (Installer is idempotent — completed steps will skip on re-run.)\n');
-  process.exit(1);
-});
+    process.exit(1);
+  });
+}

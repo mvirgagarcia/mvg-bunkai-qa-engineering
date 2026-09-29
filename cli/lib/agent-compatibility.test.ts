@@ -1,0 +1,1295 @@
+/* eslint-disable no-template-curly-in-string -- the fixtures below mirror .mcp.json verbatim, `${VAR}` included */
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+
+import { afterEach, describe, expect, test } from 'bun:test';
+
+import {
+  orcaAvailable,
+  PERSONALITY_CONTRACT,
+  proposeSessionTitle,
+  resolveWorktree,
+  sessionLabel,
+} from '../../.agents/hooks/personality-reinject.mjs';
+import { PersonalityReinject } from '../../.opencode/plugins/personality-reinject.js';
+import {
+  CLAUDE_HOOK_COMMAND,
+  CODEX_HOOK_COMMAND,
+  CODEX_HOOK_COMMAND_WINDOWS,
+  declaredMcpIds,
+  EXPECTED_MCP,
+  HOOK_IDENTITY_MARKER,
+  HOOK_ORCA_MARKER,
+  hookScriptPath,
+  KNOWN_MCP_IDS,
+  stripJsonComments,
+  validateEslintBlockWiring,
+  validateHookCompatibility,
+  validateMcpParity,
+} from './agent-compatibility-contracts.ts';
+import {
+  checkAgentCompatibility,
+  CLAUDE_INSTRUCTIONS_SHIM,
+  claudeSkillsAliasPlan,
+  commandsShadowingSkills,
+  COMPATIBILITY_GROUP_LABEL,
+  COMPATIBILITY_GROUP_ORDER,
+  describeAliasStatus,
+  groupCompatibilityErrors,
+  isInside,
+  normalizeNewlines,
+  POSIX_CLAUDE_SKILLS_TARGET,
+  removeShadowingCommands,
+  repairAgentSurfaces,
+  repairClaudeSkillsAlias,
+  SHADOWING_COMMANDS_BACKUP_DIR,
+  SKILLS_ALIAS_DEFERRED_MARKER,
+  SKILLS_ALIAS_MISSING_ERROR,
+  validateCanonicalSources,
+} from './agent-compatibility.ts';
+
+const REPO_ROOT = resolve(import.meta.dir, '..', '..');
+const temporaryRoots: string[] = [];
+
+afterEach(() => {
+  while (temporaryRoots.length > 0) {
+    const root = temporaryRoots.pop();
+    if (root) { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+function temporaryRoot(prefix = 'agent compatibility '): string {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  temporaryRoots.push(root);
+  return root;
+}
+
+function write(root: string, relativePath: string, content: string): void {
+  const destination = join(root, relativePath);
+  mkdirSync(dirname(destination), { recursive: true });
+  writeFileSync(destination, content);
+}
+
+function copyFromRepo(root: string, relativePath: string): void {
+  const destination = join(root, relativePath);
+  mkdirSync(dirname(destination), { recursive: true });
+  copyFileSync(join(REPO_ROOT, relativePath), destination);
+}
+
+// ---------------------------------------------------------------------------
+// Hook emitter harness. The emitter resolves identity from stdin (the harness
+// payload), from the environment and from the home directory, so every run
+// gets a sandboxed HOME and a PATH pointing at `<sandbox>/bin` — an `orca`
+// file there is what makes the conditional Orca line appear. The environment
+// is REPLACED, never inherited: the suite itself runs inside a harness whose
+// CLAUDE_* variables would otherwise decide the outcome.
+// ---------------------------------------------------------------------------
+
+const NODE_BINARY = Bun.which('node') ?? 'node';
+const HOOK_EMITTER = join(REPO_ROOT, '.agents/hooks/personality-reinject.mjs');
+
+interface EmitterRun {
+  exitCode: number
+  stdout: string
+  stderr: string
+}
+
+interface EmitterOptions {
+  input?: string
+  env?: Record<string, string>
+  home?: string
+}
+
+function runEmitter(options: EmitterOptions = {}): EmitterRun {
+  const home = options.home ?? temporaryRoot('agent identity home ');
+  const result = Bun.spawnSync({
+    cmd: [NODE_BINARY, HOOK_EMITTER],
+    cwd: REPO_ROOT,
+    stdin: new TextEncoder().encode(options.input ?? ''),
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: { PATH: join(home, 'bin'), HOME: home, USERPROFILE: home, ...options.env },
+  });
+  return {
+    exitCode: result.exitCode,
+    stdout: result.stdout.toString(),
+    stderr: result.stderr.toString(),
+  };
+}
+
+interface HookSpecificOutput {
+  hookEventName: string
+  additionalContext: string
+  sessionTitle?: string
+}
+
+function hookSpecificOutput(stdout: string): HookSpecificOutput {
+  const parsed = JSON.parse(stdout) as { hookSpecificOutput: HookSpecificOutput };
+  return parsed.hookSpecificOutput;
+}
+
+const CLAUDE_SESSION_PID = '4242';
+const CLAUDE_SESSION_ID = 'c0ffee12-3456-7890-abcd-ef0123456789';
+
+/** `~/.claude/sessions/<CLAUDE_PID>.json` as Claude Code writes it. */
+function claudeHome(name: string, nameSource: string): string {
+  const home = temporaryRoot('agent identity claude home ');
+  write(home, `.claude/sessions/${CLAUDE_SESSION_PID}.json`, `${JSON.stringify({
+    pid: Number(CLAUDE_SESSION_PID),
+    sessionId: CLAUDE_SESSION_ID,
+    name,
+    nameSource,
+  })}\n`);
+  return home;
+}
+
+const CLAUDE_ENV = { CLAUDE_PROJECT_DIR: REPO_ROOT, CLAUDE_PID: CLAUDE_SESSION_PID };
+
+function claudePayload(prompt: string): string {
+  return JSON.stringify({
+    session_id: CLAUDE_SESSION_ID,
+    transcript_path: join(REPO_ROOT, 'transcript.jsonl'),
+    cwd: REPO_ROOT,
+    permission_mode: 'default',
+    hook_event_name: 'UserPromptSubmit',
+    prompt,
+  });
+}
+
+/** Codex pipes `turn_id` too, and keeps its thread names in a JSONL index. */
+function codexHome(threadName: string, sessionId: string): string {
+  const home = temporaryRoot('agent identity codex home ');
+  write(home, '.codex/session_index.jsonl', [
+    JSON.stringify({ id: 'older-session', thread_name: 'something else', updated_at: 1 }),
+    JSON.stringify({ id: sessionId, thread_name: threadName, updated_at: 2 }),
+    '',
+  ].join('\n'));
+  return home;
+}
+
+function codexPayload(sessionId: string, prompt: string): string {
+  return JSON.stringify({
+    session_id: sessionId,
+    turn_id: 'turn-1',
+    transcript_path: null,
+    cwd: REPO_ROOT,
+    hook_event_name: 'UserPromptSubmit',
+    model: 'gpt-5.1-codex',
+    permission_mode: 'default',
+    prompt,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Inline fixtures: the six servers this repo ships plus `supabase` (a
+// downstream server the contract does not know), spelled per host. Written
+// here rather than copied so the tests describe the contract on their own,
+// whatever the real repo looks like at the moment they run. Each host file is
+// composed from the ids a test declares, so one fixture describes both this
+// boilerplate and a downstream project with a different server set.
+// ---------------------------------------------------------------------------
+
+/** The set this boilerplate ships (and the strict per-host shapes cover). */
+const BOILERPLATE_IDS = ['context7', 'playwright', 'dbhub', 'openapi'];
+/**
+ * A downstream set: no `dbhub`, plus servers the contract has no shape for
+ * (`tavily` and `postman` left the shipped set with ADR-0005 and are now what a
+ * project that keeps them looks like; `supabase` never had one).
+ */
+const PROJECT_IDS = ['context7', 'tavily', 'playwright', 'openapi', 'postman', 'supabase'];
+
+const MCP_SERVERS: Record<string, unknown> = {
+  context7: { command: 'bunx', args: ['-y', '@upstash/context7-mcp@4.0.3'] },
+  tavily: {
+    type: 'http',
+    url: 'https://mcp.tavily.com/mcp/',
+    headers: { Authorization: 'Bearer ${TAVILY_API_KEY}' },
+  },
+  playwright: {
+    command: 'bunx',
+    args: [
+      '@playwright/mcp@0.0.79',
+      '--caps',
+      'vision,pdf,testing,tracing,tabs',
+      '--timeout-action',
+      '10000',
+      '--timeout-navigation',
+      '30000',
+      '--viewport-size',
+      '1920x1080',
+    ],
+  },
+  dbhub: {
+    command: 'bunx',
+    args: ['-y', '@bytebase/dbhub@1.2.1', '--config', 'dbhub.toml'],
+    env: { DBHUB_DATABASE: '${DBHUB_DATABASE}', DBHUB_HOST: '${DBHUB_HOST}', DBHUB_PASSWORD: '${DBHUB_PASSWORD}', DBHUB_PORT: '${DBHUB_PORT}', DBHUB_TYPE: '${DBHUB_TYPE}', DBHUB_USER: '${DBHUB_USER}' },
+  },
+  openapi: {
+    command: 'bunx',
+    args: ['-y', '@ivotoby/openapi-mcp-server@1.16.1', '--tools', 'dynamic'],
+    env: { API_BASE_URL: '${API_BASE_URL}', OPENAPI_SPEC_PATH: '${OPENAPI_SPEC_PATH}' },
+  },
+  postman: {
+    type: 'http',
+    url: 'https://mcp.postman.com/mcp',
+    headers: { Authorization: 'Bearer ${POSTMAN_API_KEY}' },
+  },
+  supabase: {
+    command: 'bunx',
+    args: ['-y', '@supabase/mcp-server-supabase@latest', '--read-only'],
+    env: { SUPABASE_ACCESS_TOKEN: '${SUPABASE_ACCESS_TOKEN}', LOG_LEVEL: 'error' },
+  },
+};
+
+// Comments and trailing commas on purpose: this is what Prettier writes.
+const OPENCODE_SERVERS: Record<string, string> = {
+  context7: `    "context7": {
+      "type": "local",
+      "command": ["bunx", "-y", "@upstash/context7-mcp@4.0.3"],
+      "enabled": true,
+    },`,
+  tavily: `    "tavily": {
+      "type": "remote",
+      "url": "https://mcp.tavily.com/mcp/",
+      "enabled": true,
+      "headers": {
+        "Authorization": "Bearer {env:TAVILY_API_KEY}",
+      },
+    },`,
+  playwright: `    "playwright": {
+      "type": "local",
+      "command": [
+        "bunx",
+        "@playwright/mcp@0.0.79",
+        "--caps",
+        "vision,pdf,testing,tracing,tabs",
+        "--timeout-action",
+        "10000",
+        "--timeout-navigation",
+        "30000",
+        "--viewport-size",
+        "1920x1080",
+      ],
+      "enabled": true,
+    },`,
+  dbhub: `    "dbhub": {
+      "type": "local",
+      "command": ["bunx", "-y", "@bytebase/dbhub@1.2.1", "--config", "dbhub.toml"],
+      "enabled": true,
+      "environment": {
+        "DBHUB_DATABASE": "{env:DBHUB_DATABASE}",
+        "DBHUB_HOST": "{env:DBHUB_HOST}",
+        "DBHUB_PASSWORD": "{env:DBHUB_PASSWORD}",
+        "DBHUB_PORT": "{env:DBHUB_PORT}",
+        "DBHUB_TYPE": "{env:DBHUB_TYPE}",
+        "DBHUB_USER": "{env:DBHUB_USER}",
+      },
+    },`,
+  openapi: `    // schema-read-only: no token here
+    "openapi": {
+      "type": "local",
+      "command": ["bunx", "-y", "@ivotoby/openapi-mcp-server@1.16.1", "--tools", "dynamic"],
+      "enabled": true,
+      "environment": {
+        "API_BASE_URL": "{env:API_BASE_URL}",
+        "OPENAPI_SPEC_PATH": "{env:OPENAPI_SPEC_PATH}",
+      },
+    },`,
+  postman: `    "postman": {
+      "type": "remote",
+      "url": "https://mcp.postman.com/mcp",
+      "enabled": true,
+      "headers": {
+        "Authorization": "Bearer {env:POSTMAN_API_KEY}",
+      },
+    },`,
+  supabase: `    "supabase": {
+      "type": "local",
+      "command": ["bunx", "-y", "@supabase/mcp-server-supabase@latest", "--read-only"],
+      "enabled": true,
+      "environment": {
+        "SUPABASE_ACCESS_TOKEN": "{env:SUPABASE_ACCESS_TOKEN}",
+        "LOG_LEVEL": "error",
+      },
+    },`,
+};
+
+const CODEX_SERVERS: Record<string, string> = {
+  context7: `[mcp_servers.context7]
+command = "bunx"
+enabled = true
+args = ["-y", "@upstash/context7-mcp@4.0.3"]
+`,
+  tavily: `[mcp_servers.tavily]
+url = "https://mcp.tavily.com/mcp/"
+bearer_token_env_var = "TAVILY_API_KEY"
+enabled = true
+`,
+  playwright: `[mcp_servers.playwright]
+command = "bunx"
+enabled = true
+args = ["@playwright/mcp@0.0.79", "--caps", "vision,pdf,testing,tracing,tabs", "--timeout-action", "10000", "--timeout-navigation", "30000", "--viewport-size", "1920x1080"]
+`,
+  dbhub: `[mcp_servers.dbhub]
+command = "bunx"
+enabled = true
+args = ["-y", "@bytebase/dbhub@1.2.1", "--config", "dbhub.toml"]
+env_vars = ["DBHUB_DATABASE", "DBHUB_HOST", "DBHUB_PASSWORD", "DBHUB_PORT", "DBHUB_TYPE", "DBHUB_USER"]
+`,
+  openapi: `[mcp_servers.openapi]
+command = "bunx"
+enabled = true
+args = ["-y", "@ivotoby/openapi-mcp-server@1.16.1", "--tools", "dynamic"]
+env_vars = ["API_BASE_URL", "OPENAPI_SPEC_PATH"]
+`,
+  postman: `[mcp_servers.postman]
+url = "https://mcp.postman.com/mcp"
+bearer_token_env_var = "POSTMAN_API_KEY"
+enabled = true
+`,
+  supabase: `[mcp_servers.supabase]
+command = "bunx"
+enabled = true
+args = ["-y", "@supabase/mcp-server-supabase@latest", "--read-only"]
+env_vars = ["SUPABASE_ACCESS_TOKEN"]
+
+[mcp_servers.supabase.env]
+LOG_LEVEL = "error"
+`,
+};
+
+function mcpJson(ids: string[]): string {
+  const mcpServers = Object.fromEntries(ids.map(id => [id, MCP_SERVERS[id]]));
+  return `${JSON.stringify({ mcpServers }, null, 2)}\n`;
+}
+
+function opencodeJsonc(ids: string[]): string {
+  return `{
+  // OpenCode shared team config
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["@warp-dot-dev/opencode-warp"],
+  "mcp": {
+${ids.map(id => OPENCODE_SERVERS[id]).join('\n')}
+  },
+}
+`;
+}
+
+function codexToml(ids: string[]): string {
+  return `[shell_environment_policy]
+inherit = "core"
+
+${ids.map(id => CODEX_SERVERS[id]).join('\n')}`;
+}
+
+function hookSettings(command: string, windows?: string): string {
+  const hook: Record<string, unknown> = { type: 'command', command, timeout: 5 };
+  if (windows) { hook.commandWindows = windows; }
+  return `${JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [hook] }] } }, null, 2)}\n`;
+}
+
+/** Hook adapters + MCP configs (the same `ids` on every host), nothing else. */
+function contractFixture(prefix?: string, ids = BOILERPLATE_IDS): string {
+  const root = temporaryRoot(prefix);
+  copyFromRepo(root, '.agents/hooks/personality-reinject.mjs');
+  copyFromRepo(root, '.opencode/plugins/personality-reinject.js');
+  write(root, '.claude/settings.json', hookSettings(CLAUDE_HOOK_COMMAND));
+  write(root, '.codex/hooks.json', hookSettings(CODEX_HOOK_COMMAND, CODEX_HOOK_COMMAND_WINDOWS));
+  write(root, '.mcp.json', mcpJson(ids));
+  write(root, 'opencode.jsonc', opencodeJsonc(ids));
+  write(root, '.codex/config.toml', codexToml(ids));
+  return root;
+}
+
+const SKILLS = ['project-context', 'sync-ai-context'];
+
+/** Everything `checkAgentCompatibility` wants, except the alias itself. */
+function repositoryFixture(): string {
+  const root = contractFixture();
+  write(root, 'AGENTS.md', '# AI memory\n');
+  write(root, 'CLAUDE.md', CLAUDE_INSTRUCTIONS_SHIM);
+  for (const skill of SKILLS) {
+    write(root, `.agents/skills/${skill}/SKILL.md`, `---\nname: ${skill}\n---\n`);
+  }
+  return root;
+}
+
+describe('shared personality hook', () => {
+  test('emits the contract plus the identity line and exits successfully', () => {
+    const result = runEmitter();
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe('');
+    // No harness payload, no CLAUDE_*/CODEX_* variables: plain text, no JSON.
+    expect(result.stdout).toContain(PERSONALITY_CONTRACT);
+    expect(result.stdout).toContain(`${HOOK_IDENTITY_MARKER} worktree=primary session=unknown harness=unknown`);
+    expect(result.stdout).not.toContain(HOOK_ORCA_MARKER);
+  });
+
+  test('names AGENTS.md as canonical, never CLAUDE.md', () => {
+    expect(PERSONALITY_CONTRACT).toContain('AGENTS.md');
+    expect(PERSONALITY_CONTRACT).not.toContain('CLAUDE.md');
+  });
+
+  test('OpenCode mutates the system array in place with the same payload', async () => {
+    const plugin = await PersonalityReinject();
+    const transform = plugin['experimental.chat.system.transform'];
+    const output = { system: ['base system'] };
+    const originalArray = output.system;
+
+    await transform({ sessionID: 'test', model: {} }, output);
+    const afterFirst = output.system.length;
+    await transform({ sessionID: 'test', model: {} }, output);
+
+    expect(output.system).toBe(originalArray);
+    expect(output.system.length).toBe(afterFirst);
+    expect(output.system[0]).toBe('base system');
+    expect(output.system[1]).toBe(PERSONALITY_CONTRACT);
+    // The label degrades to the raw id: OpenCode exposes no session name.
+    expect(output.system[2]).toContain('session=test harness=opencode');
+  });
+});
+
+describe('agent identity', () => {
+  test('Claude Code receives additionalContext and a title derived from the prompt', () => {
+    const run = runEmitter({
+      home: claudeHome('agentic-qa-boilerplate-7', 'derived'),
+      env: CLAUDE_ENV,
+      input: claudePayload('sprint-testing UPEX-123 please plan the QA'),
+    });
+
+    expect(run.exitCode).toBe(0);
+    const output = hookSpecificOutput(run.stdout);
+    expect(output.hookEventName).toBe('UserPromptSubmit');
+    expect(output.additionalContext).toContain(PERSONALITY_CONTRACT);
+    expect(output.additionalContext).toContain(
+      `${HOOK_IDENTITY_MARKER} worktree=primary session=agentic-qa-boilerplate-7 (${CLAUDE_SESSION_ID.slice(0, 8)}) harness=claude-code`,
+    );
+    expect(output.sessionTitle).toBe('UPEX-123-sprint-testing');
+  });
+
+  test('a user-set session name is never renamed and is used verbatim', () => {
+    const run = runEmitter({
+      home: claudeHome('release-audit', 'user'),
+      env: CLAUDE_ENV,
+      input: claudePayload('sprint-testing UPEX-123 please plan the QA'),
+    });
+
+    const output = hookSpecificOutput(run.stdout);
+    expect(output.sessionTitle).toBeUndefined();
+    expect(output.additionalContext).toContain('session=release-audit harness=claude-code');
+  });
+
+  test('a name this hook set is read back verbatim as the session label', () => {
+    const run = runEmitter({
+      home: claudeHome('worker-naming', 'hook'),
+      env: CLAUDE_ENV,
+      input: claudePayload('continue with the next stage'),
+    });
+
+    const output = hookSpecificOutput(run.stdout);
+    expect(output.sessionTitle).toBeUndefined();
+    expect(output.additionalContext).toContain('session=worker-naming harness=claude-code');
+  });
+
+  test('a prompt with no workflow and issue key leaves the title alone', () => {
+    const run = runEmitter({
+      home: claudeHome('agentic-qa-boilerplate-7', 'derived'),
+      env: CLAUDE_ENV,
+      input: claudePayload('what does this repo do?'),
+    });
+
+    expect(hookSpecificOutput(run.stdout).sessionTitle).toBeUndefined();
+  });
+
+  test('Codex gets the same JSON shape without a session title', () => {
+    const sessionId = '019abcde-1111-2222-3333-444455556666';
+    const run = runEmitter({
+      home: codexHome('BK-77 retest', sessionId),
+      input: codexPayload(sessionId, 'sprint-testing BK-77 retest the fix'),
+    });
+
+    expect(run.exitCode).toBe(0);
+    const output = hookSpecificOutput(run.stdout);
+    expect(output.hookEventName).toBe('UserPromptSubmit');
+    expect(output.additionalContext).toContain(
+      `session=BK-77 retest (${sessionId.slice(0, 8)}) harness=codex`,
+    );
+    // `sessionTitle` is a Claude Code field; the Codex output wire has no such
+    // key, so emitting it there would risk the whole payload being rejected.
+    expect(output.sessionTitle).toBeUndefined();
+  });
+
+  test('the Orca line appears only when an orca binary sits on PATH', () => {
+    const home = temporaryRoot('agent identity orca ');
+    write(home, 'bin/orca', '#!/bin/sh\nexit 0\n');
+    write(home, 'bin/orca-ide', '#!/bin/sh\nexit 0\n'); // the Linux CLI name
+
+    expect(runEmitter({ home }).stdout).toContain(HOOK_ORCA_MARKER);
+    expect(runEmitter().stdout).not.toContain(HOOK_ORCA_MARKER);
+  });
+
+  test('ORCA_WORKTREE_ID names the worktree, its absence means primary', () => {
+    // A linked worktree's `.git` is a FILE; the primary checkout's is a directory.
+    const linked = temporaryRoot('agent identity linked worktree ');
+    write(linked, '.git', 'gitdir: /elsewhere/.git/worktrees/BK-123-login\n');
+    expect(resolveWorktree({ ORCA_WORKTREE_ID: 'repo-id::/work/orca/BK-123-login' }, linked)).toBe('BK-123-login');
+    expect(resolveWorktree({ ORCA_WORKTREE_ID: 'repo-id::C:\\work\\orca\\BK-9' }, linked)).toBe('BK-9');
+    expect(resolveWorktree({}, linked)).toBe('primary');
+    // Orca sets the variable for the primary checkout too: a `.git` directory wins.
+    const primary = temporaryRoot('agent identity primary ');
+    mkdirSync(join(primary, '.git'));
+    expect(resolveWorktree({ ORCA_WORKTREE_ID: 'repo-id::/work/orca/BK-123-login' }, primary)).toBe('primary');
+  });
+
+  test('the session label follows the name-source ladder', () => {
+    const sessionId = 'abcdef12-3456';
+    expect(sessionLabel({ sessionName: 'nightly', nameSource: 'user', sessionId })).toBe('nightly');
+    expect(sessionLabel({ sessionName: 'nightly', nameSource: 'hook', sessionId })).toBe('nightly');
+    expect(sessionLabel({ sessionName: 'nightly', nameSource: 'derived', sessionId })).toBe('nightly (abcdef12)');
+    expect(sessionLabel({ sessionName: 'nightly', nameSource: 'unknown', sessionId })).toBe('nightly (abcdef12)');
+    expect(sessionLabel({ sessionId })).toBe(sessionId);
+    expect(sessionLabel({})).toBe('unknown');
+  });
+
+  test('an explicit --name hint in the prompt wins over the workflow shape', () => {
+    expect(proposeSessionTitle({
+      prompt: 'test-automation UPEX-9 --name "fleet worker 2"',
+      identity: { nameSource: 'derived' },
+    })).toBe('fleet worker 2');
+    expect(proposeSessionTitle({
+      prompt: 'test-automation UPEX-9',
+      identity: { nameSource: 'none' },
+    })).toBe('UPEX-9-test-automation');
+    expect(proposeSessionTitle({
+      prompt: 'test-automation UPEX-9',
+      identity: { nameSource: 'unknown' },
+    })).toBe('');
+  });
+
+  test('the fleet-worker token names the session after the roster label', () => {
+    // The worker's prompt opens with `/<skill> <label> fleet worker …`; the label is the name.
+    expect(proposeSessionTitle({
+      prompt: '/sprint-testing BK-123 fleet worker: run every stage without returning to the prompt.',
+      identity: { nameSource: 'none' },
+    })).toBe('BK-123');
+    expect(proposeSessionTitle({
+      prompt: '/sprint-testing BK-123-login fleet worker. Read the brief.',
+      identity: { nameSource: 'derived' },
+    })).toBe('BK-123-login');
+    // A kebab label and a skill outside the workflow list both qualify.
+    expect(proposeSessionTitle({
+      prompt: '/framework-development volatile-impl fleet worker. Read the brief.',
+      identity: { nameSource: 'derived' },
+    })).toBe('volatile-impl');
+    expect(proposeSessionTitle({
+      prompt: '/playwright-cli docs-audit fleet worker. Read the brief.',
+      identity: { nameSource: 'derived' },
+    })).toBe('docs-audit');
+  });
+
+  test('the fleet token is found after the runtime preamble', () => {
+    const preamble = 'You are working inside Orca, a multi-agent IDE.\n=== CLI COMMANDS ===\n  orca orchestration send --type worker_done\n=== TASK ===\n';
+    expect(proposeSessionTitle({
+      prompt: `${preamble}/framework-development worker-naming fleet worker. Read the brief.`,
+      identity: { nameSource: 'derived' },
+    })).toBe('worker-naming');
+  });
+
+  test('extra words between the label and the token leave the title alone', () => {
+    expect(proposeSessionTitle({
+      prompt: '/framework-development env-scopes SPIKE fleet worker. Read the brief.',
+      identity: { nameSource: 'derived' },
+    })).toBe('');
+  });
+
+  test('a hook-set name is replaced by a new label and never re-emitted unchanged', () => {
+    const prompt = '/framework-development context-c fleet worker. Read the brief.';
+    expect(proposeSessionTitle({ prompt, identity: { nameSource: 'hook', sessionName: 'context-c' } })).toBe('');
+    expect(proposeSessionTitle({ prompt, identity: { nameSource: 'hook', sessionName: 'context-b' } })).toBe('context-c');
+    expect(proposeSessionTitle({ prompt, identity: { nameSource: 'user', sessionName: 'mine' } })).toBe('');
+  });
+
+  test('orcaAvailable never spawns a process and tolerates an empty PATH', () => {
+    const home = temporaryRoot('agent identity path ');
+    write(home, 'bin/orca', '');
+
+    expect(orcaAvailable({ PATH: join(home, 'bin') })).toBe(true);
+    expect(orcaAvailable({ PATH: join(home, 'missing') })).toBe(false);
+    expect(orcaAvailable({})).toBe(false);
+  });
+});
+
+describe('Codex hook portability', () => {
+  test('fails when the current directory has no Git root', () => {
+    const root = contractFixture('agent compatibility no git ');
+    const result = Bun.spawnSync({
+      cmd: ['sh', '-c', CODEX_HOOK_COMMAND],
+      cwd: root,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+
+    expect(result.exitCode).not.toBe(0);
+  });
+
+  test('resolves a Git root whose path contains spaces', () => {
+    const root = contractFixture('agent compatibility spaced root ');
+    const nested = join(root, 'nested directory');
+    mkdirSync(nested);
+    const init = Bun.spawnSync({ cmd: ['git', 'init', '-q'], cwd: root, stderr: 'pipe' });
+    expect(init.exitCode).toBe(0);
+
+    const result = Bun.spawnSync({
+      cmd: ['sh', '-c', CODEX_HOOK_COMMAND],
+      cwd: nested,
+      stdin: new TextEncoder().encode(''),
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString()).toContain(PERSONALITY_CONTRACT);
+  });
+
+  test('renders a Windows command with Git-root and Join-Path resolution', () => {
+    expect(CODEX_HOOK_COMMAND_WINDOWS).toContain('git rev-parse --show-toplevel');
+    expect(CODEX_HOOK_COMMAND_WINDOWS).toContain('Join-Path $root \'.agents/hooks/personality-reinject.mjs\'');
+    expect(CODEX_HOOK_COMMAND_WINDOWS).not.toContain('/Users/');
+  });
+});
+
+describe('eslint block wiring', () => {
+  const BASE = `export const BASE_ESLINT_OPTIONS = { rules: {} };
+export const CLI_IMPORT_CLOSURE = { files: ['cli/**/*.ts'], rules: {} };
+export const KATA_IMPORT_ALIASES = { files: ['tests/**/*.ts'], rules: {} };
+`;
+
+  test('the real repository wires every block it exports', () => {
+    expect(validateEslintBlockWiring(REPO_ROOT)).toEqual([]);
+  });
+
+  // The failure this exists for: `eslint.config.base.js` is SYNCED and
+  // `eslint.config.js` is never overwritten, so upstream can ship a rule that
+  // lands on disk, exports cleanly and enforces nothing.
+  test('an unwired block is an error naming it and the fix', () => {
+    const root = contractFixture();
+    write(root, 'eslint.config.base.js', BASE);
+    write(root, 'eslint.config.js', 'import { BASE_ESLINT_OPTIONS, CLI_IMPORT_CLOSURE } from \'./eslint.config.base.js\';\nexport default antfu({ ...BASE_ESLINT_OPTIONS }, CLI_IMPORT_CLOSURE);\n');
+    const errors = validateEslintBlockWiring(root);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('KATA_IMPORT_ALIASES');
+    expect(errors[0]).toContain('enforces nothing');
+  });
+
+  // The hole this check had on the day it was written. `eslint.config.js`'s own
+  // JSDoc names `CLI_IMPORT_CLOSURE` in prose, so a raw substring search found
+  // it there and passed a consumer that had stopped wiring the block.
+  test('a name mentioned only in a comment does NOT count as wiring', () => {
+    const root = contractFixture();
+    write(root, 'eslint.config.base.js', BASE);
+    write(root, 'eslint.config.js', '/** Extra blocks go after `CLI_IMPORT_CLOSURE`. */\n// KATA_IMPORT_ALIASES lives in the base.\nexport default antfu({});\n');
+    const errors = validateEslintBlockWiring(root);
+    expect(errors).toHaveLength(2);
+    expect(errors.join(' ')).toContain('CLI_IMPORT_CLOSURE');
+    expect(errors.join(' ')).toContain('KATA_IMPORT_ALIASES');
+  });
+
+  // Without a word boundary, wiring the longer name satisfies the shorter one.
+  test('a longer block name does not satisfy the shorter one it contains', () => {
+    const root = contractFixture();
+    write(root, 'eslint.config.base.js', 'export const CLI_IMPORT_CLOSURE = {};\nexport const CLI_IMPORT_CLOSURE_EXTRA = {};\n');
+    write(root, 'eslint.config.js', 'import { CLI_IMPORT_CLOSURE_EXTRA } from \'./eslint.config.base.js\';\nexport default antfu({}, CLI_IMPORT_CLOSURE_EXTRA);\n');
+    const errors = validateEslintBlockWiring(root);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('wire CLI_IMPORT_CLOSURE from');
+  });
+
+  test('a fully wired consumer is clean', () => {
+    const root = contractFixture();
+    write(root, 'eslint.config.base.js', BASE);
+    write(root, 'eslint.config.js', 'import { BASE_ESLINT_OPTIONS, CLI_IMPORT_CLOSURE, KATA_IMPORT_ALIASES } from \'./eslint.config.base.js\';\nexport default antfu({ ...BASE_ESLINT_OPTIONS }, CLI_IMPORT_CLOSURE, KATA_IMPORT_ALIASES);\n');
+    expect(validateEslintBlockWiring(root)).toEqual([]);
+  });
+
+  // The options object is spread into antfu's first argument, not passed as a
+  // scoped block, so requiring it by name would fire on every correct config.
+  test('BASE_ESLINT_OPTIONS is never demanded as a block', () => {
+    const root = contractFixture();
+    write(root, 'eslint.config.base.js', 'export const BASE_ESLINT_OPTIONS = { rules: {} };\n');
+    write(root, 'eslint.config.js', 'export default antfu({});\n');
+    expect(validateEslintBlockWiring(root)).toEqual([]);
+  });
+
+  test('a repo without the split config is not a finding', () => {
+    expect(validateEslintBlockWiring(contractFixture())).toEqual([]);
+  });
+});
+
+describe('hook adapters', () => {
+  test('accepts the three adapters wired to the shared emitter', () => {
+    expect(validateHookCompatibility(contractFixture())).toEqual([]);
+  });
+
+  test('the real repository wires its adapters to the shared emitter', () => {
+    expect(validateHookCompatibility(REPO_ROOT)).toEqual([]);
+  });
+
+  test('rejects an absolute personal hook path', () => {
+    const root = contractFixture();
+    write(root, '.codex/hooks.json', hookSettings(
+      'node \'/Users/example/repo/.agents/hooks/personality-reinject.mjs\'',
+      CODEX_HOOK_COMMAND_WINDOWS,
+    ));
+
+    expect(validateHookCompatibility(root)).toContain('codex hook command contains an absolute personal path.');
+  });
+
+  test('rejects the legacy Claude-only hook file next to the shared emitter', () => {
+    const root = contractFixture();
+    write(root, '.claude/hooks/personality-reinject.js', 'process.stdout.write("dup");\n');
+
+    expect(validateHookCompatibility(root)).toContain('Duplicated personality hook must be removed: .claude/hooks/personality-reinject.js');
+  });
+
+  test('rejects an OpenCode adapter that reassigns output.system', () => {
+    const root = contractFixture();
+    write(root, '.opencode/plugins/personality-reinject.js', [
+      'import { PERSONALITY_CONTRACT } from \'../../.agents/hooks/personality-reinject.mjs\';',
+      'export const PersonalityReinject = async () => ({',
+      '  \'experimental.chat.system.transform\': async (_input, output) => {',
+      '    output.system = [...output.system, PERSONALITY_CONTRACT];',
+      '  },',
+      '});',
+      '',
+    ].join('\n'));
+
+    expect(validateHookCompatibility(root)).toContain('OpenCode personality adapter must mutate output.system in place.');
+  });
+
+  test('reads the emitter path out of every adapter form', () => {
+    expect(hookScriptPath(CLAUDE_HOOK_COMMAND)).toBe('.agents/hooks/personality-reinject.mjs');
+    expect(hookScriptPath(CODEX_HOOK_COMMAND)).toBe('.agents/hooks/personality-reinject.mjs');
+    expect(hookScriptPath(CODEX_HOOK_COMMAND_WINDOWS)).toBe('.agents/hooks/personality-reinject.mjs');
+    expect(hookScriptPath('node run-something')).toBeNull();
+  });
+
+  test('rejects a hook command pointing at a file that does not exist', () => {
+    // The shape a rename leaves behind: `.claude/settings.json` is bootstrap-only,
+    // so it keeps naming the emitter's old path while the emitter has moved.
+    const root = contractFixture();
+    write(root, '.claude/settings.json', hookSettings(
+      'node "$CLAUDE_PROJECT_DIR/.agents/hooks/personality-reinject-renamed.mjs"',
+    ));
+
+    expect(validateHookCompatibility(root)).toContain(
+      'claude hook command points at a file that does not exist: .agents/hooks/personality-reinject-renamed.mjs',
+    );
+  });
+
+  test('rejects a hook command that names no repository-relative script', () => {
+    const root = contractFixture();
+    write(root, '.claude/settings.json', hookSettings('node --version'));
+
+    expect(validateHookCompatibility(root)).toContain(
+      'claude hook command does not name a repository-relative hook script.',
+    );
+  });
+});
+
+describe('MCP semantic parity', () => {
+  test('the contract itself agrees on .env dependencies across hosts', () => {
+    for (const id of KNOWN_MCP_IDS) {
+      expect(EXPECTED_MCP.opencode[id].dependsOn).toEqual(EXPECTED_MCP.claude[id].dependsOn);
+      expect(EXPECTED_MCP.codex[id].dependsOn).toEqual(EXPECTED_MCP.claude[id].dependsOn);
+      expect(EXPECTED_MCP.codex[id].literalEnv).toEqual(EXPECTED_MCP.claude[id].literalEnv);
+    }
+  });
+
+  test('accepts the six boilerplate servers across all harnesses', () => {
+    expect(validateMcpParity(contractFixture())).toEqual([]);
+  });
+
+  test('the real repository declares the same servers on every host', () => {
+    // Asserts the DECLARED set, never the literal boilerplate six: a downstream
+    // project with eight servers (or three) must pass this test unchanged.
+    const declared = declaredMcpIds(REPO_ROOT);
+    expect(declared.length).toBeGreaterThan(0);
+    expect(declared).toEqual([...declared].sort());
+    expect(validateMcpParity(REPO_ROOT)).toEqual([]);
+  });
+
+  test('strips comments without touching string contents', () => {
+    expect(JSON.parse(stripJsonComments('{ // c\n "a": "http://x/*y*/" /* b */ }'))).toEqual({ a: 'http://x/*y*/' });
+  });
+
+  test('a bearer header on Claude and OpenCode is the same dependency Codex names by variable', () => {
+    // `.mcp.json` / `opencode.jsonc` carry `Authorization: Bearer ${VAR}`;
+    // Codex carries `bearer_token_env_var = "VAR"`. Same `.env` name, no error.
+    const root = contractFixture(undefined, PROJECT_IDS);
+    expect(validateMcpParity(root)).toEqual([]);
+
+    const config = readFileSync(join(root, '.codex/config.toml'), 'utf8')
+      .replace('bearer_token_env_var = "POSTMAN_API_KEY"', 'bearer_token_env_var = "POSTMAN_TOKEN"');
+    writeFileSync(join(root, '.codex/config.toml'), config);
+
+    // `postman` is a project-declared server (no pinned shape), so the generic
+    // cross-host env contract is what catches the rename.
+    const errors = validateMcpParity(root);
+    expect(errors.some(error => error.includes('MCP postman env contract differs between claude and codex') && error.includes('POSTMAN_TOKEN'))).toBe(true);
+  });
+
+  test('reports a missing Tavily server', () => {
+    const root = contractFixture(undefined, PROJECT_IDS);
+    const configPath = join(root, '.codex/config.toml');
+    const config = readFileSync(configPath, 'utf8').replace(
+      /\n\[mcp_servers\.tavily\][\s\S]*?(?=\n\[mcp_servers\.)/,
+      '\n',
+    );
+    writeFileSync(configPath, config);
+
+    expect(validateMcpParity(root)).toEqual([
+      'MCP tavily missing from codex: declared in .mcp.json, absent from .codex/config.toml',
+    ]);
+  });
+
+  test('reports an MCP ID mismatch on both sides', () => {
+    const root = contractFixture();
+    const configPath = join(root, '.mcp.json');
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    config.mcpServers.context8 = config.mcpServers.context7;
+    delete config.mcpServers.context7;
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+
+    const errors = validateMcpParity(root);
+    expect(errors).toContain('MCP context8 missing from opencode: declared in .mcp.json, absent from opencode.jsonc');
+    expect(errors).toContain('MCP context8 missing from codex: declared in .mcp.json, absent from .codex/config.toml');
+    expect(errors).toContain('MCP context7 present in opencode only: declare it in .mcp.json or remove it from opencode.jsonc');
+    expect(errors).toContain('MCP context7 present in codex only: declare it in .mcp.json or remove it from .codex/config.toml');
+  });
+
+  test('reads OpenCode {file:dir/VAR} as the same dependency as {env:VAR}', () => {
+    // `scripts/harness-env.ts` rewrites every credential in `opencode.jsonc` to a
+    // `{file:.auth/opencode/<VAR>}` pointer, because `{env:}` resolves only from a
+    // process environment a desktop launch does not have. That is the SAME .env
+    // dependency by a different route, so parity must still hold.
+    const root = contractFixture(undefined, PROJECT_IDS);
+    const configPath = join(root, 'opencode.jsonc');
+    writeFileSync(configPath, readFileSync(configPath, 'utf8')
+      .replace('{env:POSTMAN_API_KEY}', '{file:.auth/opencode/POSTMAN_API_KEY}')
+      .replace('{env:TAVILY_API_KEY}', '{file:.auth/opencode/TAVILY_API_KEY}'));
+
+    expect(validateMcpParity(root)).toEqual([]);
+  });
+
+  test('a renamed {file:dir/VAR} still fails parity, so the form is checked and not merely tolerated', () => {
+    const root = contractFixture(undefined, PROJECT_IDS);
+    const configPath = join(root, 'opencode.jsonc');
+    writeFileSync(configPath, readFileSync(configPath, 'utf8')
+      .replace('{env:POSTMAN_API_KEY}', '{file:.auth/opencode/POSTMAN_TOKEN}'));
+
+    expect(validateMcpParity(root).some(error =>
+      error.includes('MCP postman env contract differs between claude and opencode') && error.includes('POSTMAN_TOKEN'))).toBe(true);
+  });
+
+  test('a {file:} path whose final segment is NOT all-caps stays a literal', () => {
+    // The guardrail on the pattern. `{file:certs/ca.pem}` is a file, not a
+    // credential named after a variable, and must never be read as a dependency
+    // on some variable. Anyone tempted to widen the regex has to break this.
+    const root = contractFixture();
+    const configPath = join(root, 'opencode.jsonc');
+    writeFileSync(configPath, readFileSync(configPath, 'utf8')
+      .replace('{env:API_BASE_URL}', '{file:certs/ca.pem}'));
+
+    const errors = validateMcpParity(root);
+    // Still an error, because the openapi server genuinely lost its API_BASE_URL
+    // dependency — but it is reported as a LITERAL, not as a dependency on `pem`.
+    expect(errors.some(error => error.includes('opencode MCP openapi mismatch'))).toBe(true);
+    expect(errors.some(error => error.includes('certs/ca.pem'))).toBe(true);
+    expect(errors.some(error => error.toLowerCase().includes('"pem"'))).toBe(false);
+  });
+
+  test('reports an environment-variable mismatch', () => {
+    const root = contractFixture(undefined, PROJECT_IDS);
+    const configPath = join(root, 'opencode.jsonc');
+    const config = readFileSync(configPath, 'utf8').replace('{env:POSTMAN_API_KEY}', '{env:POSTMAN_TOKEN}');
+    writeFileSync(configPath, config);
+
+    expect(validateMcpParity(root).some(error => error.includes('MCP postman env contract differs between claude and opencode') && error.includes('POSTMAN_TOKEN'))).toBe(true);
+  });
+
+  test('reports a forwarded variable that Codex renamed', () => {
+    const root = contractFixture();
+    const configPath = join(root, '.codex/config.toml');
+    writeFileSync(configPath, readFileSync(configPath, 'utf8').replace('"OPENAPI_SPEC_PATH"', '"OPENAPI_SPEC_URL"'));
+
+    const errors = validateMcpParity(root);
+    expect(errors.some(error => error.includes('codex MCP openapi mismatch') && error.includes('OPENAPI_SPEC_URL'))).toBe(true);
+    expect(errors.some(error => error.includes('MCP openapi env contract differs between claude and codex'))).toBe(true);
+  });
+
+  test('rejects a placeholder inside a Codex env table', () => {
+    const root = contractFixture();
+    const configPath = join(root, '.codex/config.toml');
+    writeFileSync(configPath, `${readFileSync(configPath, 'utf8')}\n[mcp_servers.openapi.env]\nAPI_BASE_URL = "\${API_BASE_URL}"\n`);
+
+    expect(validateMcpParity(root)).toEqual([
+      '.codex/config.toml openapi.env cannot reference API_BASE_URL: Codex does not expand placeholders. Forward the variable through env_vars instead.',
+    ]);
+  });
+});
+
+describe('project-declared MCP set', () => {
+  // A downstream project (no `dbhub`, no `postman`, plus `supabase`) is the
+  // canonical set for ITS three configs: `.mcp.json` declares, the other two
+  // must match.
+
+  test('accepts a project whose set differs from the boilerplate on every host', () => {
+    const root = contractFixture(undefined, PROJECT_IDS);
+    expect(declaredMcpIds(root)).toEqual([...PROJECT_IDS].sort());
+    expect(validateMcpParity(root)).toEqual([]);
+  });
+
+  test('reports a declared server that Codex does not carry', () => {
+    const root = contractFixture(undefined, PROJECT_IDS);
+    write(root, '.codex/config.toml', codexToml(PROJECT_IDS.filter(id => id !== 'supabase')));
+
+    expect(validateMcpParity(root)).toEqual([
+      'MCP supabase missing from codex: declared in .mcp.json, absent from .codex/config.toml',
+    ]);
+  });
+
+  test('reports a server that only OpenCode carries', () => {
+    const root = contractFixture(undefined, PROJECT_IDS);
+    write(root, 'opencode.jsonc', opencodeJsonc([...PROJECT_IDS, 'dbhub']));
+
+    expect(validateMcpParity(root)).toEqual([
+      'MCP dbhub present in opencode only: declare it in .mcp.json or remove it from opencode.jsonc',
+    ]);
+  });
+
+  test('still pins the per-host shape of a known server the project declares', () => {
+    const root = contractFixture(undefined, PROJECT_IDS);
+    const configPath = join(root, '.codex/config.toml');
+    // Same .env dependencies, different command shape: only the strict check sees it.
+    writeFileSync(configPath, readFileSync(configPath, 'utf8')
+      .replace('"--tools", "dynamic"]', '"--tools", "dynamic", "--read-only"]'));
+
+    const errors = validateMcpParity(root);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toStartWith('codex MCP openapi mismatch: expected ');
+    expect(errors[0]).toContain('--read-only');
+  });
+
+  test('compares the .env contract of an unknown server across hosts', () => {
+    const root = contractFixture(undefined, PROJECT_IDS);
+    const configPath = join(root, '.codex/config.toml');
+    writeFileSync(configPath, readFileSync(configPath, 'utf8')
+      .replace('env_vars = ["SUPABASE_ACCESS_TOKEN"]', 'env_vars = ["SUPABASE_ACCESS_TOKEN", "SUPABASE_PROJECT_REF"]'));
+
+    expect(validateMcpParity(root)).toEqual([
+      'MCP supabase env contract differs between claude and codex: {"dependsOn":["SUPABASE_ACCESS_TOKEN"],"literalEnv":{"LOG_LEVEL":"error"}} vs {"dependsOn":["SUPABASE_ACCESS_TOKEN","SUPABASE_PROJECT_REF"],"literalEnv":{"LOG_LEVEL":"error"}}',
+    ]);
+  });
+
+  test('compares the literal settings of an unknown server across hosts', () => {
+    const root = contractFixture(undefined, PROJECT_IDS);
+    const configPath = join(root, '.codex/config.toml');
+    writeFileSync(configPath, readFileSync(configPath, 'utf8').replace('LOG_LEVEL = "error"', 'LOG_LEVEL = "debug"'));
+
+    expect(validateMcpParity(root)).toEqual([
+      'MCP supabase env contract differs between claude and codex: {"dependsOn":["SUPABASE_ACCESS_TOKEN"],"literalEnv":{"LOG_LEVEL":"error"}} vs {"dependsOn":["SUPABASE_ACCESS_TOKEN"],"literalEnv":{"LOG_LEVEL":"debug"}}',
+    ]);
+  });
+
+  test('leaves an unknown server alone when its shape differs but its contract matches', () => {
+    const root = contractFixture(undefined, PROJECT_IDS);
+    const configPath = join(root, '.codex/config.toml');
+    writeFileSync(configPath, readFileSync(configPath, 'utf8')
+      .replace('args = ["-y", "@supabase/mcp-server-supabase@latest", "--read-only"]', 'args = ["-y", "@supabase/mcp-server-supabase@latest"]'));
+
+    expect(validateMcpParity(root)).toEqual([]);
+  });
+});
+
+describe('canonical sources', () => {
+  test('requires AGENTS.md, the skills store and a byte-exact CLAUDE.md shim', () => {
+    const root = temporaryRoot();
+    expect(validateCanonicalSources(root)).toEqual(['Canonical instructions missing: AGENTS.md']);
+
+    write(root, 'AGENTS.md', '# memory\n');
+    mkdirSync(join(root, '.agents/skills'), { recursive: true });
+    expect(validateCanonicalSources(root)).toEqual(['Claude instruction shim missing: CLAUDE.md']);
+
+    write(root, 'CLAUDE.md', '@AGENTS.md\n\nSome operational prose.\n');
+    expect(validateCanonicalSources(root)).toEqual(['CLAUDE.md must contain exactly `@AGENTS.md` followed by one newline.']);
+
+    write(root, 'CLAUDE.md', CLAUDE_INSTRUCTIONS_SHIM);
+    expect(validateCanonicalSources(root)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A CRLF checkout — what a downstream project gets under `core.autocrlf=true`
+// once `.gitattributes` is deleted. Every generated surface is written with
+// pure `\n`, so byte equality against the file git hands back is what breaks:
+// the shim comparison threw (killing `agents:compat:check`, `repo:check` and
+// the pre-push hook together). `crlf()` is what git's conversion does.
+// ---------------------------------------------------------------------------
+
+function crlf(text: string): string {
+  return text.replace(/\n/g, '\r\n');
+}
+
+describe('CRLF checkout', () => {
+  test('normalizeNewlines maps CRLF to LF and leaves LF alone', () => {
+    expect(normalizeNewlines('@AGENTS.md\r\n')).toBe(CLAUDE_INSTRUCTIONS_SHIM);
+    expect(normalizeNewlines(CLAUDE_INSTRUCTIONS_SHIM)).toBe(CLAUDE_INSTRUCTIONS_SHIM);
+  });
+
+  test('accepts a CRLF shim and still rejects a shim that grew prose', () => {
+    const root = temporaryRoot();
+    write(root, 'AGENTS.md', '# memory\n');
+    mkdirSync(join(root, '.agents/skills'), { recursive: true });
+
+    write(root, 'CLAUDE.md', crlf(CLAUDE_INSTRUCTIONS_SHIM));
+    expect(validateCanonicalSources(root)).toEqual([]);
+
+    write(root, 'CLAUDE.md', crlf('@AGENTS.md\n\nSome operational prose.\n'));
+    expect(validateCanonicalSources(root)).toEqual(['CLAUDE.md must contain exactly `@AGENTS.md` followed by one newline.']);
+  });
+});
+
+describe('Claude skills alias', () => {
+  test('constructs portable POSIX and Windows alias plans', () => {
+    const root = temporaryRoot();
+    expect(claudeSkillsAliasPlan(root, 'linux')).toMatchObject({
+      target: POSIX_CLAUDE_SKILLS_TARGET,
+      type: 'symlink',
+    });
+    expect(claudeSkillsAliasPlan(root, 'win32')).toMatchObject({
+      target: join(root, '.agents', 'skills'),
+      type: 'junction',
+    });
+  });
+
+  test('isInside survives a separator mismatch and rejects a sibling prefix', () => {
+    const root = temporaryRoot();
+    expect(isInside(join(root, '.agents/skills/acli'), join(root, '.agents/skills'))).toBe(true);
+    expect(isInside(join(root, '.agents/skills'), join(root, '.agents/skills'))).toBe(true);
+    expect(isInside(join(root, '.agents/skills-extra/acli'), join(root, '.agents/skills'))).toBe(false);
+  });
+
+  test('creates the relative symlink and reports it valid on the second pass', () => {
+    const root = repositoryFixture();
+    expect(repairClaudeSkillsAlias(root, 'linux')).toMatchObject({ status: 'created', target: POSIX_CLAUDE_SKILLS_TARGET });
+    expect(readlinkSync(join(root, '.claude/skills'))).toBe(POSIX_CLAUDE_SKILLS_TARGET);
+    expect(readFileSync(join(root, '.claude/skills/project-context/SKILL.md'), 'utf8')).toContain('name: project-context');
+    expect(repairClaudeSkillsAlias(root, 'linux').status).toBe('valid');
+  });
+
+  test('accepts a junction target that differs only in case', () => {
+    // A Windows filesystem is case-insensitive, and `readlinkSync` can return a
+    // drive-letter (or any segment) cased differently from `process.cwd()`. A
+    // case-sensitive comparison called that an unexpected target and made the
+    // repair unlink and recreate a junction that was already correct.
+    const root = repositoryFixture();
+    const canonical = join(root, '.agents', 'skills');
+    mkdirSync(join(root, '.claude'), { recursive: true });
+    symlinkSync(canonical.replace('.agents', '.AGENTS'), join(root, '.claude/skills'), 'dir');
+
+    expect(checkAgentCompatibility(root, 'win32').alias.status).toBe('valid');
+    expect(repairClaudeSkillsAlias(root, 'win32').status).toBe('valid');
+  });
+
+  test('re-points a symlink aimed somewhere else', () => {
+    const root = repositoryFixture();
+    mkdirSync(join(root, 'elsewhere'), { recursive: true });
+    symlinkSync('../elsewhere', join(root, '.claude/skills'), 'dir');
+
+    expect(repairClaudeSkillsAlias(root, 'linux').status).toBe('repaired');
+    expect(readlinkSync(join(root, '.claude/skills'))).toBe(POSIX_CLAUDE_SKILLS_TARGET);
+  });
+
+  test('refuses to replace a real Claude skills directory', () => {
+    const root = repositoryFixture();
+    write(root, '.claude/skills/owned.txt', 'preserve me\n');
+
+    expect(() => repairClaudeSkillsAlias(root, 'linux')).toThrow('Refusing to replace');
+    expect(readFileSync(join(root, '.claude/skills/owned.txt'), 'utf8')).toBe('preserve me\n');
+  });
+
+  test('reclaims the skills CLI per-skill symlink shim without losing a skill body', () => {
+    // `bunx skills add` (project level) writes the body to .agents/skills/<slug>/ and then
+    // creates .claude/skills/ as a REAL directory of per-skill symlinks. `bun run setup`
+    // installs community skills BEFORE repairing compatibility, so this is what a clean
+    // clone actually looks like at repair time. Refusing here aborted the install.
+    const root = repositoryFixture();
+    write(root, '.agents/skills/playwright-cli/SKILL.md', 'body\n');
+    mkdirSync(join(root, '.claude/skills'), { recursive: true });
+    symlinkSync('../../.agents/skills/playwright-cli', join(root, '.claude/skills/playwright-cli'), 'dir');
+    write(root, '.claude/skills/.DS_Store', '');
+
+    expect(repairClaudeSkillsAlias(root, 'linux')).toMatchObject({
+      target: POSIX_CLAUDE_SKILLS_TARGET,
+      status: 'repaired',
+    });
+    expect(readFileSync(join(root, '.agents/skills/playwright-cli/SKILL.md'), 'utf8')).toBe('body\n');
+    expect(readFileSync(join(root, '.claude/skills/playwright-cli/SKILL.md'), 'utf8')).toBe('body\n');
+    expect(repairClaudeSkillsAlias(root, 'linux').status).toBe('valid');
+  });
+
+  test('still refuses a shim directory that also holds real content', () => {
+    const root = repositoryFixture();
+    mkdirSync(join(root, '.agents/skills/playwright-cli'), { recursive: true });
+    mkdirSync(join(root, '.claude/skills'), { recursive: true });
+    symlinkSync('../../.agents/skills/playwright-cli', join(root, '.claude/skills/playwright-cli'), 'dir');
+    write(root, '.claude/skills/hand-written.md', 'mine\n');
+
+    expect(() => repairClaudeSkillsAlias(root, 'linux')).toThrow('Refusing to replace');
+    expect(readFileSync(join(root, '.claude/skills/hand-written.md'), 'utf8')).toBe('mine\n');
+  });
+
+  test('refuses a symlink shim pointing outside the canonical skills store', () => {
+    const root = repositoryFixture();
+    mkdirSync(join(root, 'elsewhere/rogue'), { recursive: true });
+    mkdirSync(join(root, '.claude/skills'), { recursive: true });
+    symlinkSync('../../elsewhere/rogue', join(root, '.claude/skills/rogue'), 'dir');
+
+    expect(() => repairClaudeSkillsAlias(root, 'linux')).toThrow('Refusing to replace');
+  });
+});
+
+describe('commands shadowing a skill', () => {
+  test('finds a command, on either host and in a subdirectory, whose name is a repo skill', () => {
+    const root = repositoryFixture();
+    write(root, '.claude/commands/project-context.md', '---\ndescription: mine\n---\n\nDo it my way.\n');
+    write(root, '.opencode/commands/team/sync-ai-context.md', 'Do it my way.\n');
+    write(root, '.claude/commands/deploy.md', 'A project command with its own name.\n');
+    write(root, '.opencode/commands/.DS_Store', '');
+    // A folder without SKILL.md is not a skill, so its name is free.
+    mkdirSync(join(root, '.agents/skills/deploy'), { recursive: true });
+
+    expect(commandsShadowingSkills(root)).toEqual([
+      { path: '.claude/commands/project-context.md', skill: 'project-context' },
+      { path: '.opencode/commands/team/sync-ai-context.md', skill: 'sync-ai-context' },
+    ]);
+    expect(checkAgentCompatibility(root, 'linux').errors).toContain(
+      `Command shadows skill project-context: .claude/commands/project-context.md; a command with a skill's name hides the skill's instructions (\`bun run agents:compat\` moves it to ${SHADOWING_COMMANDS_BACKUP_DIR}/)`,
+    );
+  });
+
+  test('moves each one to the backup dir with its path, and leaves every other command alone', () => {
+    const root = repositoryFixture();
+    write(root, '.claude/commands/project-context.md', 'Do it my way.\n');
+    write(root, '.claude/commands/deploy.md', 'Mine.\n');
+
+    expect(removeShadowingCommands(root)).toEqual(['.claude/commands/project-context.md']);
+    expect(existsSync(join(root, '.claude/commands/project-context.md'))).toBe(false);
+    expect(readFileSync(join(root, SHADOWING_COMMANDS_BACKUP_DIR, '.claude/commands/project-context.md'), 'utf8')).toBe('Do it my way.\n');
+    expect(readFileSync(join(root, '.claude/commands/deploy.md'), 'utf8')).toBe('Mine.\n');
+    expect(commandsShadowingSkills(root)).toEqual([]);
+    expect(removeShadowingCommands(root)).toEqual([]);
+  });
+
+  test('without command directories there is nothing to report', () => {
+    const root = repositoryFixture();
+    expect(commandsShadowingSkills(root)).toEqual([]);
+  });
+});
+
+describe('checkAgentCompatibility', () => {
+  test('passes on a repository with alias, adapters and parity in place', () => {
+    const root = repositoryFixture();
+    repairClaudeSkillsAlias(root, 'linux');
+
+    expect(checkAgentCompatibility(root, 'linux')).toMatchObject({ ok: true, errors: [], alias: { status: 'valid' } });
+  });
+
+  test('reports the missing alias together with every contract error', () => {
+    const root = repositoryFixture();
+    rmSync(join(root, '.codex/hooks.json'));
+
+    const result = checkAgentCompatibility(root, 'linux');
+    expect(result.ok).toBe(false);
+    expect(result.alias.status).toBe('missing');
+    expect(result.errors).toContain('Hook compatibility file missing: .codex/hooks.json');
+    expect(result.errors).toContain('Claude skills alias missing: .claude/skills');
+  });
+
+  test('flags a real directory sitting where the alias should be', () => {
+    const root = repositoryFixture();
+    write(root, '.claude/skills/owned.txt', 'mine\n');
+
+    const result = checkAgentCompatibility(root, 'linux');
+    expect(result.alias.status).toBe('invalid');
+    expect(result.errors).toContain('Refusing compatibility state: .claude/skills exists but is not a generated symlink or junction.');
+  });
+});
+
+describe('repairAgentSurfaces', () => {
+  test('creates the alias, moves a command that shadows a skill and passes the check', () => {
+    const root = repositoryFixture();
+    write(root, '.opencode/commands/project-context.md', 'Mine.\n');
+
+    const repair = repairAgentSurfaces(root, {}, 'linux');
+    expect(repair.aliasDeferred).toBe(false);
+    expect(repair.alias?.status).toBe('created');
+    expect(readlinkSync(join(root, '.claude/skills'))).toBe(POSIX_CLAUDE_SKILLS_TARGET);
+    expect(repair.shadowingCommandsMoved).toEqual(['.opencode/commands/project-context.md']);
+    expect(repair.check).toMatchObject({ ok: true, errors: [] });
+  });
+
+  test('with the migration just applied, the alias waits for the commit and the check does not count it', () => {
+    const root = repositoryFixture();
+
+    const repair = repairAgentSurfaces(root, { deferSkillsAlias: true }, 'linux');
+    expect(repair.aliasDeferred).toBe(true);
+    expect(repair.alias).toBeNull();
+    expect(existsSync(join(root, '.claude/skills'))).toBe(false);
+    expect(existsSync(join(root, SKILLS_ALIAS_DEFERRED_MARKER))).toBe(true);
+    expect(repair.check).toMatchObject({ ok: true, errors: [], alias: { status: 'deferred' } });
+    // The pre-commit gate runs the same check and must pass on the migration commit.
+    expect(checkAgentCompatibility(root, 'linux')).toMatchObject({ ok: true, alias: { status: 'deferred' } });
+    // Everything else is still enforced.
+    rmSync(join(root, '.codex/hooks.json'));
+    const broken = repairAgentSurfaces(root, { deferSkillsAlias: true }, 'linux');
+    expect(broken.check.ok).toBe(false);
+    expect(broken.check.errors).toEqual(['Hook compatibility file missing: .codex/hooks.json']);
+    // And `bun run agents:compat` afterwards creates it as usual and ends the deferral.
+    expect(repairAgentSurfaces(root, {}, 'linux').alias?.status).toBe('created');
+    expect(existsSync(join(root, SKILLS_ALIAS_DEFERRED_MARKER))).toBe(false);
+    // Without the marker, a missing alias is the error it always was.
+    rmSync(join(root, '.claude/skills'));
+    expect(checkAgentCompatibility(root, 'linux').errors).toContain(SKILLS_ALIAS_MISSING_ERROR);
+  });
+});
+
+describe('compatibility report grouping', () => {
+  // With pre-existing MCP drift, a flat error list hides the "alias deferred"
+  // message, so "alias pending commit" and "real drift" become indistinguishable.
+  test('errors bucket per surface in a fixed order, empty groups omitted', () => {
+    const groups = groupCompatibilityErrors([
+      'MCP postman missing from codex: declared in .mcp.json, absent from .codex/config.toml',
+      'Command shadows skill x: .claude/commands/x.md; a command with a skill\'s name hides the skill\'s instructions',
+      'Claude skills alias missing: .claude/skills',
+      'codex hook command must be exactly: node x',
+      'CLAUDE.md must contain exactly `@AGENTS.md` followed by one newline.',
+      'MCP tavily present in opencode only: declare it in .mcp.json or remove it from opencode.jsonc',
+      'eslint.config.js does not wire KATA_IMPORT_ALIASES from eslint.config.base.js: the rule ships but enforces nothing. Add it to the import and to the antfu(...) call.',
+    ]);
+    expect(groups.map(g => [g.group, g.errors.length])).toEqual([['instructions', 1], ['alias', 1], ['commands', 1], ['hooks', 1], ['mcp', 2], ['lint', 1]]);
+    expect(groups.map(g => g.label)).toEqual(COMPATIBILITY_GROUP_ORDER.map(g => COMPATIBILITY_GROUP_LABEL[g]));
+    expect(groupCompatibilityErrors([])).toEqual([]);
+  });
+
+  test('the alias line reads the same whatever the verdict, and says deferred when the marker is set', () => {
+    const alias = { path: '/repo/.claude/skills', target: '../.agents/skills', type: 'symlink' as const };
+    expect(describeAliasStatus({ ...alias, status: 'deferred' })).toContain('deferred until the migration commit');
+    expect(describeAliasStatus({ ...alias, status: 'created' })).toBe('Claude skills alias created: /repo/.claude/skills -> ../.agents/skills (symlink)');
+    expect(describeAliasStatus({ ...alias, status: 'valid' })).toContain('OK');
+    expect(describeAliasStatus({ ...alias, status: 'missing' })).toContain('bun run agents:compat');
+    expect(describeAliasStatus({ ...alias, status: 'invalid' })).toContain('not the generated symlink');
+  });
+});

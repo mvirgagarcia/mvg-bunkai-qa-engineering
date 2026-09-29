@@ -49,8 +49,12 @@ import {
   promptForVar,
   reloadDotEnv,
 } from '../install.ts';
+import {
+  resolveAtlassianInstance,
+  writeAtlassianUrlToYaml,
+} from './atlassian-instance.ts';
 import * as tui from './tui.ts';
-import { criticalVars, varsFor } from './variables-manifest.ts';
+import { criticalVars, valueSourceOf, VAR_MANIFEST, varsFor } from './variables-manifest.ts';
 
 // ----------------------------------------------------------------------------
 // Constants + options
@@ -113,6 +117,44 @@ const COLORS = {
  * Mirrors the updater's `.backups/` convention (gitignored). Best-effort: a
  * backup failure does not block the flow, but it is surfaced.
  */
+/**
+ * The current value of a manifest var, from whatever source its spec declares.
+ *
+ * `.env` is the source for almost everything, but not for all of it: a var with
+ * `valueSource: 'atlassian-instance'` is read from `.agents/project.yaml` via
+ * the canonical resolver. Every consumer that needs "the value of this var" must
+ * go through here, or a yaml-sourced var silently reads as unset and gets
+ * skipped — a failure that looks exactly like "not configured yet".
+ *
+ * Returns `''` when unset or unresolvable, matching the `.env` read it replaces.
+ */
+function currentValueOf(spec: VarSpec, env: Record<string, string>): string {
+  if (valueSourceOf(spec) === 'atlassian-instance') {
+    try { return resolveAtlassianInstance().baseUrl; }
+    catch { return ''; }
+  }
+  return (env[spec.name] ?? '').trim();
+}
+
+/** Human label for where a var's value is written, used in prompts + reports. */
+function sourceLabelOf(spec: VarSpec): string {
+  return valueSourceOf(spec) === 'atlassian-instance' ? '.agents/project.yaml' : '.env';
+}
+
+/**
+ * Vars written on THIS machine — `.env` plus the yaml-sourced ones.
+ *
+ * Deliberately wider than `varsFor('local')`: a var can be written locally
+ * without being written to `.env`. Filtering the interactive walk by destination
+ * alone would silently drop ATLASSIAN_URL from every prompt, and "the installer
+ * stopped asking" is a bug users report as "it forgot my Jira".
+ */
+function localWriteVars(): VarSpec[] {
+  return VAR_MANIFEST.filter(
+    spec => spec.destinations.includes('local') || valueSourceOf(spec) !== 'env-file',
+  );
+}
+
 async function backupEnv(): Promise<string | null> {
   if (!existsSync(ENV_PATH)) { return null; }
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -314,7 +356,10 @@ async function runRemote(
 
   for (const spec of githubVars) {
     const row = ensureRow(rows, spec);
-    const value = (existing[spec.name] ?? '').trim();
+    // NOT every github-bound var lives in `.env`: ATLASSIAN_URL is read from
+    // `.agents/project.yaml`, so the yaml is the single origin for both the
+    // local tooling and the CI secret and the two cannot drift apart.
+    const value = currentValueOf(spec, existing);
 
     if (value.length === 0) {
       row.remote = 'skipped';
@@ -376,6 +421,39 @@ function printReport(rows: Map<string, VarReportRow>): void {
 }
 
 // ----------------------------------------------------------------------------
+// Harness surfaces — regenerate after `.env` changed
+// ----------------------------------------------------------------------------
+
+/**
+ * Regenerate `.claude/settings.local.json` + `.auth/opencode/*` from `.env`.
+ *
+ * A credential written to `.env` reaches an MCP server only through those
+ * generated files (a harness spawns its servers at startup, before any hook or
+ * wrapper can help), so a `--variables` run that stops at `.env` leaves the
+ * agent exactly as broken as before it ran. Never fatal: `bun run setup:doctor`
+ * reports the same drift and `bun run harness:env` fixes it. Prints variable
+ * NAMES only.
+ *
+ * DYNAMIC import: `harness-env.ts` imports from `../install.ts`, which imports
+ * this file; a static import here would close that cycle. Same pattern
+ * `cli/install.ts` uses for the same module.
+ */
+async function regenerateHarnessSurfaces(): Promise<void> {
+  try {
+    const { generate } = await import('./harness-env.ts');
+    const result = generate();
+    tui.log.info(
+      `Harness credential surfaces ${result.changed ? 'regenerated' : 'already in sync'}: `
+      + `${result.emitted.length === 0 ? '(none emitted)' : result.emitted.join(', ')}`,
+    );
+    process.stdout.write('  Restart the agent session: MCP servers read credentials at startup, not later.\n');
+  }
+  catch (err) {
+    tui.log.warn(`Could not regenerate the harness credential surfaces: ${(err as Error).message}. Run \`bun run harness:env\`.`);
+  }
+}
+
+// ----------------------------------------------------------------------------
 // D6 — Xray / Atlassian CI wiring notice
 // ----------------------------------------------------------------------------
 
@@ -418,12 +496,11 @@ async function promptVarsInto(
 
   for (const spec of specs) {
     const row = ensureRow(rows, spec);
-    const current = (existing[spec.name] ?? '').trim();
-    const alreadySet = current.length > 0;
+    const alreadySet = currentValueOf(spec, existing).length > 0;
 
     if (alreadySet && !opts.force) {
       const overwrite = await tui.confirm({
-        message: `${spec.name} is already set. Overwrite it?`,
+        message: `${spec.name} is already set (${sourceLabelOf(spec)}). Overwrite it?`,
         initialValue: false,
       });
       if (tui.isCancel(overwrite) || !overwrite) {
@@ -438,6 +515,23 @@ async function promptVarsInto(
       row.local = alreadySet ? 'set' : 'skipped';
       continue;
     }
+
+    // A yaml-sourced var is written to its own file immediately — batching it
+    // into `collected` would put it back in `.env`, which is the whole point of
+    // the split. A write failure is reported and does NOT abort the walk.
+    if (valueSourceOf(spec) === 'atlassian-instance') {
+      try {
+        const written = writeAtlassianUrlToYaml(entered);
+        process.stdout.write(`  ${tui.statusIcon('ok')} ${spec.name} → .agents/project.yaml (${written})\n`);
+        row.local = 'set';
+      }
+      catch (err) {
+        tui.log.warn(`${spec.name}: ${(err as Error).message}`);
+        row.local = 'failed';
+      }
+      continue;
+    }
+
     collected[spec.name] = entered;
     row.local = 'set';
   }
@@ -449,7 +543,7 @@ async function promptVarsInto(
 }
 
 /**
- * Prompt the CRITICAL set (manifest `critical: true`) into `.env`. Thin wrapper
+ * Prompt the OFFERED set (manifest `critical: true`) into `.env`. Thin wrapper
  * over {@link promptVarsInto}.
  */
 async function runCriticalSet(
@@ -470,7 +564,7 @@ type MenuChoice = 'walk' | 'critical' | 'remote' | 'everything' | 'leave';
  *   (a) Walk — set EVERY local var one by one (Enter skips; overwrite-confirm on
  *       already-set). The flag-free human path; `--variables-local` is now purely
  *       a scripting alias.
- *   (b) Set / reset the CRITICAL variables (the 5 project-independent creds).
+ *   (b) Set / reset the OFFERED variables (manifest `critical: true`; skip is fine).
  *   (c) Push local .env → GitHub Actions secrets.
  *   (d) Everything (critical then push) / leave as-is.
  * Returns the rows map to print, plus the remote outcome for the closing notice.
@@ -482,7 +576,7 @@ async function runMenu(opts: VariablesFlowOptions): Promise<void> {
     message: 'What do you want to do?',
     options: [
       { label: 'Set variables one by one (walk all local vars)', value: 'walk' as const },
-      { label: 'Set / reset the critical variables (Atlassian, Resend, Tavily)', value: 'critical' as const },
+      { label: `Set / reset the offered variables (${criticalVars().map(s => s.name).join(', ')})`, value: 'critical' as const },
       { label: 'Push local .env → GitHub Actions secrets', value: 'remote' as const },
       { label: 'Everything (set critical, then push remote)', value: 'everything' as const },
       { label: 'Leave as-is (exit)', value: 'leave' as const },
@@ -501,7 +595,7 @@ async function runMenu(opts: VariablesFlowOptions): Promise<void> {
 
   if (choice === 'walk') {
     tui.section('Set variables one by one');
-    await promptVarsInto(varsFor('local'), opts, rows);
+    await promptVarsInto(localWriteVars(), opts, rows);
   }
 
   if (choice === 'critical' || choice === 'everything') {
@@ -525,6 +619,11 @@ async function runMenu(opts: VariablesFlowOptions): Promise<void> {
 
   if ((choice === 'remote' || choice === 'everything') && !remoteOutcome.blocked) {
     maybeNoticeXrayAtlassian(remoteOutcome.setNames);
+  }
+
+  // The menu never runs dry: every branch that reached here may have written `.env`.
+  if (choice !== 'remote') {
+    await regenerateHarnessSurfaces();
   }
 }
 
@@ -598,5 +697,11 @@ export async function runVariablesFlow(opts: VariablesFlowOptions): Promise<void
 
   if (doRemote && !remoteOutcome.blocked) {
     maybeNoticeXrayAtlassian(remoteOutcome.setNames);
+  }
+
+  // Only after a real local write: a dry run touched nothing, so there is
+  // nothing to derive, and a remote-only run never opened `.env` for writing.
+  if (doLocal && !opts.dryRun) {
+    await regenerateHarnessSurfaces();
   }
 }

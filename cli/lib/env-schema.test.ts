@@ -1,0 +1,234 @@
+/**
+ * @fileoverview Tests for the varlock env schema generator.
+ *
+ * Three things must stay true: the generator is deterministic and reads the
+ * manifest's schema hints the way `VarSchemaHints` documents; free text can
+ * never leak a decorator into the schema; and the committed pair actually
+ * loads through the pinned varlock (the layout's one undocumented reliance,
+ * see the header of `./env-schema.ts`). The last one shells out to `bunx
+ * varlock`, so it needs `bun install` to have run.
+ */
+
+import type { VarSpec } from './variables-manifest.ts';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { describe, expect, test } from 'bun:test';
+
+import {
+  CORE_SCHEMA_FILE,
+  generateCoreSchema,
+  loadSchemaPairThroughVarlock,
+  placeholderEnv,
+  placeholderFor,
+  PROJECT_SCHEMA_FILE,
+  projectSchemaTemplate,
+  RETIRED_KEYS,
+  RUNTIME_KNOBS,
+  schemaRequiredDecorator,
+  seedProjectSchema,
+  writeCoreSchema,
+} from './env-schema.ts';
+import { envFileVars, VAR_MANIFEST } from './variables-manifest.ts';
+
+const REPO_ROOT = path.resolve(import.meta.dir, '..', '..');
+
+function spec(overrides: Partial<VarSpec> & { name: string }): VarSpec {
+  return {
+    destinations: ['local'],
+    secret: false,
+    scope: 'core',
+    usedBy: 'a consumer',
+    required: false,
+    critical: false,
+    obtainHint: 'somewhere',
+    note: 'a note',
+    ...overrides,
+  };
+}
+
+describe('schemaRequiredDecorator', () => {
+  test('required: true -> @required', () => {
+    expect(schemaRequiredDecorator(spec({ name: 'A', required: true }))).toBe('@required');
+  });
+  test('ifEnv on TEST_ENV -> forEnv', () => {
+    expect(schemaRequiredDecorator(spec({ name: 'A', required: { ifEnv: 'TEST_ENV=staging' } }))).toBe('@required=forEnv(staging)');
+  });
+  test('ifEnv on another key has no env-spec equivalent -> optional', () => {
+    expect(schemaRequiredDecorator(spec({ name: 'A', required: { ifEnv: 'AUTO_SYNC=true' } }))).toBeNull();
+  });
+  test('schema.required overrides the installer requiredness', () => {
+    expect(schemaRequiredDecorator(spec({ name: 'A', required: true, critical: true, schema: { required: false } }))).toBeNull();
+    expect(schemaRequiredDecorator(spec({ name: 'A', required: false, schema: { required: { ifEnv: 'TEST_ENV=local' } } }))).toBe('@required=forEnv(local)');
+  });
+  test('a non-core item is never required, whatever its fields say (ADR-0005 second lock)', () => {
+    expect(schemaRequiredDecorator(spec({ name: 'A', scope: 'project', required: true }))).toBeNull();
+    expect(schemaRequiredDecorator(spec({ name: 'A', scope: 'tooling', schema: { required: { ifEnv: 'TEST_ENV=local' } } }))).toBeNull();
+  });
+});
+
+describe('generateCoreSchema', () => {
+  test('is deterministic, LF-only, ends with one newline', () => {
+    const a = generateCoreSchema();
+    const b = generateCoreSchema();
+    expect(a).toBe(b);
+    expect(a.includes('\r')).toBe(false);
+    expect(a.endsWith('\n')).toBe(true);
+    expect(a.endsWith('\n\n')).toBe(false);
+  });
+
+  test('declares every env-file manifest var, every runtime knob and every retired key exactly once, never ATLASSIAN_URL', () => {
+    const text = generateCoreSchema();
+    const declared = text.split('\n').filter(l => /^[A-Z][A-Z0-9_]*=/.test(l)).map(l => l.slice(0, l.indexOf('=')));
+    for (const s of envFileVars()) { expect(declared.filter(k => k === s.name)).toHaveLength(1); }
+    for (const k of RUNTIME_KNOBS) { expect(declared.filter(x => x === k.name)).toHaveLength(1); }
+    for (const k of RETIRED_KEYS) { expect(declared.filter(x => x === k.name)).toHaveLength(1); }
+    expect(declared).not.toContain('ATLASSIAN_URL');
+    expect(declared).toHaveLength(envFileVars().length + RUNTIME_KNOBS.length + RETIRED_KEYS.length);
+  });
+
+  test('a retired key is declared optional and sensitive, and rejected when still declared elsewhere', () => {
+    // An older .env carrying `TAVILY_API_KEY=` (empty) must keep validating:
+    // varlock fails an undeclared key that is present and empty.
+    const text = generateCoreSchema([spec({ name: 'A' })], [], [{ name: 'OLD_KEY', since: '2026-01-01', reason: 'gone' }]);
+    expect(text).toContain('# Retired 2026-01-01: gone\n# @sensitive\nOLD_KEY=\n');
+    expect(() => generateCoreSchema([spec({ name: 'A' })], [], [{ name: 'A', since: 'x', reason: 'dup' }])).toThrow(/retire it or declare it/);
+  });
+
+  test('maps the manifest to decorators the way VarSchemaHints documents', () => {
+    const text = generateCoreSchema([
+      spec({ name: 'TEST_ENV', required: true, schema: { type: 'enum(local, staging)', default: 'local' } }),
+      spec({ name: 'LOCAL_USER_PASSWORD', secret: true, required: { ifEnv: 'TEST_ENV=local' } }),
+      spec({ name: 'ATLASSIAN_API_TOKEN', secret: true, required: true, critical: true, schema: { required: false, docs: 'https://id.atlassian.com/x' } }),
+      spec({ name: 'API_BASE_URL', schema: { type: 'url', example: 'http://localhost:3000' } }),
+    ], []);
+    expect(text).toContain('# @required @type=enum(local, staging)\nTEST_ENV=local\n');
+    expect(text).toContain('# @required=forEnv(local) @sensitive\nLOCAL_USER_PASSWORD=\n');
+    expect(text).toContain('# @sensitive @docs(https://id.atlassian.com/x)\nATLASSIAN_API_TOKEN=\n');
+    expect(text).toContain('# @type=url @example="http://localhost:3000"\nAPI_BASE_URL=\n');
+  });
+
+  test('groups items under one banner per scope, core first, and names the consumer', () => {
+    const text = generateCoreSchema([
+      spec({ name: 'P_ONE', scope: 'project', usedBy: 'the app login' }),
+      spec({ name: 'C_ONE', scope: 'core', usedBy: 'the runner', featureGate: 'auto-sync' }),
+      spec({ name: 'T_ONE', scope: 'tooling', usedBy: 'a notifier' }),
+    ], []);
+    const at = (needle: string): number => text.indexOf(needle);
+    expect(at('FRAMEWORK (scope: core)')).toBeGreaterThan(-1);
+    expect(at('FRAMEWORK (scope: core)')).toBeLessThan(at('C_ONE='));
+    expect(at('C_ONE=')).toBeLessThan(at('TOOLING (scope: tooling'));
+    expect(at('T_ONE=')).toBeLessThan(at('PROJECT-UNDER-TEST (scope: project'));
+    expect(at('PROJECT-UNDER-TEST (scope: project')).toBeLessThan(at('P_ONE='));
+    expect(text).toContain('# Used by: the runner (only when the auto-sync switch is on)\n');
+    expect(text).toContain('# Used by: the app login\n');
+  });
+
+  test('free text cannot smuggle a decorator or a line break into the schema', () => {
+    const text = generateCoreSchema([
+      spec({ name: 'A', note: 'contact ops@example.test\nsecond line', obtainHint: '@required is not a hint' }),
+    ], [{ name: 'K', docs: 'knob @sensitive text' }]);
+    expect(text).toContain('# contact ops(at)example.test second line\n# Used by: a consumer\n# Obtain: (at)required is not a hint\nA=\n');
+    expect(text).toContain('# knob (at)sensitive text\nK=\n');
+  });
+
+  test('rejects a knob that shadows a manifest var', () => {
+    expect(() => generateCoreSchema([spec({ name: 'A' })], [{ name: 'A', docs: 'dup' }])).toThrow(/declare it once/);
+  });
+
+  test('the real manifest emits no unconditional @required outside TEST_ENV', () => {
+    // The schema's contract is validateTestEnv's: TEST_ENV plus the active
+    // env's test-user credentials. CI never holds an Atlassian token.
+    const unconditional = envFileVars().filter(s => schemaRequiredDecorator(s) === '@required').map(s => s.name);
+    expect(unconditional).toEqual(['TEST_ENV']);
+  });
+});
+
+describe('placeholders', () => {
+  test('placeholderFor satisfies each type without being real', () => {
+    expect(placeholderFor('enum(local, staging)', false)).toBe('local');
+    expect(placeholderFor('email', false)).toBe('placeholder@example.test');
+    expect(placeholderFor('url', false)).toMatch(/^https:\/\//);
+    expect(placeholderFor('port', false)).toBe('5432');
+    expect(placeholderFor(undefined, true).length).toBeGreaterThan(20);
+  });
+  test('placeholderEnv covers exactly what is required under the env', () => {
+    // A synthetic manifest with a conditional core item: the helper still
+    // understands forEnv, even though the real manifest no longer emits one.
+    const manifest = [
+      spec({ name: 'TEST_ENV', required: true }),
+      spec({ name: 'LOCAL_ONLY', required: { ifEnv: 'TEST_ENV=local' } }),
+      spec({ name: 'STAGING_ONLY', required: { ifEnv: 'TEST_ENV=staging' } }),
+      spec({ name: 'OPTIONAL' }),
+    ];
+    expect(Object.keys(placeholderEnv('local', manifest)).sort()).toEqual(['LOCAL_ONLY', 'TEST_ENV']);
+    expect(Object.keys(placeholderEnv('staging', manifest)).sort()).toEqual(['STAGING_ONLY', 'TEST_ENV']);
+  });
+
+  test('the real manifest needs nothing but TEST_ENV under any env', () => {
+    // The framework requires only what it owns (ADR-0005): a project's
+    // test-user pair is an optional typed example, never a required item.
+    expect(Object.keys(placeholderEnv('local'))).toEqual(['TEST_ENV']);
+    expect(Object.keys(placeholderEnv('staging'))).toEqual(['TEST_ENV']);
+  });
+});
+
+describe('files', () => {
+  test('writeCoreSchema is idempotent and seedProjectSchema never overwrites', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'env-schema-test-'));
+    try {
+      expect(writeCoreSchema(dir)).toBe(true);
+      expect(writeCoreSchema(dir)).toBe(false);
+      expect(seedProjectSchema(dir)).toBe(true);
+      fs.writeFileSync(path.join(dir, PROJECT_SCHEMA_FILE), '# mine\n', 'utf8');
+      expect(seedProjectSchema(dir)).toBe(false);
+      expect(fs.readFileSync(path.join(dir, PROJECT_SCHEMA_FILE), 'utf8')).toBe('# mine\n');
+    }
+    finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('the project template imports the core file and switches on TEST_ENV', () => {
+    const t = projectSchemaTemplate();
+    expect(t).toContain(`# @import(./${CORE_SCHEMA_FILE})`);
+    expect(t).toContain('# @currentEnv=$TEST_ENV');
+  });
+});
+
+describe('the committed pair loads through the pinned varlock', () => {
+  test('the repo pair resolves every core item with .env.core.schema read as a schema source', () => {
+    const result = loadSchemaPairThroughVarlock(REPO_ROOT, 'local');
+    expect(result.reason).toBeUndefined();
+    expect(result.ok).toBe(true);
+    expect(result.sources.some(s => s.type === 'schema' && s.label.endsWith(CORE_SCHEMA_FILE))).toBe(true);
+    expect(result.resolvedKeys).toContain('TEST_ENV');
+    expect(result.resolvedKeys).toContain('ATLASSIAN_API_TOKEN');
+  });
+
+  test('a missing required item fails the load instead of passing silently', () => {
+    // Same pair, but the staging env, whose credentials the local placeholder
+    // set does not carry: the gate must go red, not green.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'env-schema-neg-'));
+    try {
+      fs.copyFileSync(path.join(REPO_ROOT, CORE_SCHEMA_FILE), path.join(dir, CORE_SCHEMA_FILE));
+      fs.copyFileSync(path.join(REPO_ROOT, PROJECT_SCHEMA_FILE), path.join(dir, PROJECT_SCHEMA_FILE));
+      // A project file that forgot the import: the core items vanish.
+      fs.writeFileSync(path.join(dir, PROJECT_SCHEMA_FILE), '# @currentEnv=$TEST_ENV\n# ---\nTEST_ENV=local\n', 'utf8');
+      const noImport = loadSchemaPairThroughVarlock(dir, 'local');
+      expect(noImport.ok).toBe(false);
+      expect(noImport.reason).toMatch(/not loaded as a schema source|core items not in the resolved graph/);
+    }
+    finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('the real manifest carries no conditional @required (project credentials are optional)', () => {
+    // ADR-0005: a test-user pair is the project's, so the synced schema never
+    // marks it required for an environment. A missing one fails by name at the
+    // point of use (config.testUser), not at varlock load.
+    const conditional = VAR_MANIFEST.filter(s => schemaRequiredDecorator(s)?.startsWith('@required=forEnv') === true).map(s => s.name);
+    expect(conditional).toEqual([]);
+  });
+});

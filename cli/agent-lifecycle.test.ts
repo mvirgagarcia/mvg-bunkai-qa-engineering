@@ -1,0 +1,351 @@
+import type { ReportSink } from './lib/updater-types.ts';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+
+import { dirname, join, resolve } from 'node:path';
+
+import { afterEach, describe, expect, test } from 'bun:test';
+
+import { communitySkillStatus, diagnoseAgentCompatibility } from './doctor.ts';
+import {
+  buildCommunitySkillArgs,
+  detectAgents,
+  discoverRequiredEnvVars,
+  launchCommandsForAgents,
+  migrateAgentIds,
+  parseAgentsEnv,
+  PROJECT_LEVEL_SKILLS,
+  PROJECT_SKILL_DESTINATION,
+  remoteHeadRef,
+  repairRepositoryCompatibility,
+} from './install.ts';
+import { declaredMcpIds } from './lib/agent-compatibility-contracts.ts';
+import {
+  claudeSkillsAliasPlan,
+  repairClaudeSkillsAlias,
+} from './lib/agent-compatibility.ts';
+import { COMPONENTS, makeAgentCompatibilityHook } from './update-boilerplate.ts';
+
+const REPO_ROOT = resolve(import.meta.dir, '..');
+const temporaryRoots: string[] = [];
+
+function temporaryRoot(): string {
+  const root = mkdtempSync(join(tmpdir(), 'agent lifecycle '));
+  temporaryRoots.push(root);
+  return root;
+}
+
+/**
+ * Full `ReportSink` whose only live member is `step`, which records into
+ * `steps`. Every other member throws instead of no-opping: the compatibility
+ * hook is only allowed to report progress, so a call to `warn`, `confirm`, or
+ * any picker is a behavioral regression the test must fail on, not swallow.
+ */
+function recordingSink(steps: string[]): ReportSink {
+  const forbidden = (member: string) => (): never => {
+    throw new Error(`makeAgentCompatibilityHook must not call sink.${member}()`);
+  };
+  return {
+    phase: forbidden('phase'),
+    subphase: forbidden('subphase'),
+    step: message => steps.push(message),
+    warn: forbidden('warn'),
+    error: forbidden('error'),
+    spinner: forbidden('spinner'),
+    confirm: forbidden('confirm'),
+    pickScopes: forbidden('pickScopes'),
+    pickFiles: forbidden('pickFiles'),
+    pickIgnoreLines: forbidden('pickIgnoreLines'),
+    resolveDiverged: forbidden('resolveDiverged'),
+    confirmDelete: forbidden('confirmDelete'),
+  };
+}
+
+function copyPath(root: string, relativePath: string): void {
+  const destination = join(root, relativePath);
+  mkdirSync(dirname(destination), { recursive: true });
+  cpSync(join(REPO_ROOT, relativePath), destination, { recursive: true });
+}
+
+function compatibilityFixture(): string {
+  const root = temporaryRoot();
+  for (const path of [
+    'AGENTS.md',
+    'CLAUDE.md',
+    '.agents/skills/project-context/SKILL.md',
+    '.agents/hooks/personality-reinject.mjs',
+    '.claude/settings.json',
+    '.opencode/plugins/personality-reinject.js',
+    '.codex/hooks.json',
+    '.codex/config.toml',
+    '.mcp.json',
+    'opencode.jsonc',
+  ]) { copyPath(root, path); }
+  return root;
+}
+
+afterEach(() => {
+  while (temporaryRoots.length > 0) {
+    const root = temporaryRoots.pop();
+    if (root) { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+describe('installer Codex lifecycle', () => {
+  test('parses Codex, deduplicates agents, and migrates legacy state values', () => {
+    expect(parseAgentsEnv('codex,claude-code,codex,unknown,opencode')).toEqual([
+      'codex',
+      'claude-code',
+      'opencode',
+    ]);
+    expect(migrateAgentIds(['claude-code', 'opencode'])).toEqual(['claude-code', 'opencode']);
+    expect(migrateAgentIds(['codex', 'unknown'])).toEqual(['codex']);
+  });
+
+  test('distinguishes Codex CLI detection from Desktop repository configuration', async () => {
+    const root = temporaryRoot();
+    mkdirSync(join(root, '.codex'), { recursive: true });
+    writeFileSync(join(root, '.codex/config.toml'), '[shell_environment_policy]\ninherit = "core"\n');
+    const detected = await detectAgents({
+      home: join(root, 'home'),
+      root,
+      binaryExists: binary => binary === 'codex',
+    });
+
+    expect(detected).toEqual({
+      claudeCode: false,
+      opencode: false,
+      codexCli: true,
+      codexConfigured: true,
+    });
+  });
+
+  test('keeps project skills canonical and maps global skills to every harness', () => {
+    const item = { package: 'owner/repo', skill: 'example' };
+    expect(PROJECT_SKILL_DESTINATION).toBe('.agents/skills');
+    expect(buildCommunitySkillArgs(item, 'project', ['claude-code', 'opencode', 'codex']))
+      .toEqual(['skills', 'add', 'owner/repo', '--skill', 'example', '--yes']);
+    expect(buildCommunitySkillArgs(item, 'global', ['claude-code', 'opencode', 'codex']))
+      .toEqual([
+        'skills',
+        'add',
+        'owner/repo',
+        '--skill',
+        'example',
+        '--global',
+        '--agent',
+        'claude-code',
+        '--agent',
+        'opencode',
+        '--agent',
+        'codex',
+        '--yes',
+      ]);
+  });
+
+  test('discovers Codex MCP environment contracts and exposes launch guidance', async () => {
+    // The six DBHUB_* arrive through `env_vars` on the dbhub server: Codex
+    // inherits only `core`, so anything dbhub.toml interpolates has to be
+    // forwarded by name. Every one of these is project-scoped, so the
+    // installer defers them to `bun run setup:doctor` instead of prompting.
+    // No remote server's key appears: those servers run at harness level.
+    expect(await discoverRequiredEnvVars(['codex'], REPO_ROOT)).toEqual([
+      'API_BASE_URL',
+      'DBHUB_DATABASE',
+      'DBHUB_HOST',
+      'DBHUB_PASSWORD',
+      'DBHUB_PORT',
+      'DBHUB_TYPE',
+      'DBHUB_USER',
+      'OPENAPI_SPEC_PATH',
+    ]);
+    expect(launchCommandsForAgents(['claude-code', 'opencode', 'codex']))
+      .toEqual(['bun claude', 'bun opencode', 'bun codex']);
+  });
+});
+
+describe('compatibility repair lifecycle', () => {
+  test('constructs portable POSIX and Windows alias plans', () => {
+    const root = temporaryRoot();
+    expect(claudeSkillsAliasPlan(root, 'linux')).toMatchObject({
+      target: '../.agents/skills',
+      type: 'symlink',
+    });
+    expect(claudeSkillsAliasPlan(root, 'win32')).toMatchObject({
+      target: join(root, '.agents', 'skills'),
+      type: 'junction',
+    });
+  });
+
+  test('refuses to replace a real Claude skills directory', () => {
+    const root = compatibilityFixture();
+    mkdirSync(join(root, '.claude/skills'), { recursive: true });
+    writeFileSync(join(root, '.claude/skills/owned.txt'), 'preserve me\n');
+
+    expect(() => repairClaudeSkillsAlias(root, 'linux')).toThrow('Refusing to replace');
+    expect(readFileSync(join(root, '.claude/skills/owned.txt'), 'utf8')).toBe('preserve me\n');
+  });
+
+  test('reclaims the skills CLI per-skill symlink shim without losing a skill body', () => {
+    // `bunx skills add` (project level) writes the body to .agents/skills/<slug>/ and then
+    // creates .claude/skills/ as a REAL directory of per-skill symlinks. `bun run setup`
+    // installs community skills BEFORE repairing compatibility, so this is what a clean
+    // clone actually looks like at repair time. Refusing here aborted the install.
+    const root = compatibilityFixture();
+    mkdirSync(join(root, '.agents/skills/playwright-cli'), { recursive: true });
+    writeFileSync(join(root, '.agents/skills/playwright-cli/SKILL.md'), 'body\n');
+    mkdirSync(join(root, '.claude/skills'), { recursive: true });
+    symlinkSync('../../.agents/skills/playwright-cli', join(root, '.claude/skills/playwright-cli'), 'dir');
+
+    expect(repairClaudeSkillsAlias(root, 'linux')).toMatchObject({
+      target: '../.agents/skills',
+      status: 'repaired',
+    });
+    // The body survives and is still reachable through the directory-level alias.
+    expect(readFileSync(join(root, '.agents/skills/playwright-cli/SKILL.md'), 'utf8')).toBe('body\n');
+    expect(readFileSync(join(root, '.claude/skills/playwright-cli/SKILL.md'), 'utf8')).toBe('body\n');
+    expect(repairClaudeSkillsAlias(root, 'linux').status).toBe('valid');
+  });
+
+  test('still refuses a shim directory that also holds real content', () => {
+    const root = compatibilityFixture();
+    mkdirSync(join(root, '.agents/skills/playwright-cli'), { recursive: true });
+    mkdirSync(join(root, '.claude/skills'), { recursive: true });
+    symlinkSync('../../.agents/skills/playwright-cli', join(root, '.claude/skills/playwright-cli'), 'dir');
+    writeFileSync(join(root, '.claude/skills/hand-written.md'), 'mine\n');
+
+    expect(() => repairClaudeSkillsAlias(root, 'linux')).toThrow('Refusing to replace');
+    expect(readFileSync(join(root, '.claude/skills/hand-written.md'), 'utf8')).toBe('mine\n');
+  });
+
+  test('refuses a symlink shim pointing outside the canonical skills store', () => {
+    const root = compatibilityFixture();
+    mkdirSync(join(root, 'elsewhere/rogue'), { recursive: true });
+    mkdirSync(join(root, '.claude/skills'), { recursive: true });
+    symlinkSync('../../elsewhere/rogue', join(root, '.claude/skills/rogue'), 'dir');
+
+    expect(() => repairClaudeSkillsAlias(root, 'linux')).toThrow('Refusing to replace');
+  });
+
+  test('installer and updater repairs are idempotent', async () => {
+    const root = compatibilityFixture();
+    const first = repairRepositoryCompatibility(root, 'linux');
+    const second = repairRepositoryCompatibility(root, 'linux');
+    expect(first.alias.status).toBe('created');
+    expect(second).toMatchObject({ shadowingCommandsMoved: [], alias: { status: 'valid' } });
+
+    const steps: string[] = [];
+    const hook = makeAgentCompatibilityHook(recordingSink(steps), root);
+    await hook({ applied: [] } as never);
+    await hook({ applied: [] } as never);
+    expect(steps.at(-1)).toBe('Compatibilidad lista: alias valid.');
+  });
+});
+
+describe('doctor and updater parity', () => {
+  test('reports file correctness separately from Codex trust and CLI availability', () => {
+    const root = compatibilityFixture();
+    repairRepositoryCompatibility(root, 'linux');
+    const diagnostic = diagnoseAgentCompatibility(root, { platform: 'linux', codexCliDetected: false });
+
+    expect(diagnostic.file_correct).toBe(true);
+    expect(diagnostic.errors).toEqual([]);
+    expect(diagnostic.errors_by_surface).toEqual([]);
+    expect(diagnostic.alias.status).toBe('valid');
+    // Derived from `.mcp.json`, never a literal count: a downstream project
+    // with more servers passes unchanged.
+    expect(diagnostic.mcp).toMatchObject({ expected_servers: declaredMcpIds(root).length, parity: true });
+    expect(diagnostic.codex).toMatchObject({
+      cli_detected: false,
+      repository_configured: true,
+      desktop_uses_repository_config: true,
+      trust_required: true,
+      trust_status: 'required-not-verifiable',
+    });
+  });
+
+  test('reports a missing alias and grouped errors without throwing', () => {
+    const root = compatibilityFixture();
+    repairRepositoryCompatibility(root, 'linux');
+    rmSync(join(root, '.claude/skills'));
+    rmSync(join(root, '.codex/hooks.json'));
+
+    const diagnostic = diagnoseAgentCompatibility(root, { platform: 'linux', codexCliDetected: false });
+    expect(diagnostic.file_correct).toBe(false);
+    expect(diagnostic.alias.status).toBe('missing');
+    expect(diagnostic.instructions.claude_alias).toBe(false);
+    expect(diagnostic.hooks.codex).toBe(false);
+    expect(diagnostic.errors_by_surface.map(bucket => bucket.group)).toEqual(['alias', 'hooks']);
+    expect(diagnostic.errors_by_surface[1].errors).toEqual(['Hook compatibility file missing: .codex/hooks.json']);
+  });
+
+  test('updater owns every canonical source and generated adapter family', () => {
+    const paths = COMPONENTS.flatMap(component => component.paths);
+    expect(paths).toContain('.agents/skills');
+    expect(paths).toContain('.agents/hooks');
+    // The alias wrappers are retired: harness command dirs are the project's own.
+    expect(paths).not.toContain('.claude/commands');
+    expect(paths).not.toContain('.opencode/commands');
+    expect(paths).toContain('.opencode/plugins');
+    expect(paths).toContain('.codex');
+    // Since 8.2 `agent-root-config` delivers `.claude/settings.json` once and
+    // then leaves it to the project (watchlist). `CLAUDE.md` is generated by the
+    // compatibility repair and `.mcp.json` / `opencode.jsonc` are watchlisted
+    // project registries, so no component may sync any of the three.
+    const rootFiles = COMPONENTS.find(component => component.name === 'agent-root-config');
+    expect(rootFiles).toMatchObject({ type: 'file-list', paths: ['.claude'], bootstrapOnly: true });
+    expect(rootFiles?.files).toEqual(['settings.json']);
+    const syncedFiles = COMPONENTS.flatMap(component => component.files ?? []);
+    for (const never of ['CLAUDE.md', '.mcp.json', 'opencode.jsonc']) {
+      expect(syncedFiles).not.toContain(never);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T3 community skills. Installed once at scaffold time, gitignored, and
+// outside the updater's surface — so without this reporting a project runs its
+// scaffold-day copy forever with no signal. Reporting only: no reinstall path,
+// because an overwrite of a gitignored skill has no backup to restore from.
+// ---------------------------------------------------------------------------
+
+describe('community skill version reporting', () => {
+  const SHA = 'a'.repeat(40);
+  const OTHER = 'b'.repeat(40);
+
+  test('reads the remote HEAD from one ls-remote, no clone', () => {
+    const calls: string[][] = [];
+    const run = (binary: string, args: string[]): { ok: boolean, stdout: string } => {
+      calls.push([binary, ...args]);
+      return { ok: true, stdout: `${SHA}\tHEAD\n` };
+    };
+
+    expect(remoteHeadRef('https://github.com/microsoft/playwright-cli', run)).toBe(SHA);
+    expect(calls).toEqual([['git', 'ls-remote', 'https://github.com/microsoft/playwright-cli', 'HEAD']]);
+  });
+
+  test('an unreachable or nonsense remote yields null, never a stale sha', () => {
+    expect(remoteHeadRef('x', () => ({ ok: false, stdout: '' }))).toBeNull();
+    expect(remoteHeadRef('x', () => ({ ok: true, stdout: '' }))).toBeNull();
+    expect(remoteHeadRef('x', () => ({ ok: true, stdout: 'not-a-sha\tHEAD\n' }))).toBeNull();
+  });
+
+  test('ignorance never reads as current', () => {
+    expect(communitySkillStatus(false, SHA, SHA)).toBe('not-installed');
+    expect(communitySkillStatus(true, null, SHA)).toBe('untracked');
+    expect(communitySkillStatus(true, SHA, null)).toBe('unknown');
+  });
+
+  test('compares the recorded baseline against the remote head', () => {
+    expect(communitySkillStatus(true, SHA, SHA)).toBe('current');
+    expect(communitySkillStatus(true, SHA, OTHER)).toBe('outdated');
+  });
+
+  test('every declared T3 skill carries the package the baseline is recorded against', () => {
+    expect(PROJECT_LEVEL_SKILLS.length).toBeGreaterThan(0);
+    for (const item of PROJECT_LEVEL_SKILLS) {
+      expect(item.package).toMatch(/^https?:\/\//);
+      expect(item.skill).toBeTruthy();
+    }
+  });
+});
