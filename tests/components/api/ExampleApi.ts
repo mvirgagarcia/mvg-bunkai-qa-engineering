@@ -54,7 +54,7 @@ export class ExampleApi extends ApiBase {
    * TODO: Replace 'PROJ' with your Jira project key (e.g., @atc('UPEX-101'))
    * TODO: Update endpoint path
    */
-  @atc('PROJ-101')
+  @atc('PROJ-121')
   async createResourceSuccessfully(
     payload: CreateExampleRequest,
   ): Promise<[APIResponse, CreateExampleResponse, CreateExampleRequest]> {
@@ -85,7 +85,7 @@ export class ExampleApi extends ApiBase {
    * TODO: Replace 'PROJ' with your Jira project key (e.g., @atc('UPEX-102'))
    * TODO: Update endpoint path
    */
-  @atc('PROJ-102')
+  @atc('PROJ-122')
   async createResourceWithInvalidData(
     payload: CreateExampleRequest,
   ): Promise<[APIResponse, Record<string, unknown>, CreateExampleRequest]> {
