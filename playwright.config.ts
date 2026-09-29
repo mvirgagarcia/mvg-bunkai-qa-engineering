@@ -9,7 +9,7 @@
  */
 
 import { defineConfig, devices } from '@playwright/test';
-import { config, env } from './config/variables';
+import { config, env } from '@variables';
 
 // Use values from centralized config (no direct process.env access)
 const baseURL = config.baseUrl;
