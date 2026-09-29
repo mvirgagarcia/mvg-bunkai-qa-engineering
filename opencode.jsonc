@@ -25,7 +25,7 @@
   "mcp": {
     "context7": {
       "type": "local",
-      "command": ["npx", "-y", "@upstash/context7-mcp"],
+      "command": ["bunx", "-y", "@upstash/context7-mcp@4.0.3"],
       "enabled": true
     },
     "tavily": {
@@ -34,7 +34,7 @@
         "npx",
         "-y",
         "mcp-remote",
-        "https://mcp.tavily.com/mcp/?tavilyApiKey={env:TAVILY_API_KEY}"
+        "https://mcp.tavily.com/mcp/?tavilyApiKey={file:.auth/opencode/TAVILY_API_KEY}"
       ],
       "enabled": true
     },
@@ -42,7 +42,7 @@
       "type": "local",
       "command": [
         "bunx",
-        "@playwright/mcp@latest",
+        "@playwright/mcp@0.0.79",
         "--caps",
         "vision,pdf,testing,tracing,tabs",
         "--timeout-action",
@@ -56,17 +56,24 @@
     },
     "dbhub": {
       "type": "local",
-      "command": ["bunx", "-y", "@bytebase/dbhub@latest", "--config", "dbhub.toml"],
-      "enabled": true
+      "command": ["bunx", "-y", "@bytebase/dbhub@1.2.1", "--config", "dbhub.toml"],
+      "enabled": true,
+      "environment": {
+        "DBHUB_DATABASE": "{file:.auth/opencode/DBHUB_DATABASE}",
+        "DBHUB_HOST": "{file:.auth/opencode/DBHUB_HOST}",
+        "DBHUB_PASSWORD": "{file:.auth/opencode/DBHUB_PASSWORD}",
+        "DBHUB_PORT": "{file:.auth/opencode/DBHUB_PORT}",
+        "DBHUB_TYPE": "{file:.auth/opencode/DBHUB_TYPE}",
+        "DBHUB_USER": "{file:.auth/opencode/DBHUB_USER}"
+      }
     },
     "openapi": {
       "type": "local",
-      "command": ["bunx", "-y", "@ivotoby/openapi-mcp-server", "--tools", "dynamic"],
+      "command": ["bunx", "-y", "@ivotoby/openapi-mcp-server@1.16.1", "--tools", "dynamic"],
       "enabled": true,
       "environment": {
-        "API_BASE_URL": "{env:API_BASE_URL}",
-        "OPENAPI_SPEC_PATH": "{env:OPENAPI_SPEC_PATH}",
-        "API_HEADERS": "Authorization:Bearer {env:API_TOKEN}"
+        "API_BASE_URL": "{file:.auth/opencode/API_BASE_URL}",
+        "OPENAPI_SPEC_PATH": "{file:.auth/opencode/OPENAPI_SPEC_PATH}"
       }
     },
     "postman": {
@@ -74,7 +81,7 @@
       "url": "https://mcp.postman.com/mcp",
       "enabled": true,
       "headers": {
-        "Authorization": "Bearer {env:POSTMAN_API_KEY}"
+        "Authorization": "Bearer {file:.auth/opencode/POSTMAN_API_KEY}"
       }
     }
   },

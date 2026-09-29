@@ -70,7 +70,17 @@
       "Skill(business-feature-map)",
       "Skill(business-api-map)",
       "Skill(master-test-plan)",
-      "Skill(break-down-tests)"
+      "Skill(break-down-tests)",
+      "Bash(orca *)",
+      "Skill(orca-orchestration)",
+      "Skill(session-handoff)",
+      "Skill(project-context)",
+      "Skill(sync-ai-context)",
+      "Skill(jira-administration)",
+      "Skill(bug-screenshot-annotation)",
+      "Skill(framework-development)",
+      "Skill(judgment-day)",
+      "Skill(pr-review-lead)"
     ],
     "deny": [
       "Bash(rm -rf *)",
@@ -101,5 +111,19 @@
     "pr": ""
   },
   "enableAllProjectMcpServers": true,
-  "cleanupPeriodDays": 60
+  "cleanupPeriodDays": 60,
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.agents/hooks/personality-reinject.mjs\"",
+            "timeout": 5,
+            "statusMessage": "Loading output contract..."
+          }
+        ]
+      }
+    ]
+  }
 }
