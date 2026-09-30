@@ -162,7 +162,7 @@ orchestration:
   # `orchestrator_cli` = no orchestrator on this machine: every workflow skill
   # falls back to the pasted-launch-line path and says NOTHING about it.
   orchestrator_name: Orca # the application the operator sees
-  orchestrator_cli: orca # the binary on PATH (Linux outside a managed terminal: orca-ide)
+  orchestrator_cli: '' # empty: Orca is not installed here; set to `orca` once it is on PATH
   # `message_verb` carries every message BETWEEN sessions. Byte-intact.
   # `terminal_verb` DRIVES a terminal: commands, CLI calls, harness slash-commands,
   # keystrokes. It truncates a long payload silently, so if a HUMAN would read it,
