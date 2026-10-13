@@ -175,14 +175,14 @@ git_strategy:
     setup_version: 2
     created: 2026-07-11 # YYYY-MM-DD stamped by Strategy Setup
     # NEW in 1.0.0 — added by `bun sync`, unset. See .agents/README.md.
-    policy_verified: null # YYYY-MM-DD of the last `bun run git:policy verify`. null = never reconciled against the host
+    policy_verified: 2026-10-13 # YYYY-MM-DD of the last `bun run git:policy verify`. null = never reconciled against the host
     # NEW in 1.0.0 — added by `bun sync`, unset. See .agents/README.md.
-    policy_source: declared # verified | accepted | declared. `verified` = host matches the yaml exactly; `accepted` = every divergence is formally listed in policy.accepted_divergences (stamped by `git:policy verify --stamp`); `declared` = never reconciled, or an unaccepted drift is open.
+    policy_source: verified # verified | accepted | declared. `verified` = host matches the yaml exactly; `accepted` = every divergence is formally listed in policy.accepted_divergences (stamped by `git:policy verify --stamp`); `declared` = never reconciled, or an unaccepted drift is open.
     # NEW in 1.0.0 — added by `bun sync`, unset. See .agents/README.md.
     # Did anyone actually CHOOSE this strategy, or is it just the shipped default?
     # `strategy:` above is never null, so its value alone cannot answer that. Strategy
     # Setup flips this to `chosen` when the questionnaire actually runs.
-    strategy_source: inherited # inherited | chosen
+    strategy_source: chosen # inherited | chosen
 
 # Defaults for multi-session orchestration (supervised worker fleets via Orca —
 # see the orca-orchestration skill). Owned by that skill; read directly, NOT
