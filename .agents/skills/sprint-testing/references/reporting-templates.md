@@ -349,13 +349,13 @@ for each {TEST_KEY, result} in run:
   [TMS_TOOL] Update Run:
     execution: {ATR_KEY}
     test:      {TEST_KEY}
-    status:    PASS | FAIL | BLOCKED | ABORTED | TODO  # terminal-set caveat: §2.4
+    status:    PASSED | FAILED | TODO | EXECUTING  # this instance's vocabulary; BLOCKED / ABORTED only where defined: §2.4
     comment:   "{optional note, e.g. bug key if FAIL}"
 
 # Close the Execution
 [ISSUE_TRACKER_TOOL] Transition Issue:
   issue: {ATR_KEY}
-  transition: done
+  transition: {{jira.transition.test_execution.complete}}
 ```
 
 If the run was already imported from CI via `[TMS_TOOL] Import Results`, the Test Runs are already populated — only the description + Environment + Begin/End need the manual update.
@@ -615,7 +615,7 @@ Record the gate outcome (hypothesis, cited fact, decision) in the ATR Observatio
 
    Resolve the `blocks` link type by slug only, create one edge, then run the mandatory direction check (confirm the Story's inward partner is the Bug under `is blocked by`) — full mechanics in `agentic-qa-core/references/traceability-linking.md` (§2 slug resolution, §4 directionality + verification, §6 never degrade a `blocks` edge to `relates` silently). Defer `--out`/`--in` flag handling to `/acli` per `[ISSUE_TRACKER_TOOL]`.
 6. PBI `context.md` updated with `Final Status` block.
-7. Nothing to commit — the ATR is canonical in Jira; the synced `acceptance-test-results.md` is a gitignored cache rebuilt by `bun run jira:sync-issues`, and `context.md` is disposable session output (see `AGENTS.md` §9).
+7. Nothing to commit — the ATR is canonical in Jira; the synced `acceptance-test-results.md` is a gitignored cache rebuilt by `bun run jira:sync-issues`, and `context.md` is disposable session output (see `.agents/instructions/agent-local-context-pbi.md`).
 8. For sprint-wide mode, only now is the sprint log appended — one entry in `.session/sprint-testing/sprint-{N}/progress.md` mirrored as one comment on the STP (Stage-3 gate; append-only on both sides).
 
 ### 5.2 Next stage routing

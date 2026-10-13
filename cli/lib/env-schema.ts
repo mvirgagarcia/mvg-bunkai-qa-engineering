@@ -31,9 +31,18 @@
  * that changes the rule fails the gate instead of silently dropping every
  * core variable from validation.
  *
+ * THE OPTIONAL PROVIDER OVERLAY. The core header carries
+ * `@import(./.env.provider.schema, allowMissing=true)`: the hook a project
+ * uses when it keeps its secrets in a manager (ADR-0010). Absent overlay = a
+ * no-op, so every project without one loads unchanged. Placed HERE, in the
+ * synced half, so an existing project gains the hook with `bun sync` and
+ * never has to edit its own `.env.schema`. Measured: an overlay item beats both
+ * this file's empty declaration and a project re-declaration with an empty
+ * value. The overlay itself is `cli/lib/secret-providers.ts`.
+ *
  * `cli/` is import-closed (AGENTS.md §4.5): this module imports only from
- * `./variables-manifest.ts` and node built-ins. `scripts/env-schema.ts` is
- * the argv wrapper that imports FROM here.
+ * `./variables-manifest.ts`, `./secret-providers.ts` and node built-ins.
+ * `scripts/env-schema.ts` is the argv wrapper that imports FROM here.
  */
 
 import type { VarScope, VarSpec } from './variables-manifest.ts';
@@ -42,6 +51,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+import { PROVIDER_SCHEMA_FILE } from './secret-providers.ts';
 import { validateVarManifest, valueSourceOf, VAR_MANIFEST, VAR_SCOPES } from './variables-manifest.ts';
 
 // ----------------------------------------------------------------------------
@@ -103,19 +113,25 @@ export const RUNTIME_KNOBS: readonly RuntimeKnob[] = [
 ];
 
 // ----------------------------------------------------------------------------
-// Retired keys: declared so an older .env still validates
+// Retired keys: cleaned from .env, never declared
 // ----------------------------------------------------------------------------
 
 /**
  * Keys the manifest no longer knows but an adopting repo's `.env` may still
- * carry, copied from an older template. varlock fails an UNDECLARED key that
- * is present and EMPTY (env-secrets probe), so retiring a key from the manifest
- * without declaring it here would break every downstream `.env` the day it
- * synced the new schema. Each stays declared, optional and sensitive, under a
- * banner that says to delete the line; the doctor warns when one is set.
+ * carry, copied from an older template. The schema does NOT declare them:
+ * nothing reads them, and a declared name reads as a live one.
+ *
+ * That has a price, measured with the pinned varlock: an UNDECLARED key that
+ * is present and EMPTY in `.env` fails `varlock load` ("Value is required but
+ * is currently empty"); one with a value passes. So the cleanup runs BEFORE
+ * any validation: `bun setup` and `bun run setup:doctor` find the lines
+ * (`retiredEnvKeysIn`) and offer to delete them with one confirmation
+ * (`removeRetiredEnvLines`), and the doctor's own validation neutralizes the
+ * ones still there (`neutralizeRetiredKeys`) so a declined cleanup or a
+ * non-interactive run reports them instead of failing on them.
  *
  * `since` is the date the key left the manifest; `reason` is one sentence a
- * human reads in the schema comment.
+ * human reads in the cleanup prompt.
  */
 export interface RetiredKey {
   name: string
@@ -129,6 +145,57 @@ export const RETIRED_KEYS: readonly RetiredKey[] = [
   { name: 'RESEND_API_KEY', since: '2026-09-24', reason: 'the resend CLI logs in on its own (resend login); nothing in the repo reads it.' },
   { name: 'API_TOKEN', since: '2026-09-24', reason: 'legacy; bun run api:login writes the curl token to .auth/tokens.env.' },
 ];
+
+/** An ACTIVE assignment line (`KEY=` or `export KEY=`); a commented line is inert and stays. */
+const ENV_ASSIGNMENT = /^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=/;
+
+/**
+ * The retired keys that `.env` text still assigns, in `RETIRED_KEYS` order.
+ * Names only: a caller never needs, and never gets, a value.
+ */
+export function retiredEnvKeysIn(envText: string, retired: readonly RetiredKey[] = RETIRED_KEYS): string[] {
+  const assigned = new Set<string>();
+  for (const line of envText.split(/\r?\n/)) {
+    const match = ENV_ASSIGNMENT.exec(line);
+    if (match) { assigned.add(match[1]); }
+  }
+  return retired.filter(k => assigned.has(k.name)).map(k => k.name);
+}
+
+/**
+ * `.env` text without the active lines that assign a retired key. Every other
+ * line, comment and line ending is kept byte for byte; a duplicate assignment
+ * of the same key goes too.
+ */
+export function removeRetiredEnvLines(envText: string, retired: readonly RetiredKey[] = RETIRED_KEYS): { text: string, removed: string[] } {
+  const names = new Set(retired.map(k => k.name));
+  const removed = new Set<string>();
+  const kept: string[] = [];
+  // Split keeping each line's own terminator, so a CRLF file stays CRLF.
+  for (const line of envText.split(/(?<=\n)/)) {
+    const match = ENV_ASSIGNMENT.exec(line);
+    if (match && names.has(match[1])) {
+      removed.add(match[1]);
+      continue;
+    }
+    kept.push(line);
+  }
+  return { text: kept.join(''), removed: retired.filter(k => removed.has(k.name)).map(k => k.name) };
+}
+
+/**
+ * A child environment in which every retired key `.env` still assigns has a
+ * non-empty placeholder, so `varlock load` judges the declared items only. A
+ * process value wins over the `.env` line (measured), and an undeclared key
+ * fails only when EMPTY. The placeholder is a constant, never the real value.
+ */
+export function neutralizeRetiredKeys<T extends Record<string, string | undefined>>(env: T, retiredInFile: readonly string[]): T {
+  // Generic, never `NodeJS.ProcessEnv`: `cli/**` must compile under a host
+  // whose `ProcessEnv` requires `NODE_ENV` (cli/updater-host-types.test.ts).
+  const out: Record<string, string | undefined> = { ...env };
+  for (const name of retiredInFile) { out[name] = 'retired'; }
+  return out as T;
+}
 
 // ----------------------------------------------------------------------------
 // Generation
@@ -228,18 +295,12 @@ function envFileSpecs(manifest: readonly VarSpec[]): VarSpec[] {
 export function generateCoreSchema(
   manifest: readonly VarSpec[] = VAR_MANIFEST,
   knobs: readonly RuntimeKnob[] = RUNTIME_KNOBS,
-  retired: readonly RetiredKey[] = RETIRED_KEYS,
 ): string {
   validateVarManifest(manifest);
   const manifestNames = new Set(manifest.map(s => s.name));
   for (const knob of knobs) {
     if (manifestNames.has(knob.name)) {
       throw new Error(`Runtime knob '${knob.name}' is also a manifest variable; declare it once.`);
-    }
-  }
-  for (const key of retired) {
-    if (manifestNames.has(key.name) || knobs.some(k => k.name === key.name)) {
-      throw new Error(`Retired key '${key.name}' is still declared elsewhere; retire it or declare it, not both.`);
     }
   }
 
@@ -255,6 +316,11 @@ export function generateCoreSchema(
     '# This file declares NAMES, types, sensitivity and which items varlock refuses',
     '# to run without. It never holds a value: fill .env (or .env.local), or let a',
     '# provider resolve the sensitive ones. Validate: bunx varlock load --agent',
+    '#',
+    `# The import below is the OPTIONAL secret-manager overlay (${PROVIDER_SCHEMA_FILE},`,
+    '# references only, written by `bun setup` when a project opts in). Absent',
+    '# = nothing changes: values come from .env / .env.local.',
+    `# @import(./${PROVIDER_SCHEMA_FILE}, allowMissing=true)`,
     '#',
     '# The two root decorators below are the defaults for THIS file\'s items; each',
     '# item states its own requiredness and sensitivity explicitly.',
@@ -306,19 +372,6 @@ export function generateCoreSchema(
     body.push(...renderKnob(knob));
     body.push('');
   }
-  if (retired.length > 0) {
-    body.push('# ----------------------------------------------------------------------------');
-    body.push('# RETIRED keys. Nothing reads them any more. Declared (optional) only so a .env');
-    body.push('# copied from an older template still validates: delete the line from yours.');
-    body.push('# ----------------------------------------------------------------------------');
-    body.push('');
-    for (const key of retired) {
-      body.push(`# Retired ${key.since}: ${safeText(key.reason)}`);
-      body.push('# @sensitive');
-      body.push(`${key.name}=`);
-      body.push('');
-    }
-  }
 
   return `${[...header, ...body].join('\n').replace(/\n+$/, '')}\n`;
 }
@@ -340,7 +393,7 @@ export function projectSchemaTemplate(): string {
     '# ============================================================================',
     `# ${PROJECT_SCHEMA_FILE} - project-owned env schema (varlock, env-spec)`,
     '# ============================================================================',
-    '# Delivered once by the boilerplate, then yours: bun run up never overwrites',
+    '# Delivered once by the boilerplate, then yours: bun sync never overwrites',
     `# it. The framework half lives in ${CORE_SCHEMA_FILE} (generated + synced) and`,
     '# is pulled in by the import below. Add the variables YOUR project-under-test',
     '# needs under "Project variables"; keep values out of this file.',
@@ -410,6 +463,225 @@ export function seedProjectSchema(root: string): boolean {
   if (fs.existsSync(target)) { return false; }
   fs.writeFileSync(target, projectSchemaTemplate(), 'utf8');
   return true;
+}
+
+// ----------------------------------------------------------------------------
+// Sensitivity lint: a secret-looking key must be @sensitive
+// ----------------------------------------------------------------------------
+
+/**
+ * Name fragments that mark a key as a secret. `varlock load --agent` redacts
+ * ONLY the items the schema calls sensitive; a token declared without
+ * `@sensitive` prints in clear (the Slack token incident, 2026-10-05). Matched
+ * as whole `_`-separated segments, case-insensitive, so `GH_TOKEN` and
+ * `SLACK_MCP_XOXP_TOKEN` match and `MAX_TOKENS` does not (a number cannot be
+ * `@sensitive` in varlock, so a false positive there would have no way out).
+ * agentic-dev ships the same constant with the same list; change both.
+ */
+export const SECRET_NAME_PATTERNS: readonly string[] = [
+  'TOKEN',
+  'SECRET',
+  'SECRETS',
+  'PASSWORD',
+  'PASSWORDS',
+  'PASSWD',
+  'PWD',
+  'API_KEY',
+  'APIKEY',
+  'ACCESS_KEY',
+  'PRIVATE_KEY',
+  'CLIENT_SECRET',
+  'CREDENTIAL',
+  'CREDENTIALS',
+  'PAT',
+  'XOXP',
+  'XOXB',
+  'XAPP',
+];
+
+const SECRET_NAME_RE = new RegExp(`(?:^|_)(?:${SECRET_NAME_PATTERNS.join('|')})(?:_|$)`, 'i');
+
+export function isSecretLookingName(name: string): boolean {
+  return SECRET_NAME_RE.test(name);
+}
+
+/** What one file says about an item's sensitivity. `undefined` = says nothing. */
+type Sensitivity = true | false | 'dynamic' | undefined;
+
+interface SchemaItemDef {
+  key: string
+  line: number
+  /** From the item's own `@sensitive` / `@public`. */
+  explicit: Sensitivity
+  /** From the file's `@defaultSensitive` root decorator, applied to this key. */
+  fileDefault: Sensitivity
+}
+
+export interface ParsedSchemaFile {
+  items: SchemaItemDef[]
+  /** Raw first argument of every root `@import(...)`, in file order. */
+  imports: string[]
+}
+
+export interface SensitivityViolation {
+  key: string
+  /** Root-relative path and 1-based line of the declaration the reason names. */
+  file: string
+  line: number
+  reason: string
+}
+
+const DIVIDER = /^\s*#\s*-{3,}\s*$/;
+const COMMENT = /^\s*#/;
+const ITEM = /^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=(.*)$/;
+
+/** The decorator part of a comment, or null when the comment is plain prose. */
+function decoratorText(comment: string): string | null {
+  const body = comment.replace(/^\s*#\s?/, '').trim();
+  return body.startsWith('@') ? body : null;
+}
+
+/** `@sensitive` / `@public` in one decorator string, resolved to what the item ends up as. */
+function sensitivityIn(decorators: string): Sensitivity {
+  const m = /(?:^|\s)@(sensitive|public)(?:=(\S+))?(?=\s|$)/.exec(decorators);
+  if (!m) { return undefined; }
+  const [, name, value] = m;
+  if (name === 'sensitive' && value?.startsWith('{')) { return true; }
+  const flag = value === undefined || value === 'true' ? true : value === 'false' ? false : 'dynamic';
+  if (flag === 'dynamic') { return 'dynamic'; }
+  return name === 'sensitive' ? flag : !flag;
+}
+
+/** The trailing `# ...` of an item line, skipping a quoted value. */
+function postValueComment(value: string): string | null {
+  const v = value.trimStart();
+  let rest = v;
+  const quote = v[0];
+  if (quote === '"' || quote === '\'' || quote === '`') {
+    const end = v.indexOf(quote, 1);
+    rest = end === -1 ? '' : v.slice(end + 1);
+  }
+  const hash = rest.search(/(?:^|\s)#/);
+  return hash === -1 ? null : rest.slice(hash).trim();
+}
+
+/** What `@defaultSensitive=<v>` makes of `key`. */
+function defaultFor(rootDecorators: string, key: string): Sensitivity {
+  const m = /(?:^|\s)@defaultSensitive=(\S+)/.exec(rootDecorators);
+  if (!m) { return undefined; }
+  if (m[1] === 'true') { return true; }
+  if (m[1] === 'false') { return false; }
+  const prefix = /^inferFromPrefix\((["']?)([^"')]*)\1\)$/.exec(m[1]);
+  return prefix ? !key.startsWith(prefix[2]) : 'dynamic';
+}
+
+/**
+ * Parse one env-spec file for the sensitivity lint. Static on purpose: running
+ * varlock would resolve, and could print, the very values this guards. Reads
+ * the header (the leading comment block, closed by a `# ---` divider or a blank
+ * line), the decorator comments directly above each item, and a post-value
+ * comment on the item line. A commented-out assignment is not an item.
+ */
+export function parseSchemaForSensitivity(text: string): ParsedSchemaFile {
+  const lines = normalizeEol(text).split('\n');
+
+  let headerEnd = 0;
+  if (lines.length > 0 && COMMENT.test(lines[0])) {
+    let i = 0;
+    while (i < lines.length && COMMENT.test(lines[i]) && !DIVIDER.test(lines[i])) { i++; }
+    if (i < lines.length && (DIVIDER.test(lines[i]) || lines[i].trim() === '')) { headerEnd = i + 1; }
+  }
+  const header = lines.slice(0, headerEnd).map(decoratorText).filter((d): d is string => d !== null).join(' ');
+  const imports = [...header.matchAll(/@import\(\s*([^,)\s]+)/g)].map(m => m[1].replace(/^["']|["']$/g, ''));
+
+  const items: SchemaItemDef[] = [];
+  let block: string[] = [];
+  for (let i = headerEnd; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === '' || DIVIDER.test(line)) { block = []; continue; }
+    if (COMMENT.test(line)) {
+      const dec = decoratorText(line);
+      if (dec !== null) { block.push(dec); }
+      continue;
+    }
+    const m = ITEM.exec(line);
+    if (m) {
+      const post = postValueComment(m[2]);
+      const decorators = [...block, post ? decoratorText(post) : null].filter((d): d is string => d !== null).join(' ');
+      items.push({ key: m[1], line: i + 1, explicit: sensitivityIn(decorators), fileDefault: defaultFor(header, m[1]) });
+    }
+    block = [];
+  }
+  return { items, imports };
+}
+
+/**
+ * The env schema files varlock loads from `root`: `.env.schema`, everything its
+ * `@import` chain reaches, plus the core and provider halves when present (so a
+ * broken import still gets them linted). Root-relative, deduplicated.
+ */
+export function schemaFilesIn(root: string): string[] {
+  const seen = new Set<string>();
+  const queue = [PROJECT_SCHEMA_FILE, CORE_SCHEMA_FILE, PROVIDER_SCHEMA_FILE];
+  while (queue.length > 0) {
+    const rel = path.normalize(queue.shift() as string);
+    const abs = path.join(root, rel);
+    if (seen.has(rel) || !fs.existsSync(abs) || !fs.statSync(abs).isFile()) { continue; }
+    seen.add(rel);
+    for (const imp of parseSchemaForSensitivity(fs.readFileSync(abs, 'utf8')).imports) {
+      queue.push(path.relative(root, path.resolve(path.dirname(abs), imp)));
+    }
+  }
+  return [...seen];
+}
+
+/**
+ * Every secret-looking key, across all `files`, that `varlock load --agent`
+ * could print in clear. Independent of varlock's def precedence: PASS needs no
+ * declaration calling the key non-sensitive AND (one declaration marking it
+ * `@sensitive`, OR every declaration's file defaulting it to sensitive).
+ * Names only; a schema value is never read into the result.
+ */
+export function lintSchemaSensitivity(files: ReadonlyArray<{ file: string, text: string }>): SensitivityViolation[] {
+  const defs = new Map<string, Array<SchemaItemDef & { file: string }>>();
+  for (const { file, text } of files) {
+    for (const item of parseSchemaForSensitivity(text).items) {
+      if (!isSecretLookingName(item.key)) { continue; }
+      defs.set(item.key, [...(defs.get(item.key) ?? []), { ...item, file }]);
+    }
+  }
+
+  const violations: SensitivityViolation[] = [];
+  for (const [key, list] of defs) {
+    const optOut = list.find(d => d.explicit === false);
+    if (optOut) {
+      violations.push({ key, file: optOut.file, line: optOut.line, reason: 'secret-looking name marked non-sensitive (@public / @sensitive=false)' });
+      continue;
+    }
+    const dynamic = list.find(d => d.explicit === 'dynamic');
+    if (dynamic) {
+      violations.push({ key, file: dynamic.file, line: dynamic.line, reason: '@sensitive must be a literal (bare, =true or ={...}), not an expression' });
+      continue;
+    }
+    if (list.some(d => d.explicit === true)) { continue; }
+    if (list.every(d => d.fileDefault === true)) { continue; }
+    const first = list[0];
+    violations.push({ key, file: first.file, line: first.line, reason: 'secret-looking name without @sensitive' });
+  }
+  return violations.sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line);
+}
+
+export interface SensitivityCheck {
+  ok: boolean
+  files: string[]
+  violations: SensitivityViolation[]
+}
+
+/** The sensitivity lint over the schema files `root` actually loads. */
+export function checkSchemaSensitivity(root: string): SensitivityCheck {
+  const files = schemaFilesIn(root);
+  const violations = lintSchemaSensitivity(files.map(file => ({ file, text: fs.readFileSync(path.join(root, file), 'utf8') })));
+  return { ok: violations.length === 0, files, violations };
 }
 
 // ----------------------------------------------------------------------------

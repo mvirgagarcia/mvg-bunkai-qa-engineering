@@ -4,21 +4,25 @@
   "templateCommit": "e4454b5efc107b2c13f5462d429279eb1efb0aed",
   "perComponentCommit": {
     "claude-config": "5a07dfc9a19ae042b3072a58acc4ed652ee70132",
-    "skills": "78597763963061453470eebd872be393157f2adc",
+    "skills": "869e4200e340a4cf38968aee786327fceb222d6d",
     "commands": "78597763963061453470eebd872be393157f2adc",
-    "scripts": "78597763963061453470eebd872be393157f2adc",
-    "docs": "78597763963061453470eebd872be393157f2adc",
-    "cli": "42b8949659a435e76d807cded5ec033b4205189a",
-    "vscode": "06f22a35ba95efd9ea9ccdeeb1e7cfd89685b689",
-    "husky": "42b8949659a435e76d807cded5ec033b4205189a",
-    "agents-docs": "42b8949659a435e76d807cded5ec033b4205189a",
-    "tooling": "42b8949659a435e76d807cded5ec033b4205189a",
-    "env-template": "42b8949659a435e76d807cded5ec033b4205189a",
-    "agent-compatibility": "42b8949659a435e76d807cded5ec033b4205189a",
-    "codex-config": "42b8949659a435e76d807cded5ec033b4205189a",
+    "scripts": "869e4200e340a4cf38968aee786327fceb222d6d",
+    "docs": "869e4200e340a4cf38968aee786327fceb222d6d",
+    "cli": "869e4200e340a4cf38968aee786327fceb222d6d",
+    "vscode": "869e4200e340a4cf38968aee786327fceb222d6d",
+    "husky": "869e4200e340a4cf38968aee786327fceb222d6d",
+    "agents-docs": "869e4200e340a4cf38968aee786327fceb222d6d",
+    "tooling": "869e4200e340a4cf38968aee786327fceb222d6d",
+    "env-template": "869e4200e340a4cf38968aee786327fceb222d6d",
+    "agent-compatibility": "869e4200e340a4cf38968aee786327fceb222d6d",
+    "codex-config": "869e4200e340a4cf38968aee786327fceb222d6d",
     "agent-root-config": "42b8949659a435e76d807cded5ec033b4205189a",
-    "config-core": "42b8949659a435e76d807cded5ec033b4205189a",
-    "env-schema": "42b8949659a435e76d807cded5ec033b4205189a"
+    "config-core": "869e4200e340a4cf38968aee786327fceb222d6d",
+    "env-schema": "869e4200e340a4cf38968aee786327fceb222d6d",
+    "instructions": "869e4200e340a4cf38968aee786327fceb222d6d",
+    "worktree-include": "869e4200e340a4cf38968aee786327fceb222d6d",
+    "orca-config": "869e4200e340a4cf38968aee786327fceb222d6d",
+    "playwright-cli-config": "869e4200e340a4cf38968aee786327fceb222d6d"
   },
   "syncedComponents": [],
   "ignoreFileSync": {
@@ -37,7 +41,7 @@
       ]
     },
     ".gitignore": {
-      "lastSyncedSha": "20c61b5c23a9de049fb8d8eedce5319ffd90cb12",
+      "lastSyncedSha": "d28d8f402c4ac3692dd7afe715ccddbd46b73199",
       "appendedLines": [
         ".template/claude-md.upstream.sha",
         "/.allure/",
@@ -68,14 +72,26 @@
         ".agents/skills/resend-cli/",
         ".agents/skills/skill-creator/",
         "!skills-lock.json",
-        "!**/skills-lock.json"
+        "!**/skills-lock.json",
+        ".playwright/profiles/",
+        ".playwright-cli/",
+        "storage-state-*.json",
+        "!.env.provider.schema",
+        ".context/*",
+        "!.context/README.md",
+        "!.context/project-config.md",
+        "!.context/ADR/",
+        "!.context/regression-history/",
+        "!.context/reports/",
+        "!.context/PBI/",
+        ".agents/skills/diagram-design/"
       ]
     }
   },
   "packageJsonSync": {
     "package.json": {
       "scripts": {
-        "lastSyncedSha": "41748da278949890d205b09fe137a9f79c332a6a",
+        "lastSyncedSha": "d63a1ef0460976a9514a284368674abf0e34a0db",
         "appliedKeys": [
           "vars:env:check",
           "env",
@@ -98,27 +114,36 @@
           "tests:map",
           "vars:schema",
           "vars:schema:check",
-          "worktree:provision"
+          "worktree:provision",
+          "browser:profiles",
+          "context:map",
+          "env:set",
+          "instructions:audit",
+          "instructions:check",
+          "shared:check",
+          "sync",
+          "tests:explain:render",
+          "worktree:audit"
         ]
       },
       "devDependencies": {
-        "lastSyncedSha": "41748da278949890d205b09fe137a9f79c332a6a",
+        "lastSyncedSha": "d63a1ef0460976a9514a284368674abf0e34a0db",
         "appliedKeys": [
           "allure-js-commons",
           "varlock"
         ]
       },
       "dependencies": {
-        "lastSyncedSha": "41748da278949890d205b09fe137a9f79c332a6a",
+        "lastSyncedSha": "d63a1ef0460976a9514a284368674abf0e34a0db",
         "appliedKeys": []
       },
       "lint-staged": {
-        "lastSyncedSha": "41748da278949890d205b09fe137a9f79c332a6a",
+        "lastSyncedSha": "d63a1ef0460976a9514a284368674abf0e34a0db",
         "appliedKeys": []
       }
     }
   },
   "cliVersion": "8.5",
-  "lastSyncedAt": "2026-09-29T22:38:50.033Z",
+  "lastSyncedAt": "2026-10-13T21:00:11.679Z",
   "variableSystemVersion": 1
 }

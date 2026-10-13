@@ -3,7 +3,7 @@
 > Loaded by: whoever sets up a new machine, once.
 > **None of this is versionable.** Every item below lives in the app's own settings store on THIS
 > computer. There is no repo file that carries it, no CLI command that sets it, and therefore no
-> way for `bun run up` or a fresh clone to restore it. That is the reason this file exists: so the
+> way for `bun sync` or a fresh clone to restore it. That is the reason this file exists: so the
 > list is at least written down, even though it cannot be automated.
 
 ---
@@ -38,9 +38,10 @@ orca skills install --skill orchestration --skill orca-cli --agent universal
 orca skills installed
 ```
 
-These are **optional and never required**. The stubs teach WHEN, not HOW; the grammar is served by
-the binary on demand (`orca skills get <topic>`), which is what this repo's references ask for on the DEEP topics; the stubs themselves are loaded, not fetched (AGENTS.md §5).
-Install them if you want the user-level trigger words; skip them and nothing breaks.
+These are **optional and never required**. The stubs carry the command grammar and are loaded alongside
+`orca-orchestration` (the list is `orchestration.orchestrator_skills` in `.agents/project.yaml`); the binary
+serves the DEEP topics a stub points at on demand (`orca skills get <topic>`). Skip them and nothing breaks:
+the binary still answers for the grammar.
 
 Note `orca skills install --local` installs into the current project instead of globally. In THIS
 repo, do not use `--local`: a stub landing inside the project skill store would show up as an
@@ -49,13 +50,14 @@ untracked skill directory and collide with the repo's own tier model. Global (th
 
 ---
 
-## 3 · The two native-launch prerequisites
+## 3 · The native-launch prerequisites
 
-These two items decide whether **supervision** is available on this machine at all, so they are not
-optional extras. The native launch (`worker-start --agent <agent> --model <id> --effort <level>`) is
+Item 3.1 decides whether **supervision** is available on this machine at all, so it is not an
+optional extra; item 3.2 decides whether a supervised worker has its credentials, and needs nothing
+per machine. The native launch (`worker-start --agent <agent> --model <id> --effort <level>`) is
 the ONLY supervised one: the runtime recognizes only agents it started itself, so a terminal created
 from our own command line can never be adopted (`references/gotchas.md` G44). A machine that has not
-done both items below can still run a fleet, but every worker on it is unsupervised.
+done item 3.1 can still run a fleet, but every worker on it is unsupervised.
 
 ### 3.1 · The agent's default arguments (permission mode)
 
@@ -86,70 +88,69 @@ Until that override exists on a machine, a native worker launches in whatever mo
 per-agent default gives it, which is the trap gotcha G27 describes. Neither the repo nor a teammate's
 machine can tell whether you did it, which is the whole problem with a non-versionable setting.
 
-### 3.2 · Credentials for a supervised worker: the harness surfaces, and direnv only for Codex
+### 3.2 · Credentials for a supervised worker: the `.env` loader
 
-A launch line can export variables; the native launch cannot, because it has no argv. That used to
-make direnv the only seam. It no longer is: `bun run harness:env` derives from `.env` a per-harness
-credential surface that a worker reads with NO shell involved.
+A launch line can export variables; the native launch cannot, because it has no argv. So no MCP
+server depends on the launch: every one that needs `.env` values starts through the `.env` loader
+declared in `.mcp.json`, `opencode.jsonc` and `.codex/config.toml` (`varlock run ... --filter <its
+vars> -- <server>`, ADR-0011), which reads the varlock schema plus `.env` / `.env.local` from the
+worktree root when the harness spawns the server. NO shell is involved, for Claude Code, OpenCode
+and Codex workers alike. Nothing here is set per machine: what this item needs is the worktree's own
+`.env`, which provisioning copies.
 
-- **Claude Code workers** read the `env` block of `.claude/settings.local.json`. On macOS/Linux the
-  file is resolved from the MAIN checkout's root, so every worktree inherits it with no action
-  (measured, G45 and ADR-0006: a session launched inside a worktree gave its MCP child the main
-  checkout's value; the worktree's own copy was ignored. Re-verify after a harness upgrade).
-- **OpenCode workers** read `.auth/opencode/<VAR>` through `{file:}` references in `opencode.jsonc`,
-  relative to the worktree. `bun run worktree:provision` copies `.auth/` from the primary (mode
-  `0600`), and `bun install` creates empty placeholders on a fresh clone so the config still loads.
-- **Codex workers** are the only ones still on the shell: `.codex/config.toml` NAMES variables and
-  reads them from the process environment at connect time. So does anything inside a worker that
-  reads a shell-exported variable (`acli`, `curl`, `bun xray`). For those, direnv in Orca's
-  **interactive shell** is the seam: with it installed and hooked, an `.envrc` that sources the repo's
-  env file fires when the worker's terminal opens. Measured (G45): a direct probe showed
-  `direnv: export +ATLASSIAN_API_TOKEN +ATLASSIAN_EMAIL …` and then the probe variable reading `SET`.
-
-Without direnv, a Codex worker (or a shell-exported CLI inside any worker) has NO credentials **and
-nothing reports it**. It fails much later, at its first authenticated call, with an error that reads
-like a broken tool (gotcha G45).
+- **What the worker needs is its own `.env`.** `bun run worktree:provision` copies it from the
+  primary. A worktree without one hands every server empty values, and the hook says so on the
+  first prompt.
+- **The plaintext copies an older `bun run harness:env` generated** (the `env` block of
+  `.claude/settings.local.json`, `.auth/opencode/<VAR>`) are retired by the current one.
+  `bun run worktree:provision` copies `.auth/opencode/` only while the worktree's `opencode.jsonc`
+  still has `{file:}` references, and never copies `.auth/harness-env-backup/`.
+- **Every other process a worker runs loads its own config too; no secret is ever exported into
+  the worker's shell.** Bun scripts (`bun run jira:*`, `bun run api:login`, `bun xray`, the acli
+  helper scripts) read `.env` through Bun's autoload; `acli` uses its own stored auth and `gh` its
+  keyring; a raw `curl` that needs `ATLASSIAN_EMAIL` / `ATLASSIAN_API_TOKEN` runs inside
+  `bunx varlock run --filter ATLASSIAN_EMAIL,ATLASSIAN_API_TOKEN -- sh -c '...'`; an app-API `curl`
+  runs `source .auth/tokens.env` in the same command. Secret-manager mode: Bun's autoload does not
+  resolve 1Password references, so such a script runs through `bunx varlock run -- <cmd>`.
 
 ```bash
-bun run harness:env                              # after every .env change; then restart the agent session
-command -v direnv                                # Codex workers / shell-exported vars only: installed AND hooked
-cat .envrc                                       # must source the repo's env file; never commit secrets here
-direnv allow                                     # once per checkout, per machine
+# after every .env change: restart the agent session (MCP servers read .env at spawn)
+test -f .env && echo present || echo MISSING     # in the worker's worktree: presence only, never the content
+# Claude Code: /mcp lists every server connected; the other harnesses: their own server listing
 ```
 
-`bun run worktree:provision` runs `direnv allow <worktree>` for you, but only when direnv is
-installed AND the primary checkout's `.envrc` is already allowed, and it prints what it did (or why it
-skipped). It never approves an `.envrc` on a machine that never approved the primary.
-
-Two rules that follow from this being per-machine and invisible:
+Two rules that follow:
 
 - The conductor **verifies credentials on the worker's screen** before sending it any work
-  (`references/coordinator-playbook.md` §1 step 5), whichever surface they came from. Readiness is
-  not capability.
-- `.envrc` is a per-machine convenience, not a repo contract. Nothing in this repo may depend on it
-  existing: the custom-argv line loads the env file through the repo's own wrapper instead, and that
-  is why the human-paste path needs none of this.
+  (`references/coordinator-playbook.md` §1 step 5), whichever harness it runs: its MCP servers
+  connected and its worktree holding `.env`. Readiness is not capability.
+- Nothing in this repo may depend on a secret exported into a shell: the custom-argv line starts the
+  harness binary bare, exactly like the native launch, so the human-paste path relies on the same
+  loaders listed above and needs the same worktree `.env`.
 
 ---
 
-## 4 · The setup hook → the provisioning script
+## 4 · The setup and archive hooks → the committed `orca.yaml`
+
+The repo commits `orca.yaml`: `scripts.setup` runs `bun run worktree:provision` in every new worktree
+and `scripts.archive` runs `bun run worktree:audit --rescue` before one is removed
+(`references/provisioning.md` §3). Nothing is set per machine, but three per-machine things decide
+whether it runs, so read them once:
 
 ```bash
 orca repo list --json </dev/null
-orca repo show --repo <selector> --json </dev/null     # read the CURRENT setup command + policy
+orca repo show --repo <selector> --json </dev/null     # registered hooks + source policy
 ```
 
-Read the registered setup command (`orca repo show`, above): if it only installs dependencies, it
-covers one row of the gap table in `references/provisioning.md` §1. Point it at
-`bun run worktree:provision` instead and every repairable row closes automatically:
+- The source policy in the repository's Hooks settings must not be local-only, or `orca.yaml` is
+  ignored. A local script set before `orca.yaml` existed (often `bun install`) is redundant now.
+- Approve the trust prompt the first time each hook runs; it asks again when the script changes.
+- Keep the setup policy at run-by-default, so a new worktree provisions itself before the agent
+  starts.
 
-- In the app: the repository's settings → the setup script field → `bun run worktree:provision`.
-- Keep the setup policy at run-by-default, so a newly created worktree provisions itself before the
-  agent starts.
-
-**This setting is UI-only** (gotcha G24): the CLI does not expose it, the machine-readable command
-schema has no command for it, and desktop automation is blocked by the OS permission model on
-macOS. It cannot be scripted and it cannot be versioned.
+A machine where the committed hooks cannot run falls back to setting the setup script field in the
+app to `bun run worktree:provision` (UI only, gotcha G24) and running the audit by hand before every
+removal.
 
 ---
 
@@ -172,11 +173,10 @@ find out during a real fleet, and record it in `references/gotchas.md`.
 [ ] Settings -> Agents: `claude` default args include `--permission-mode auto`
     (prerequisite of the SUPERVISED native launch; a pasted custom-argv line needs nothing)
 [ ] other agents: their documented equivalent, verified, not guessed
-[ ] `bun run harness:env` run after the last `.env` change (Claude and OpenCode workers read the
-    generated surfaces; no direnv needed for them)
-[ ] direnv installed, hooked into the shell, `.envrc` sources the env file, `direnv allow` run
-    (Codex workers and shell-exported CLI vars only; verify on the worker's screen at launch)
-[ ] repo setup script set to `bun run worktree:provision`, policy run-by-default
+[ ] the worktree has its own `.env` and the session restarted after the last `.env` change (every
+    MCP server reads it through the `.env` loader; verify its servers connected on the worker's
+    screen at launch)
+[ ] `orca.yaml` hooks honoured: source policy not local-only, trust approved, setup run-by-default
 [ ] (optional) phone paired
 [ ] a single test worker launched and released end to end BEFORE a real fleet
 ```

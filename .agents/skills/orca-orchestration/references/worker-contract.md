@@ -11,7 +11,7 @@
 
 ---
 
-## The fourteen rules
+## The fifteen rules
 
 1. **One task: the one in the brief.** Do not widen the scope. Do not create other workers. If you
    find something that changes the scope, STOP and report it — a scope correction is the conductor's
@@ -47,7 +47,9 @@
    terminal — the conductor owns that.
 
 7. **Write the long report BEFORE `worker_done`**, to the path the brief gives you
-   (`.session/orchestration/<slug>/reports/<label>.md`, or the scope the workflow skill declares).
+   (`<ABS>/.session/orchestration/<slug>/reports/<label>.md` in the PRIMARY checkout, or the scope
+   the workflow skill declares, always by absolute path: a report written inside your worktree dies
+   with it).
    Sections: `## Summary`, `## Files changed`, `## Commits` (sha + subject), `## Decisions taken`
    (and why), `## Verification` (commands + exit codes), `## Left open`. The message body is a
    summary; the file is the record.
@@ -151,6 +153,10 @@ breaks the resume path.
   Orphaned headless browsers once ran for hours before the owner noticed (G37).
 - One dev server and one browser per worktree. Splitting ports is NOT enough when two processes share
   a build directory in the same checkout.
+- Browser sessions are named and in memory; an owner's persistent profile is single-writer across
+  every worktree and repo on the machine, so check `playwright-cli list --all` before opening one and
+  never `kill-all` (it kills every session on the machine, G73). Canon:
+  `agentic-qa-core/references/browser-sessions.md`.
 - Check free disk before a long round. With a full disk, **writing the output fails, not the
   command**: the worker goes mute because the message command is also a shell process, while file
   writes keep working.
@@ -193,3 +199,11 @@ has a known failure mode:
 - [ ] The report path and the report protocol.
 - [ ] Your session label, and the rename instruction if your harness needs one.
 - [ ] The trailer reminder.
+
+15. **Resolve your `ROUTE:` lines before the brief.** Your first prompt arrives with the hook's
+    `ROUTE: read <file>` lines (`AGENTS.md` LOAD PROTOCOL): read each one first, then COMMON and your
+    brief. They are few on purpose: the hook routes on the prompt's `ROUTE-SCOPE:` sentence or, without
+    one, on the task block only, never on the injected preamble, and caps the binding lines; anything
+    else it matched sits on one `ROUTE-OPTIONAL:` line you read only if the work needs it. Before the
+    cap, worker prompts fired most sections at once and workers read almost none of them, so the
+    brief ran without the sections it depended on (measurements in ADR-0017).

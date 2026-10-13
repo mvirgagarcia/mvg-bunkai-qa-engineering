@@ -42,7 +42,7 @@ The Refinement subagent's job is to produce a high-signal artifact for PO + Dev 
 | Story (title, description, ACs, priority, labels, sprint, parent epic, comments) | `bun run jira:sync-issues get {STORY_KEY} --include-comments`, then read the synced `.md` (NEVER `acli view` — returns `null` for custom fields) |
 | Team Discussion | Synced `comments.md` — same extraction rules as `session-entry-points.md` §Step 1b |
 | Parent epic (if any) | `bun run jira:sync-issues get {EPIC_KEY}`, then read the synced epic `.md` — description + risk callouts only |
-| Project-wide context | `.context/business/business-data-map.md`, `.context/business/business-feature-map.md`, `.context/business/business-api-map.md`, `.context/master-test-plan.md` |
+| Project-wide context | the business context skills (`bun run context:map business-data-context` / `business-e2e-context` / `business-api-context`), `.context/PBI/qa-artifacts/master-test-plan.md` |
 | Module context (if it exists) | `.context/PBI/epics/EPIC-<EPIC_KEY>-<slug>/module-context.md` (module = Epic, 1:1) |
 | Code (light read) | `{{BACKEND_REPO}}/{{BACKEND_ENTRY}}` + `{{FRONTEND_REPO}}/{{FRONTEND_ENTRY}}` — read enough to confirm feasibility, NOT to reproduce |
 | Common gap catalog | `refinement-questions.md` (this skill) |
@@ -226,7 +226,7 @@ The orchestrator presents the per-Story summary to the user, waits for OK, then 
 - **No Jira mutations.** All updates land in Phase 3.
 - **No test execution.** No smoke, no DB queries, no API calls. Refinement is doc-only.
 - **No parametrization tables, no test-data JSON, no Faker recipes.** Deferred to in-sprint planning.
-- **No TC creation.** TCs are formalized in Stage 4 (`/test-documentation`).
+- **No TC creation.** `/sprint-testing` Stage 1 (Modality jira-xray) or Stage 4 `/test-documentation` (Modality jira-native) creates them, per `sprint-testing/SKILL.md` §"TC creation timing".
 - **No git operations.** No branch, no commit.
 - **No new ATP / ATR Jira issues.** Phase 3 publishes the ATP to the `{{jira.acceptance_test_plan}}` field only — nobody in this skill creates TMS items. The Test Plan issue is created later by `/sprint-testing` Stage 1 from the field content.
 - **No subtask mutations.** The `[QA] Shift-Left Review` tracking subtask is owned by the orchestrator (Phase 1: find-or-create → `{{jira.status.subtask.active}}`; Phase 3: annotations + `{{jira.status.subtask.close}}`) — the Refinement subagent never touches it.

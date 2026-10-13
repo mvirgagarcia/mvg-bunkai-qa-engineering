@@ -252,8 +252,10 @@ components          ->  PRODUCT module/epic  ("what part of the product it affec
 | **Defect epic** | every **bug/defect/improvement** | `qa.qa_epics.defect_epic.name` — **"QA Defect Management"** |
 
 - The **Master Test Plan epic has a special role**: it is an **Epic** (not a Test
-  Plan work type), is the **parent of all Test Plans** (FTP/STP/ATP/RTP), mirrors
-  `.context/master-test-plan.md` + points to the official QA team repository, and is
+  Plan work type), is the **parent of all Test Plans** (FTP/STP/ATP/RTP), carries
+  the Master Test Plan itself in its description (source of truth; cached by the
+  sync at `.context/PBI/qa-artifacts/master-test-plan.md`) + points to the official
+  QA team repository, and is
   cross-linked (`relates to`) to its three sibling QA epics (Test Repository, Test
   Artifacts, Defect Management) — so the four form a navigable QA-governance cluster.
 - **Test Sets split by altitude.** The per-Story **ATS** (Acceptance Test Set,
@@ -323,9 +325,12 @@ the relevant process epic by the configured name:
 
 Filling the report richly is not optional polish — these fields *are* the
 defect-management metrics (JQL filters, dashboards, escape/containment rates).
-A report that skips them is incomplete. The table is the doctrine per slug;
-the authoritative matrix an instance enforces is `required:` per work type in
-`.agents/jira-required.yaml`, so when the two disagree, fix the yaml, never the table.
+A report that skips them is incomplete. This table is the per-work-type
+obligation, and the only place it is stated. `.agents/jira-required.yaml`
+`required:` is a different thing: one catalog of which fields must exist on the
+instance and what each falls back to when absent. A field this table requires
+that the instance lacks follows its `fallback:` there; it never stops being
+required here.
 
 | Field | Slug / native | Required | Source |
 |---|---|---|---|

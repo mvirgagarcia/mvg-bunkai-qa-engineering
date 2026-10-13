@@ -72,7 +72,7 @@
         Context engineering es el trabajo de decidir qué entra en esa ventana en cada paso. El
         prompting se ocupa de cómo redactar una instrucción (lo cubre
         <a href="prompting.html">Prompting</a>). Aquí la pregunta es otra: de todo lo que el agente
-        podría leer, ¿qué necesita ahora, qué puede esperar y qué debería vivir en disco?
+        podría leer, qué necesita ahora, qué puede esperar y qué debería vivir en disco?
       </p>
 
       <h2 id="tres-zonas">Tres zonas: siempre, bajo demanda, fuera</h2>
@@ -92,9 +92,10 @@
             <title id="zonas-title">La ventana de contexto como presupuesto</title>
             <desc id="zonas-desc">
               Tres zonas. Dentro de la ventana, una franja pequeña siempre cargada con AGENTS.md y
-              las descripciones de skills, y una franja bajo demanda con compact rules, SKILL.md y
-              references. Fuera de la ventana, la caché .context, la memoria Engram y los archivos
-              de sesión y handoffs, que entran solo cuando un paso los pide.
+              las descripciones de skills, y una franja bajo demanda con las secciones que nombra el
+              router, compact rules, SKILL.md y references. Fuera de la ventana, la caché .context,
+              la memoria Engram y los archivos de sesión y handoffs, que entran solo cuando un paso
+              los pide.
             </desc>
             <defs>
               <marker
@@ -134,7 +135,7 @@
               Siempre cargado
             </text>
             <text x="50" y="88" font-size="12" fill="currentColor">
-              AGENTS.md (reglas y mapa de carga)
+              AGENTS.md (reglas, conducta y router)
             </text>
             <text x="50" y="106" font-size="12" fill="currentColor">
               name + description de cada skill
@@ -152,10 +153,10 @@
               Bajo demanda (según la tarea)
             </text>
             <text x="50" y="178" font-size="12" style="fill: var(--text-2)">
-              compact rules del REGISTRY en el briefing
+              secciones de .agents/instructions/ (router)
             </text>
             <text x="50" y="198" font-size="12" style="fill: var(--text-2)">
-              SKILL.md de la skill que se activó
+              compact rules o SKILL.md de la skill activa
             </text>
             <text x="50" y="218" font-size="12" style="fill: var(--text-2)">
               una reference concreta de esa skill
@@ -192,7 +193,7 @@
               .context/
             </text>
             <text x="518" y="94" font-size="11" style="fill: var(--text-2)">
-              caché de Jira y mapas
+              caché de Jira (PBI)
             </text>
             <rect
               x="506"
@@ -275,10 +276,10 @@
         Las <strong>compact rules</strong> son un escalón intermedio pensado para subagentes. Cuando
         el agente principal delega una tarea, podría pedirle al subagente que lea tres
         <code>SKILL.md</code> enteros. En cambio, le pega en el briefing un bloque acotado de reglas
-        por skill (DO, DO NOT, WHEN; los límites los fija
-        <code>scripts/build-skill-registry.ts</code>) y una línea que dice cuándo hace falta leer el
-        archivo completo. El subagente trabaja con un resumen verificado y el costo por encargo baja
-        mucho cuando varias skills se solapan.
+        por skill (DO, DO NOT, WHEN; un bloque escrito a mano va entero, y solo el raspado
+        automático de <code>scripts/build-skill-registry.ts</code> tiene tope) y una línea que dice
+        cuándo hace falta leer el archivo completo. El subagente trabaja con un resumen verificado y
+        el costo por encargo baja mucho cuando varias skills se solapan.
       </p>
 
       <svg
@@ -485,9 +486,12 @@
               <td><code>AGENTS.md</code></td>
               <td>
                 Se carga en cada sesión (Claude Code lo lee a través de <code>CLAUDE.md</code>, que
-                solo importa <code>@AGENTS.md</code>). Su propia cabecera manda el detalle a las
-                <code>references/</code> de cada skill, y la sección 4 es una tabla de tarea → skill
-                → contexto que se lee antes de responder.
+                solo importa <code>@AGENTS.md</code>). Guarda solo lo que ata en cada turno: la
+                frase obligatoria de cada regla, la capa de conducta, el núcleo de orquestación y un
+                router. El resto vive en una sección por tema bajo
+                <code>.agents/instructions/</code>, que se lee cuando el router o una línea
+                <code>ROUTE:</code> del hook la nombra; la tabla de tarea → skill → contexto es
+                <code>agent-context-map.md</code>.
               </td>
             </tr>
             <tr>
@@ -498,12 +502,12 @@
               </td>
               <td>
                 <code>scripts/build-skill-registry.ts</code> genera un bloque por skill. Strategy A
-                toma la sección <code>## Compact Rules</code> del <code>SKILL.md</code> tal cual
-                (hasta el límite <code>MAX_RULES</code>); Strategy B raspa las primeras viñetas y
-                marca el bloque como de baja confianza. Si el frontmatter trae
-                <code>compact_rules:</code>, se usa literal. El briefing pega un número acotado de
-                skills; el límite lo fija el protocolo del resolver
-                (<code>agentic-qa-core/references/skill-resolver.md</code>).
+                toma la sección <code>## Compact Rules</code> del <code>SKILL.md</code> tal cual,
+                sin tope; Strategy B raspa las primeras viñetas (ahí sí hay un tope,
+                <code>MAX_SCRAPED_RULES</code>) y marca el bloque como de baja confianza. Si el
+                frontmatter trae <code>compact_rules:</code>, también se usa literal y sin tope. El
+                briefing pega un número acotado de skills; el límite lo fija el protocolo del
+                resolver (<code>agentic-qa-core/references/skill-resolver.md</code>).
               </td>
             </tr>
             <tr>
@@ -511,9 +515,25 @@
               <td><code>.agents/skills/project-context/SKILL.md</code></td>
               <td>
                 Cada ejecución resuelve un solo modo y carga solo la reference de ese modo. El modo
-                <code>context-skill</code> crea una skill de criterio sobre un mapa de
-                <code>.context/</code>: cita las rutas y nunca copia su contenido
+                <code>context-skill</code> crea una skill de criterio propia del proyecto, solo para
+                un aspecto que las context skills de mapas no cubren: cita sus fuentes y nunca copia
+                su contenido
                 (<code>.agents/skills/project-context/references/context-skill.md</code>).
+              </td>
+            </tr>
+            <tr>
+              <td>Lo sintetizado vive en una skill</td>
+              <td>
+                <code>cli/lib/context-maps.ts</code> (<code>CONTEXT_MAP_SKILLS</code>),
+                <code>scripts/context-map.ts</code>
+              </td>
+              <td>
+                Lo que un script baja de una fuente (la caché de Jira) va a <code>.context/</code>;
+                lo que una IA sintetiza (los mapas de datos, API, E2E, dominio e infraestructura) es
+                un HTML dentro de su context skill. Tú lo abres en el navegador; el agente lo lee
+                con <code>bun run context:map &lt;slug&gt;</code>, que quita SVG y estilos y deja
+                cada sección como texto (<code>--section &lt;id&gt;</code> trae una sola,
+                <code>--list</code> el índice). Así el agente carga una sección y no el mapa entero.
               </td>
             </tr>
             <tr>
@@ -562,9 +582,10 @@
                 <code>.agents/skills/session-handoff/references/capture-contract.md</code>
               </td>
               <td>
-                Escribe <code>.session/handoffs/&lt;session-name&gt;-handoff-NN.md</code> y lanza la
-                sucesora en el mismo worktree y el mismo harness. Lo dispara la persona cuando ve
-                que la ventana se llena.
+                Escribe <code>.session/handoffs/&lt;session-name&gt;-handoff-NN.md</code> en el
+                checkout principal (también desde un worktree, para que no se pierda al borrarlo) y
+                lanza la sucesora en el mismo worktree y el mismo harness. Lo dispara la persona
+                cuando ve que la ventana se llena.
               </td>
             </tr>
             <tr>
@@ -582,11 +603,11 @@
       </div>
       <p>
         El resultado práctico: una sesión de QA arranca con <code>AGENTS.md</code> y las
-        descripciones de skills, carga <code>/sprint-testing</code> cuando le piden probar un
-        ticket, sincroniza ese ticket a <code>.context/PBI/</code> y lee solo los archivos de esa
-        historia. Si delega, el subagente recibe compact rules en lugar de skills completas. Para
-        ver el ciclo entero en contexto, revisa
-        <a href="../metodologia/este-repo.html">el IQL en este repo</a>.
+        descripciones de skills, lee las secciones que el router le nombra, carga
+        <code>/sprint-testing</code> cuando le piden probar un ticket, sincroniza ese ticket a
+        <code>.context/PBI/</code> y lee solo los archivos de esa historia. Si delega, el subagente
+        recibe compact rules en lugar de skills completas. Para ver el ciclo entero en contexto,
+        revisa <a href="../metodologia/este-repo.html">el IQL en este repo</a>.
       </p>
 
       <div class="callout warn" id="errores">
@@ -609,8 +630,9 @@
             el paso se degrada sin avisar.
           </li>
           <li>
-            Copiar en una skill la tabla de un mapa de <code>.context/</code>. Quedan dos fuentes y
-            una va a envejecer.
+            Copiar en otra skill la tabla de un mapa de contexto. El mapa vive en su context skill y
+            se lee con <code>bun run context:map</code>; con una copia quedan dos fuentes y una va a
+            envejecer.
           </li>
           <li>
             Confiar en la compaction para una tarea de horas. Escribe plan y progreso en disco, o
@@ -659,7 +681,9 @@
 
       <footer class="doc-footer">
         <p>
-          Fuentes en el repo: <code>AGENTS.md</code> (secciones 3, 4, 9 y 12),
+          Fuentes en el repo: <code>AGENTS.md</code> (secciones 3 y 12),
+          <code>.agents/instructions/agent-context-map.md</code> (sección 4),
+          <code>.agents/instructions/agent-local-context-pbi.md</code> (sección 9),
           <code>.agents/skills/agentic-qa-core/references/skill-resolver.md</code>,
           <code>.agents/skills/agentic-qa-core/references/session-management.md</code>. Páginas
           relacionadas: <a href="prompting.html">Prompting</a>,

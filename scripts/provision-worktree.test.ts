@@ -12,10 +12,9 @@
  *   5. Every `{file:}` target the committed opencode.jsonc names EXISTS in the
  *      worktree afterwards, empty when the primary's .auth/ had no value for
  *      it (a missing target invalidates OpenCode's whole config).
- *   6. With no direnv on PATH the direnv step prints its skip line and the
- *      script still exits 0. The ALLOW path (direnv installed AND the primary's
- *      .envrc approved) is not unit-testable: it needs a real direnv and a
- *      real approval by the machine's owner, which a test must never grant.
+ *   6. The script never runs direnv, even with one on PATH: each process
+ *      loads `.env` itself, so a worktree needs its `.env` copy and nothing
+ *      approved in the shell.
  *
  * The fixture's package.json declares a trivial `agents:compat` script (`bun
  * -e "process.exit(0)"`) so the test never depends on this repo's real
@@ -24,11 +23,13 @@
  * test here, not that script's own behaviour.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { platform, tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 
 import { afterEach, describe, expect, test } from 'bun:test';
+
+import { PROVISION_COPIES, worktreeIncludeLine } from '../cli/lib/worktree.ts';
 
 const SCRIPT = resolve(import.meta.dir, 'provision-worktree.ts');
 const IS_WINDOWS = platform() === 'win32';
@@ -76,6 +77,7 @@ function fixture(): { primary: string, worktree: string } {
     '.auth/',
     '.session/',
     '.agents/skills/community-skill/',
+    'api/openapi.json',
     '',
   ].join('\n'));
   // A committed OpenCode config pointing at a value file nothing has written:
@@ -103,9 +105,13 @@ function fixture(): { primary: string, worktree: string } {
 
   // Gitignored state present in the primary, never committed.
   writeFileSync(join(primary, '.env'), 'LOCAL_USER_EMAIL=test@example.com\n');
+  mkdirSync(join(primary, 'api'), { recursive: true });
+  writeFileSync(join(primary, '.env.local'), 'LOCAL_USER_PASSWORD=override\n');
+  writeFileSync(join(primary, 'api', '.openapi-config.json'), '{}\n');
   mkdirSync(join(primary, '.auth', 'opencode'), { recursive: true });
   writeFileSync(join(primary, '.auth', 'tokens.env'), 'export API_TOKEN_USER_LOCAL=\'x\'\n');
   writeFileSync(join(primary, '.auth', 'opencode', 'TAVILY_API_KEY'), 'tk-literal');
+  writeFileSync(join(primary, 'api', 'openapi.json'), '{"openapi":"3.0.0"}\n');
   mkdirSync(join(primary, '.session'), { recursive: true });
   writeFileSync(join(primary, '.session', 'probe.md'), 'must never be copied\n');
   mkdirSync(join(primary, '.agents', 'skills', 'community-skill'), { recursive: true });
@@ -123,20 +129,16 @@ function run(cwdArgs: string[], env: Record<string, string> = {}): { code: numbe
 }
 
 /**
- * A PATH with no `direnv` on it, but with `bun` and `git` still reachable: every
- * PATH segment that holds a direnv executable is dropped, and a temp bin dir of
- * symlinks to the real `bun` and `git` is prepended so the script's own
- * subprocesses keep working when they lived in a dropped segment.
+ * A PATH whose first segment holds a fake `direnv` that records every call in
+ * `marker`. The rest of PATH is untouched, so `bun` and `git` resolve as usual.
  */
-function pathWithoutDirenv(): string {
+function pathWithRecordingDirenv(marker: string): string {
   const bin = mkdtempSync(join(tmpdir(), 'provision-worktree-bin-'));
   temporaryRoots.push(bin);
-  for (const tool of ['bun', 'git']) {
-    const real = Bun.which(tool);
-    if (real) { symlinkSync(real, join(bin, tool)); }
-  }
-  const kept = (process.env.PATH ?? '').split(delimiter).filter(seg => seg !== '' && !existsSync(join(seg, 'direnv')));
-  return [bin, ...kept].join(delimiter);
+  const fake = join(bin, 'direnv');
+  writeFileSync(fake, `#!/bin/sh\necho "$@" >> '${marker}'\n`);
+  chmodSync(fake, 0o755);
+  return [bin, process.env.PATH ?? ''].join(delimiter);
 }
 
 describe('provision-worktree', () => {
@@ -167,6 +169,9 @@ describe('provision-worktree', () => {
 
     expect(existsSync(join(worktree, '.agents', 'skills', 'community-skill', 'SKILL.md'))).toBe(true);
 
+    // The synced spec the OpenAPI MCP reads at start.
+    expect(readFileSync(join(worktree, 'api', 'openapi.json'), 'utf8')).toContain('openapi');
+
     // .session/ exists in the primary but must NEVER be copied.
     expect(existsSync(join(worktree, '.session'))).toBe(false);
   });
@@ -183,13 +188,38 @@ describe('provision-worktree', () => {
     expect(result.out).toContain('OpenCode placeholders: 1 created empty (DBHUB_HOST)');
   });
 
-  test('with no direnv on PATH the direnv step is skipped, says so, and the run still succeeds', () => {
-    if (IS_WINDOWS) { return; } // the PATH fixture uses symlinks; documented, not measured on Windows.
-    const { worktree } = fixture();
-    const result = run([worktree], { PATH: pathWithoutDirenv() });
+  test('never copies the retired MCP credential copies into a worktree whose opencode.jsonc is on the .env loader', () => {
+    const { primary, worktree } = fixture();
+    mkdirSync(join(primary, '.auth', 'harness-env-backup'), { recursive: true });
+    writeFileSync(join(primary, '.auth', 'harness-env-backup', 'OLD_TOKEN'), 'old-literal');
+    // The worktree's own (tracked) config no longer points at .auth/opencode/.
+    writeFileSync(join(worktree, 'opencode.jsonc'), '{ "mcp": {} }\n');
+    const result = run([worktree]);
     expect(result.code).toBe(0);
-    expect(result.out).toContain('direnv: skipped (not installed)');
-    expect(result.out).not.toContain('direnv: allowed');
+    expect(existsSync(join(worktree, '.auth', 'tokens.env'))).toBe(true);
+    expect(existsSync(join(worktree, '.auth', 'opencode'))).toBe(false);
+    expect(existsSync(join(worktree, '.auth', 'harness-env-backup'))).toBe(false);
+  });
+
+  test('a legacy {file:} config still gets .auth/opencode/, but never the retirement backup', () => {
+    const { primary, worktree } = fixture();
+    mkdirSync(join(primary, '.auth', 'harness-env-backup'), { recursive: true });
+    writeFileSync(join(primary, '.auth', 'harness-env-backup', 'OLD_TOKEN'), 'old-literal');
+    const result = run([worktree]);
+    expect(result.code).toBe(0);
+    expect(readFileSync(join(worktree, '.auth', 'opencode', 'TAVILY_API_KEY'), 'utf8')).toBe('tk-literal');
+    expect(existsSync(join(worktree, '.auth', 'harness-env-backup'))).toBe(false);
+  });
+
+  test('never runs direnv, even with one on PATH; the .env copy is all a worktree needs', () => {
+    if (IS_WINDOWS) { return; } // the fake binary is a POSIX shell script; documented, not measured on Windows.
+    const { worktree } = fixture();
+    const marker = join(worktree, '..', 'direnv-calls.log');
+    const result = run([worktree], { PATH: pathWithRecordingDirenv(marker) });
+    expect(result.code).toBe(0);
+    expect(readFileSync(join(worktree, '.env'), 'utf8')).toBe('LOCAL_USER_EMAIL=test@example.com\n');
+    expect(existsSync(marker)).toBe(false);
+    expect(result.out).not.toContain('direnv');
   });
 
   test('copied secrets are mode 0600 (files) / 0700 (dirs) on POSIX', () => {
@@ -204,6 +234,26 @@ describe('provision-worktree', () => {
     expect(authDirMode).toBe(0o700);
     const tokenMode = statSync(join(worktree, '.auth', 'tokens.env')).mode & 0o777;
     expect(tokenMode).toBe(0o600);
+  });
+
+  test('local overrides and the OpenAPI config travel too; absent optional inputs are info, not warnings', () => {
+    const { worktree } = fixture();
+    const result = run([worktree]);
+    expect(result.code).toBe(0);
+    expect(readFileSync(join(worktree, '.env.local'), 'utf8')).toBe('LOCAL_USER_PASSWORD=override\n');
+    expect(existsSync(join(worktree, 'api', '.openapi-config.json'))).toBe(true);
+    if (!IS_WINDOWS) { expect(statSync(join(worktree, '.env.local')).mode & 0o777).toBe(0o600); }
+    expect(result.out).toContain('Skipping .mcp.local.json (not present in primary checkout)');
+  });
+
+  test('.worktreeinclude names every path the provisioner copies', () => {
+    const lines = readFileSync(resolve(import.meta.dir, '..', '.worktreeinclude'), 'utf8')
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line !== '' && !line.startsWith('#'));
+    for (const entry of PROVISION_COPIES) {
+      expect(lines).toContain(worktreeIncludeLine(entry));
+    }
   });
 
   test('--dry-run reports intent without writing anything', () => {

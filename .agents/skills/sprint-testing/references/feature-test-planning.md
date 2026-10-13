@@ -39,9 +39,9 @@ Read before starting. All paths relative to repo root.
 |-------|--------|
 | Epic / feature ticket (detail) | `bun run jira:sync-issues get <EPIC-KEY> --include-comments` then read the synced `epic.md` / custom-field files |
 | Child story list | `bun run jira:sync-issues jql "parent = <EPIC-KEY>"` (or `[ISSUE_TRACKER_TOOL]` search for a trivial key/summary list only) |
-| Business context | `.context/business/business-data-map.md` + `.context/master-test-plan.md` |
-| API context | `.context/business/business-api-map.md` (business angle) + `api/schemas/` (generated types from `bun run api:sync`) |
-| Architecture + SRS (if present) | `.context/SRS/architecture.md`, `.context/SRS/functional-specs.md`, `.context/SRS/non-functional-specs.md` (API contract comes from `api/openapi-types.ts` and `.context/business/business-api-map.md`, not from SRS) |
+| Business context | `bun run context:map business-data-context` + `bun run context:map business-e2e-context` (journeys) + `.context/PBI/qa-artifacts/master-test-plan.md` |
+| API context | `bun run context:map business-api-context` (business angle) + `api/schemas/` (generated types from `bun run api:sync`) |
+| Architecture + NFRs (if generated) | `bun run context:map infra-context --section architecture` and the `nfr-*` sections (`--list` shows them); functional specs live in the `business-e2e-context` `feature-*` sections. API contract comes from `api/openapi-types.ts` and the `business-api-context` map |
 | Prior epic discussions | Synced `comments.md` from the epic (Team Discussion extraction — see `session-entry-points.md`) |
 
 If project-wide context files are missing, stop and hand off to `project-discovery`. Do not proceed on partial context.
@@ -95,20 +95,20 @@ The output document has seven sections. AI fills each one by reading the specifi
 
 ### 1. Business Context
 
-From `business-data-map.md` + `.context/business/business-model.md` + `.context/PRD/*` (if present) extract:
+From the data map (`business-data-context`) + the domain map (`bun run context:map business-domain-context --section business-model`) + the personas and journeys in `business-e2e-context` (`persona-*`, `journey-*`) extract:
 
 - Primary user personas affected
 - Business value proposition and success metrics (KPIs the feature influences)
 - Critical user journeys the feature enables or modifies
 
-Keep to 5-10 bullets. The goal is to anchor risk analysis, not reproduce the PRD.
+Keep to 5-10 bullets. The goal is to anchor risk analysis, not reproduce the business context.
 
 ### 2. Technical Architecture
 
-From `business-api-map.md` + `SRS/*` + `api/schemas/` + backend/frontend code exploration:
+From the API map (`business-api-context`) + the infra map (`infra-context`: `architecture`, `backend`, `frontend`) + `api/schemas/` + backend/frontend code exploration:
 
 - Frontend components / pages / routes touched
-- Backend endpoints + services (reference IDs from `business-api-map.md`, `api/schemas/`, or `api-contracts.yaml`)
+- Backend endpoints + services (reference section ids from the `business-api-context` map or `api/schemas/`)
 - Database tables + critical queries
 - External services (payment, email, auth provider, webhooks)
 - Integration points table (internal: FE↔API, API↔DB, API↔Auth; external: API↔Stripe, API↔Email, …)
@@ -161,7 +161,7 @@ Anchor each testing level to the integration points from Section 2.
 | Integration | Each integration point from Section 2 | QA + Dev |
 | E2E | Critical user journeys from Section 1 | QA |
 | API | Endpoints from Section 2, contract-validated against OpenAPI | QA |
-| Non-functional | NFRs from `SRS/non-functional-specs.md` if present | QA |
+| Non-functional | NFRs from the `infra-context` `nfr-*` sections if generated | QA |
 
 **Scope**: list what is in and out of scope explicitly. Out-of-scope items become hand-offs to sibling epics, platform teams, or regression.
 
@@ -228,7 +228,7 @@ The ATP refines each class into concrete test outlines. The feature plan stops a
 
 Identify variables once at feature level to avoid per-story re-discovery.
 
-- **Shared personas**: list roles used across stories (admin, standard user, trial user). Reference from `user-personas.md` if present.
+- **Shared personas**: list roles used across stories (admin, standard user, trial user). Reference the `persona-*` sections of `business-e2e-context` if generated.
 - **Shared fixtures**: entities that pre-exist in the active env's DB (e.g., a seeded tenant, a baseline catalog). Found via `[DB_TOOL]` on `{{DB_MCP}}`.
 - **Dynamic generators**: Faker utilities reused across stories (`faker.internet.email`, `faker.person.firstName`, `faker.finance.amount`).
 - **Factories**: entity factories from `tests/data/` that stories should extend rather than duplicate.
@@ -282,7 +282,7 @@ Else:
 1. **Keep the plan feature-level.** Zero test outlines, zero literal test data. All of that is ATP territory.
 2. **Do not forbid low counts.** A 2-line story may legitimately need 1 test. Force-fitting "at least 5 per story" produces low-value tests.
 3. **Team Discussion is non-blocking.** Extract PO / Dev answers from epic comments, but never wait for them synchronously — timebox Section 4 to "mark open and move on".
-4. **Traceability**: once per-story ATPs exist, link back `{STORY_ATP} ← {EPIC_FTP}` via a line at the top of each ATP. Sprint-testing Stage 1 does not create Xray TCs yet (`test-documentation` owns that in Stage 4).
+4. **Traceability**: once per-story ATPs exist, link back `{STORY_ATP} ← {EPIC_FTP}` via a line at the top of each ATP. Stage 1 TC timing follows `SKILL.md` §"TC creation timing" (jira-xray creates sprint `Test` issues; jira-native defers to Stage 4 `test-documentation`).
 5. **Hand-off to ATP**: feature plan is input to every child story's `acceptance-test-planning.md` run. Each child ATP MUST cite the shared risks, integration points, and personas from the feature plan rather than rediscovering them.
 6. **Regeneration**: if requirements change mid-sprint, re-run with updated inputs and overwrite. Do not amend previous comments — add a fresh dated comment with changes called out.
 7. **Language**: artifacts in English; user-facing conversation can mirror the user's language.

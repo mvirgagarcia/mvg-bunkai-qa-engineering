@@ -105,7 +105,16 @@
     "tests:map": "bun scripts/tests-map.ts",
     "vars:schema": "bun scripts/env-schema.ts",
     "vars:schema:check": "bun scripts/env-schema.ts --check",
-    "worktree:provision": "bun scripts/provision-worktree.ts"
+    "worktree:provision": "bun scripts/provision-worktree.ts",
+    "browser:profiles": "bun scripts/browser-profiles.ts",
+    "context:map": "bun scripts/context-map.ts",
+    "env:set": "bun --no-env-file scripts/env-set.ts",
+    "instructions:audit": "bun scripts/instructions-audit.ts",
+    "instructions:check": "bun scripts/lint-instructions.ts",
+    "shared:check": "bun scripts/shared-check.ts",
+    "sync": "bun cli/update-boilerplate.ts",
+    "tests:explain:render": "bun scripts/tests-explain-render.ts",
+    "worktree:audit": "bun scripts/worktree-audit.ts"
   },
   "dependencies": {
     "@clack/prompts": "^1.4.0",

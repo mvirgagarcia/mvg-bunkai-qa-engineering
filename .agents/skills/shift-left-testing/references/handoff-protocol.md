@@ -19,7 +19,7 @@ This reference defines:
 | Refined refinement file (NON-Jira working file) | `.context/PBI/epics/EPIC-<EPIC_KEY>-<slug>/stories/STORY-<STORY_KEY>-<slug>/shift-left-refinement.md` |
 | Current Story status | `bun run jira:sync-issues get {STORY_KEY}`, then read synced status (or `acli search` for the trivial status-only lookup) |
 | Current Story labels | Same synced read — labels list |
-| Modality | From the session's `progress.md` (`.session/shift-left-testing/<batch-id>/`, resolved in shift-left-testing Phase 0.1). Informational here — the ATP write is field-first in both modalities |
+| Modality | From the session's `plan.md` §Inputs (`.session/shift-left-testing/<batch-id>/`, resolved in shift-left-testing Phase 0.1). Informational here — the ATP write is field-first in both modalities |
 | TMS field map | `.agents/jira-fields.json` → `{{jira.acceptance_criteria}}`, `{{jira.acceptance_test_plan}}` |
 | Workflow transitions | `.agents/jira-workflows.json` → `{{jira.transition.story.analyze}}`, `{{jira.transition.story.estimate}}` |
 | Tracking subtask | The `[QA] Shift-Left Review` subtask created in Phase 1 (`{{jira.status.subtask.active}}` — the subtask workflow's names are `ACTIVE` / `Close`, NOT "In Progress" / "Done"). Closed at Step 5b via `{{jira.transition.subtask.complete}}`; if the catalog has no subtask work type, Phase 1 skipped it — Step 5b then skips with a warning too |
@@ -88,7 +88,7 @@ The Handoff subagent must read the current description FIRST (from the synced `.
 >
 > **Why field-first pre-sprint**: PO has not estimated yet and scope may shrink — creating the item this early wastes an artifact and leaves a second copy for Stage 1 to reconcile. The field IS the only pre-sprint ATP write, in BOTH modalities; modality only decides which engine Stage 1 uses later.
 >
-> What marks this ATP as pre-sprint is the Story's `shift-left-reviewed` + `shift-left-{YYYY-MM-DD}` labels, not the title. Those labels are what Stage 1 reads to decide whether to short-circuit.
+> What marks this ATP as pre-sprint is the Story's `shift-left-reviewed` + `shift-left-{YYYY-MM-DD}` labels, not the title. Stage 1 reads those labels first, but they only CLAIM a pass: the short-circuit opens only when the synced ATP body published here is present too (`sprint-testing/references/acceptance-test-planning.md` §0.0, fail-closed).
 
 The write is identical in Modality jira-xray and Modality jira-native:
 
@@ -135,7 +135,7 @@ Mention rule: include `@PO_HANDLE` and `@DEV_LEAD_HANDLE` in the comment IF thos
   labels: +shift-left-reviewed, +shift-left-{{YYYY-MM-DD}}
 ```
 
-- `shift-left-reviewed` is the SOFT MARKER — `/sprint-testing` Stage 1 reads it.
+- `shift-left-reviewed` is the SOFT MARKER — `/sprint-testing` Stage 1 reads it, but a marker is not evidence: the short-circuit also needs the published ATP body (`sprint-testing/references/acceptance-test-planning.md` §0.0).
 - `shift-left-{{YYYY-MM-DD}}` is the FRESHNESS MARKER — `/sprint-testing` uses the date to decide whether refinement is still <30 days old and can be short-circuited.
 
 Both labels are appended (never replaced). If the Story already carries an older `shift-left-{date}`, leave it — it documents the refinement timeline.
@@ -247,7 +247,7 @@ The stage-specific status lines are:
 
 Warnings DO NOT abort the per-Story handoff — they are surfaced in the batch report.
 
-Errors DO abort. Per AGENTS.md §Orchestration Mode, the orchestrator presents retry / skip / abort to the user. Do NOT auto-rollback Jira mutations — they are recorded in the partial log so a future session can resume.
+Errors DO abort. Per AGENTS.md §3 (Orchestration Mode), the orchestrator presents retry / skip / abort to the user. Do NOT auto-rollback Jira mutations — they are recorded in the partial log so a future session can resume.
 
 ---
 
@@ -330,7 +330,7 @@ Sorted by risk + dependency:
 
 - [ ] PO answers Aggregated Critical Questions before sprint planning
 - [ ] Dev lead answers Aggregated Tech Questions before estimation
-- [ ] When each Story reaches `Ready For QA`, run `/sprint-testing` — Stage 1 will detect `shift-left-reviewed` label and short-circuit Phases 1-3 of `acceptance-test-planning.md`
+- [ ] When each Story reaches `Ready For QA`, run `/sprint-testing` — Stage 1 short-circuits Phases 1-3 of `acceptance-test-planning.md` when the fresh `shift-left-*` labels AND the published ATP body are both there (§0.0)
 - [ ] If any Story still carries a data-feasibility blocker at sprint-planning time, consider moving it to a later sprint
 ```
 
@@ -390,5 +390,5 @@ Each step is idempotent:
 - [ ] `[QA] Shift-Left Review` subtask per Story: annotations posted + transitioned to `{{jira.status.subtask.close}}` (or skipped with warning)
 - [ ] Batch report written to `.session/shift-left-testing/<YYYY-MM-DD>-<descriptor>/batch-report.md`
 - [ ] Batch report posted to parent epic (if all Stories share one) OR delivered inline
-- [ ] User informed: when each Story reaches `Ready For QA`, run `/sprint-testing` (short-circuit thanks to `shift-left-reviewed`)
+- [ ] User informed: when each Story reaches `Ready For QA`, run `/sprint-testing` (it short-circuits on the published ATP body, not on the label alone)
 - [ ] Warnings + errors surfaced explicitly in the user-facing session-close message

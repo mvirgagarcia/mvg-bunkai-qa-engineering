@@ -14,9 +14,9 @@ Every workflow skill that distributes work writes a **launch file** — `launch.
 session scope, N lines, each one self-contained and ready to paste. It writes that file **always**,
 whether or not any runtime exists.
 
-**The byte-identical rule survives, with a narrower scope.** The line in `launch.txt` is the line a
+**The byte-identical rule, and its scope.** The line in `launch.txt` is the line a
 HUMAN pastes, byte for byte, and a conductor that deliberately opens an unsupervised terminal passes
-it verbatim as that terminal's command. What it can no longer be is the supervised launch: the
+it verbatim as that terminal's command. It cannot be the supervised launch: the
 runtime recognizes only agents IT started, so a terminal created from our own command line can never
 be adopted (`orca-orchestration/references/gotchas.md` G44). Supervision is the native launch, and
 the native launch takes an agent, a model and an effort level — **not a command line**.
@@ -30,7 +30,7 @@ the failure this rule exists to prevent; the prompt is what must not drift.
 |---|---|---|
 | Launch | the human opens N terminals and pastes N lines from `launch.txt` | `[ORCHESTRATION_TOOL] launch: one native supervised worker per unit of work (agent + model + effort), then send the prompt into it` |
 | Prompt | it is inside the pasted line | delivered as a separate step, same text, opening with `/<workflow-skill> <KEY> fleet worker` |
-| Credentials | the pasted line runs in the user's own shell, which already has them | Claude reads `.claude/settings.local.json`, OpenCode reads `.auth/opencode/*` (both from `bun run harness:env`); Codex and shell-exported vars need direnv in the runtime's interactive shell; the conductor VERIFIES them on screen before sending work (G45) |
+| Credentials | the pasted line runs in the user's own shell, which already has them | every MCP server reads the worktree's own `.env` through the `.env` loader on any harness, and every other process loads its own config; the conductor VERIFIES them on screen before sending work (`references/orca-machine-setup.md` §3.2) |
 | State | the workflow's own blocked-state tokens in its session memory, plus the tracker | the mailbox: wait on done / escalation / question |
 | Sibling awareness | each worker knows only its own ticket | the roster in the brief; a worker broadcasts a fact that changes someone else's decision |
 | Close | the human closes terminals | `[ORCHESTRATION_TOOL] close: release the supervised worker by dispatch` |
@@ -44,7 +44,10 @@ for the real grammar. Only this skill spells out commands, because only this ski
 
 ### 2.1 · The launch file
 
-- Path: `.session/<skill-slug>/<scope>/launch.txt`.
+- Path: `<<PRIMARY_ROOT>>/.session/<skill-slug>/<scope>/launch.txt`, inside the scope of the workflow
+  skill that distributes the work. One file, one home: only a wave that no single workflow skill
+  owns (a conductor running `orca-orchestration` directly) keeps it in the orchestration scope,
+  `.session/orchestration/<slug>/launch.txt` (`references/coordinator-playbook.md` §0). Never both.
 - **Regenerated whole** at each planning pass. Closed or finished items simply drop out; nothing is
   edited in place, so there is never a half-updated file.
 - One line per unit of work, **self-contained**: it exports whatever the worker needs, then starts
@@ -53,14 +56,17 @@ for the real grammar. Only this skill spells out commands, because only this ski
 - Shape (Claude Code example; other harnesses use their own binary and their own documented flags):
 
   ```
-  bun run claude -- --model <full-model-id> --effort <level> --permission-mode auto \
+  claude --model <full-model-id> --effort <level> --permission-mode auto \
     -n "<KEY>" '<prompt>'
   ```
 
-  `bun run claude` forwards trailing arguments to the binary through the env-loading wrapper
-  (verified: `bun run claude -- --version` prints the CLI version), and the wrapper is what makes the
-  env file win over an inherited variable. `<KEY>` is the worker's roster name, the same token the
-  prompt opens with. On a harness where the launcher cannot set a session name, omit the flag: the
+  The line starts the harness binary directly, with its own flags. No launch line loads `.env` into
+  the worker's shell: every MCP server reads `.env` through the filtered loader in the MCP configs
+  (ADR-0011) and every repo script loads it itself (`references/provisioning.md` §1b), so a pasted
+  line and a supervised launch get credentials the same way. A variable the human exported in the
+  shell the line is pasted into still wins over `.env` for whatever that shell starts;
+  `bun run vars:env:check` names such a variable (names and lengths only). `<KEY>` is the worker's
+  roster name, the same token the prompt opens with. On a harness where the launcher cannot set a session name, omit the flag: the
   human types `/rename <KEY>` once the session is up, because a model cannot rename its own session.
 
 **This line is for a human, or for a terminal nobody will supervise.** Two things about it do not
@@ -84,6 +90,7 @@ parts, in this order:
 /<workflow-skill> <KEY> fleet worker. Read <ABS>/<scope>/COMMON.md then <ABS>/<scope>/W-<label>.md
 and execute your brief. Run every stage without returning to the prompt until worker_done is sent;
 stage boundaries are not checkpoints. Channel: orca orchestration. No heartbeats.
+ROUTE-SCOPE: <section ids the work needs, e.g. git, harnesses; or none>
 ```
 
 - **The opening token is load-bearing.** `/<workflow-skill> <KEY> fleet worker` is what the identity
@@ -93,6 +100,15 @@ stage boundaries are not checkpoints. Channel: orca orchestration. No heartbeats
   a stage boundary with work remaining, on briefs that said "no checkpoints": the instruction works
   when it arrives as the worker's own prompt and fails as a pointer to a file. It belongs in the
   prompt, in the brief, and in `COMMON.md`.
+- **The scope sentence goes LAST and names what the worker must read.** The prompt hook
+  classifies the prompt to inject `ROUTE:` lines, and a worker prompt is the worst input it gets:
+  the injected preamble talks about workers, dispatch and rules, and the absolute paths name the
+  scope folders, so before the cap one prompt fired most sections and workers read almost none of
+  them (measurements in ADR-0017). `ROUTE-SCOPE:` replaces the prompt for that classification: list the section
+  ids (`id:` in `.agents/instructions/agent-*.md`) the brief's work needs, a few words when unsure,
+  or `none`. It runs to the end of its line, so nothing follows it. Without it the hook classifies
+  the task block alone; with it the worker gets exactly the routes the conductor chose. On a
+  pasted launch line the sentence stays on the same line, after `No heartbeats.`
 - **One prompt, one task** (`references/brief-template.md` §5). The brief lives in a FILE; the prompt
   points at it.
 

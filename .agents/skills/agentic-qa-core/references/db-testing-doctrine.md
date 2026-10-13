@@ -8,13 +8,13 @@
  SCHEMA + QUERY               CONFIG                       CREDENTIALS
  --------------               ------                       -----------
  DBHub MCP  [DB_TOOL]         dbhub.toml (committed)       .env  DBHUB_* (see .env.example)
-  search_objects_primary       [[sources]] id = "primary"   -> declared on the MCP layer
-  execute_sql_primary          ${DBHUB_*} interpolation        of all three hosts
+  search_objects_primary       [[sources]] id = "primary"   -> the .env loader's --filter
+  execute_sql_primary          ${DBHUB_*} interpolation        on all three hosts
 ```
 
 ## The tool: DBHub MCP
 
-`[DB_TOOL]` resolves to the DBHub MCP (AGENTS.md §6); Supabase MCP or raw SQL are the fallback.
+`[DB_TOOL]` resolves to the DBHub MCP (`.agents/instructions/agent-tool-resolution.md`); Supabase MCP or raw SQL are the fallback.
 DBHub names its tools `{tool}_{source_id}`. `dbhub.toml` ships one source with `id = "primary"`,
 so the tools are:
 
@@ -32,13 +32,15 @@ A project that adds a second `[[sources]]` block with `id = "reporting"` gets
   placeholder. Never put a literal password in it and never gitignore it: the file is shared
   config, the values are not.
 - **`dbhub` itself does the interpolation**, from the environment of the process it was spawned
-  in, so the `DBHUB_*` variables `.env.example` declares must reach that process. That is why all three hosts declare
-  them on the MCP layer: `env` in `.mcp.json`, `environment` with `{file:.auth/opencode/VAR}`
-  in `opencode.jsonc`, `env_vars` in `.codex/config.toml`. Parity is checked
+  in, so the `DBHUB_*` variables `.env.example` declares must reach that process. That is why all three hosts start
+  it through the `.env` loader with those six names in its `--filter` (`.mcp.json`,
+  `opencode.jsonc`, `.codex/config.toml`): the loader reads `.env` from the project root at spawn
+  time and hands dbhub exactly those names. Parity is checked
   (`mcp-atlassian-optin.md`, MCP parity contract).
 - **It fails late and quietly.** A missing variable does not stop startup: `dbhub` substitutes
   the literal `${DBHUB_HOST}` and the connection fails on the first query, which reads like a
-  database problem. Check the `DBHUB_*` values in `.env` first, run `bun run harness:env`, then
+  database problem. Check which `DBHUB_*` variables are set with `bunx varlock load --agent --filter 'DBHUB_*'`
+  (redacted; never open `.env`); once the human fixes `.env`,
   RESTART the agent session (spawn-time env, Critical Rule #10).
 - **Read-only user by default.** Validation needs `SELECT`; ask for write grants only on a
   non-production environment and only when a test must seed data directly.
@@ -144,7 +146,7 @@ a miss a bug.
 | Symptom | Likely cause | Check |
 |---|---|---|
 | `Connection refused` | database not running, wrong port, firewall | `DBHUB_HOST` / `DBHUB_PORT`; `pg_isready -h <host> -p <port>` on Postgres |
-| `password authentication failed` / login failed | wrong password or user, or a literal `${DBHUB_PASSWORD}` reached the server | the `DBHUB_*` values in `.env`, then `bun run harness:env` and restart |
+| `password authentication failed` / login failed | wrong password or user, or a literal `${DBHUB_PASSWORD}` reached the server | `bunx varlock load --agent --filter 'DBHUB_*'` (redacted) to see which are set; the human corrects the value in `.env`; then restart the session |
 | `too many connections` | parallel sessions not closing connections | fewer parallel workers; a pooler |
 | `SSL connection is required` / SSL errors | server and `sslmode` disagree | check the `sslmode` value in `dbhub.toml`; a local database without TLS needs that line changed in the project's copy |
 
@@ -153,4 +155,5 @@ a miss a bug.
 - **NEVER** run `UPDATE` / `DELETE` against a shared environment to "fix" test data without the
   owner's OK. Seed through the API or a fixture instead.
 - **NEVER** paste a connection string with a password into a command, artifact or chat.
+- **NEVER** use the database to log in as someone: no session or refresh-token row written or read to obtain a session. Seeding the rows a scenario needs is this doctrine; the session it runs in comes from the real login (`browser-sessions.md` §4).
 - **NEVER** report a data mismatch as a bug before ruling out replication lag or a clock skew.

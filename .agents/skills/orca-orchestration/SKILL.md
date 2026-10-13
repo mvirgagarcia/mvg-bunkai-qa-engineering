@@ -18,7 +18,7 @@ compact_rules: |
   - DO treat the channel as an ASSIGNMENT, not a preference: `orchestration send` carries every message between sessions and is byte-intact; anything longer than a couple of sentences goes in a FILE with a one-line pointer; `terminal send` drives a terminal (commands, CLI calls, harness slash-commands, keystrokes) and nothing else, because it truncates silently, keeps only the TAIL and still reports success. The one exception is the launch handoff prompt of a supervised worker, which has no argv to travel in: keep it short and point it at a file. And read every send result as a statement about the CALL, never about the outcome.
   - DO acknowledge every mailbox batch, verified, in the SAME command that re-arms the wait, and never inside a compound command whose exit code can be swallowed. An unacknowledged batch replays forever and hides everything queued behind it, and the runtime does not re-notify. Roll the wait in windows of at most 540 s, because the harness kills a foreground command at 600 s. One waiter per Run, never a shell background job, never a self-built monitor: the runtime notifies the conductor on its own.
   - DO launch a supervised worker NATIVELY (the runtime starts the agent: task, worktree, agent, model, effort) and then send its prompt as the immediate next step. A terminal created with our own command line can NEVER be supervised — the runtime recognizes only agents it started, and adoption is refused on a terminal whose agent is demonstrably alive. Custom argv is the human-paste shape and the deliberately-unsupervised shape, nothing more.
-  - DO verify credentials on the worker's own screen before dispatching work to it. The native launch has no argv: a Claude Code worker reads the `env` block of `.claude/settings.local.json` and an OpenCode worker reads `.auth/opencode/*` via `{file:}` (both generated from `.env` by `bun run harness:env`), while a Codex worker, and anything reading a shell-exported variable, depends on a per-machine direnv hook in the runtime's interactive shell: without it that worker starts clean, unsupervisedly broken, and fails much later at its first authenticated call.
+  - DO verify credentials on the worker's own screen before dispatching work to it. The native launch has no argv: every MCP server, on any harness, reads the worktree's own `.env` through the `.env` loader in the MCP configs, so a provisioned `.env` is what reaches it, and every other process loads its own config (Bun autoload, `acli` stored auth, `varlock run` for a raw `curl`); no secret is ever exported into the worker's shell. Evidence is its MCP servers connected (`/mcp` on Claude Code) and its worktree holding `.env`: without them that worker starts clean and fails much later at its first authenticated call.
   - DO tell every worker, in the prompt AND in the brief, to run every stage without returning to the prompt until `worker_done` is sent: a stage boundary is not a checkpoint. And DO name the one `ask` that is mandatory: when a worker's own measurement contradicts a conductor instruction, it stops and asks with both readings and the evidence — never silent compliance, never silent deviation.
   - DO treat create + launch + brief as ONE indivisible operation, and verify a few minutes later that the brief actually landed (a created terminal reports success when the text was DELIVERED, not when it ran). Readiness is not completion.
   - DO close a finished worker in the same turn, and read its cost footer off its screen BEFORE closing: a worker's token and context usage exists nowhere else and dies with the terminal. Release the supervised worker by its dispatch; without a dispatch, COUNT the terminals in that worktree before closing anything, because the stop verb's radius is the whole worktree. Remove a worktree only after the orphan audit, because everything gitignored inside it (env file, evidence, session scope) dies with it.
@@ -26,16 +26,10 @@ compact_rules: |
   - DO declare a claim before touching shared fixture data or a shared credential, with one of three intents (`read` / `write` / `enumerate` — a listing that exposes siblings' entities is never an assertion target). A claim already listed in the brief is PRE-GRANTED: the worker announces it and works. Only a claim discovered mid-run waits, and the conductor arbitrates it: first message wins, it keeps the ledger and broadcasts the grant. Conductor-only operations (login / token minting, schema sync, tracker pull-push) are never delegated.
   - DO provision a fresh worktree BEFORE launching. A missing provisioning step disguises itself as something else: an absent env file reads as "the tool does not exist", absent dependencies as "a broken import", an absent tracker cache as a worker that simply cannot see the story.
   - DO keep `.agents/project.yaml` → `orchestration` as DEFAULTS only (worker cap, agent, model, effort). An explicit user instruction in the conductor session always overrides them for that run; the defaults apply only when the user said nothing.
+  - WHEN running as an unattended routine (AUTOMATION mode): take the routine's lock FIRST (`<<PRIMARY_ROOT>>/.session/orchestration/automations/<routine>/lock.json`, created no-clobber, then read back), because a manual fire bypasses the precheck and can overlap a scheduled one. A live lock means exit with a one-line report, never wait or queue; a lock older than the prompt's `stale_after_minutes` is reclaimed and the reclamation reported; a prompt with no window fails closed. Delete the lock as the run's last step. Canon: `references/automations.md` §2.
+  - WHEN running as an unattended routine: open at most `orchestration.max_workers` workers in total, in one round (lower if the prompt says so), and list the rest as deferred; treat nothing eligible as a correct outcome, never pick a marginal item to fill the report; write the run report at every step boundary, never only at the end; and select a Story for testing only after the deploy check says its merge is on the target environment. The deployed environment is truth, the tracker is a hint.
   - WHEN a commit is produced by any session: the forensic trailers (`Worktree:` then `Session:`) are mandatory and are NOT AI attribution. Canon: `/git-flow-master`.
 ---
-
-<!-- Model preferences (advisory; dispatchers may use to route) -->
-<!--
-model_preferences:
-  conductor: opus        # planning, arbitration, report synthesis
-  worker: sonnet         # scoped execution; opus for a whole-story or architectural scope
-  automation: opus       # unattended dispatcher (it never produces)
--->
 
 # Orca Orchestration — One Conductor, a Fleet of Sessions
 
@@ -90,7 +84,7 @@ LAYER 3 · REPO DOCTRINE      .agents/skills/orca-orchestration/   (T1, versione
         ^ points at v
 LAYER 2 · GRAMMAR + MACHINE  orca skills get orchestration      (mailbox, Run, Task, worker lifecycle)
                              orca skills get orca-cli           (terminals, worktrees, board, browser)
-   served BY THE BINARY, versioned with it. The user-level stubs teach nothing: they say "ask the binary".
+   served BY THE BINARY, versioned with it. The user-level stubs carry the command grammar and load alongside this skill; the binary serves the DEEP topics a stub points at.
         ^ operates on v
 LAYER 1 · APP                the app running · runtime reachable · board · phone
 ```
@@ -99,9 +93,9 @@ LAYER 1 · APP                the app running · runtime reachable · board · p
 
 **Consequence for the gate**: it is evaluated on `binary + runtime`, NEVER on "is the vendor skill installed". A machine with the binary and no stubs is fully capable, because this reference knows how to ask the binary for the grammar.
 
-**Consequence for cost.** The user-level stubs are small (measure with `wc -c` on the installed stubs; the figure that settled this, and the fact that the rule once said the opposite, are recorded in `.context/ADR/ADR-0006-forensic-measurements-ledger.md`). The trap is conflating the user-level SKILL.md STUB with the full topic payload the binary serves on demand (`{{ORCHESTRATOR_CLI}} skills get <topic>`) — those are different artifacts and only the second is large.
+**Consequence for cost.** The user-level stubs are small (measure with `wc -c` on the installed stubs; the figure that settled this is recorded in `.context/ADR/ADR-0006-forensic-measurements-ledger.md`). The trap is conflating the user-level SKILL.md STUB with the full topic payload the binary serves on demand (`{{ORCHESTRATOR_CLI}} skills get <topic>`) — those are different artifacts and only the second is large.
 
-So the rule is: **`orchestration.orchestrator_skills` load ALONGSIDE this skill, never instead of it.** This skill owns WHEN and WHAT; the vendor stubs own the command grammar. A small load up front is cheaper than one iteration spent correcting an invented flag, which is what the fetch-on-demand posture cost on a live sprint-testing fleet (see ADR-0006). The on-demand fetch stays for the DEEP topics a stub only points at.
+So the rule is: **`orchestration.orchestrator_skills` load ALONGSIDE this skill, never instead of it.** This skill owns WHEN and WHAT; the vendor stubs own the command grammar. A small load up front is cheaper than one iteration spent correcting an invented flag (measured: ADR-0006). The on-demand fetch stays for the DEEP topics a stub only points at.
 
 The list is `orchestration.orchestrator_skills` in `.agents/project.yaml`, not a hardcoded name here. Empty list = nothing installed, and this skill falls back to asking the binary for its grammar — which is still fully capable, per the gate rule above.
 
@@ -166,7 +160,7 @@ Practical rule: **the subagent explores and returns a map; the worker executes a
 2. **Do you want to hand the work away and stop caring?** → that is a **handoff**, ownership transfer, not orchestration: no Task, no Dispatch, no mailbox. A single TASK handed to another agent is the binary's `orca-cli` guide; ask for that guide and follow it. A whole SESSION handed to its own successor because the context window is filling up is `/session-handoff`.
 3. **Do you need to supervise, wait for results, answer questions, or coordinate a dependency graph?** → orchestration. Continue.
 4. **Does the work write code?** → one Orca worktree per worker. **Does it not?** → fleet in the same checkout. See `references/topologies.md`.
-5. **Do you want the workers SUPERVISED** (addressable by dispatch, closable one by one, preamble injected)? → the NATIVE launch, and nothing else: the runtime recognizes only agents it started itself. Two per-machine prerequisites decide whether that path exists here at all: the agent's default arguments, and credentials reaching the worker (`bun run harness:env` for Claude and OpenCode workers; direnv only for Codex workers and shell-exported vars; `references/orca-machine-setup.md` §3). Either one missing → the fleet still runs, every worker unsupervised, and you say so to the owner before launching rather than discovering it at cleanup.
+5. **Do you want the workers SUPERVISED** (addressable by dispatch, closable one by one, preamble injected)? → the NATIVE launch, and nothing else: the runtime recognizes only agents it started itself. The per-machine prerequisite that decides whether that path exists here at all is the agent's default arguments; credentials reach the worker through a provisioned `.env`, which every MCP server reads through the `.env` loader (`references/orca-machine-setup.md` §3). Default arguments missing → the fleet still runs, every worker unsupervised, and you say so to the owner before launching rather than discovering it at cleanup.
 6. **Is there no human at the wheel?** → `references/automations.md`.
 
 ---
@@ -200,7 +194,7 @@ The owner speaks natural language to the conductor; the conductor translates. Th
 6. **Never acknowledge a batch you did not process.** Verified ack (the acknowledged id equals the one requested, the pending count drops), never inside a compound command. An unacknowledged batch hides everything behind it AND the runtime will not notify again.
 7. **Do not build a monitor**, and roll the wait instead. The runtime notifies the conductor when mail arrives; a homemade monitor competes with that notice, arrives late by construction, and triggers on echoes of the conductor's own messages. The harness kills a foreground command at 600 s, so a realistic round is covered by successive waits of at most 540 s, each re-armed with the verified ack in the same command — not by one long block, and never by a shell background job.
 8. **The stop verb has worktree radius: count first.** To close one terminal, close that terminal (and its tab).
-9. **A base-ref flag resolves LOCAL refs**: verify the new worktree's SHA against the remote base, with no `|| true` to hide the failure. This was paid for twice.
+9. **A base-ref flag resolves LOCAL refs**: verify the new worktree's SHA against the remote base, with no `|| true` to hide the failure.
 10. **Never name the orchestrator to the user from a workflow skill when the gate fails**, and never put it in prerequisites, in a non-bypassable probe, in the ATR environment block, or in a blocked-token sweep.
 11. **Text typed into a terminal and not sent is not an instruction.**
 12. **One dev server and one browser per worktree**; close every browser-automation session before reporting (orphaned headless browsers, measured: G37).
@@ -262,7 +256,7 @@ behaviour.
 
 | Frequent confusion | What is actually true |
 |---|---|
-| "installing the vendor skill" enables orchestration | No. The binary already carries the commands. The stub only teaches when. The gate is on the binary |
+| "installing the vendor skill" enables orchestration | No. The binary already carries the commands, so a machine without the stubs is still capable. The stubs are the loaded grammar, not a precondition. The gate is on the binary |
 | a harness worktree equals an Orca worktree | No. The harness one lives inside the repo, invisible to the board and the phone, with no managed terminal. The Orca one has a card, terminals, a browser, and is reachable from the phone. To orchestrate: always the Orca one |
 | a context-only injection leaves a supervised worker | No: deliberately unsupervised, and the release verb does not close it. Supervised = the native launch |
 | a custom-argv terminal can be supervised | **No.** The runtime decides "is this an agent" from the argv IT launched, never from the running process, so adoption is refused on a terminal whose agent is alive on screen. Measured (`references/gotchas.md` G44). Supervision is the native launch or nothing |
@@ -289,7 +283,7 @@ behaviour.
 | `references/brief-template.md` | the fleet extension of the 7-component briefing, plus the two templates |
 | `references/standby-report-contract.md` | what a session emits when it STOPS: the six parts, the closed blocker vocabulary, the three envelopes, and why it is not a progress table or a heartbeat. Read when a session goes to standby or reaches a final status |
 | `references/gotchas.md` | every measured gotcha with symptom, fix, date and the version it was verified against, plus the vendor guide's known lies |
-| `references/automations.md` | unattended routines: recipes, the frozen-prompt trap, cost per wake-up, "the dispatcher never produces" |
+| `references/automations.md` | unattended routines: "the dispatcher never produces", run discipline (lock, worker cap, empty run, report as you go, deployed environment over tracker status), recipes, the frozen-prompt trap, cost per wake-up |
 | `references/launch-seam.md` | how a workflow skill writes its launch file and its gated lines, and what it must never do |
 | `references/html-surfaces.md` | opening a generated page (coverage map, report, deck) in a worktree-bound browser tab instead of the system browser: the gate, the two routes, the clipboard dead end, the split-state rule |
 | `references/orca-machine-setup.md` | the one-time per-machine checklist (not versionable) |

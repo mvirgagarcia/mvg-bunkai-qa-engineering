@@ -1,5 +1,5 @@
 import type { ParityFinding, ParityInput, ParityMeta } from './updater-parity.ts';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 import { dirname, join } from 'node:path';
@@ -8,6 +8,8 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import {
   ABORTED_OUTRO,
   archivedSkillsToReport,
+  browserProfileDrift,
+  browserProfileSitesIn,
   buildParityFileBody,
   buildParityPrompt,
   collectParityFindings,
@@ -22,17 +24,22 @@ import {
   diffStats,
   frameworkGatesNote,
   harnessLevelMcpNote,
+  legacyPlaywrightProfileKeys,
   lintStagedNoStashNote,
   markdownSectionDelta,
   missingConfigBlocks,
   PATH_PREREQUISITES,
   persistArchivedSkillMarkers,
+  PLAYWRIGHT_CLI_CONFIG,
   prerequisiteFor,
   protectNote,
   readGitStrategyStamp,
   renderParityReport,
   RESOLVED_BY_APPLY_MARK,
   resolvedByApply,
+  RETIRED_ENVRC,
+  retiredHarnessScripts,
+  retiredMcpNote,
   runVerdict,
   strictVerdict,
   structuralEvidence,
@@ -388,6 +395,215 @@ describe('collectParityFindings', () => {
     expect(findings).toEqual([]);
   });
 
+  test('a compat warning is one informational row on its file, never blocking, folded into an error row on the same file', () => {
+    const root = temporaryRoot();
+    const upstream = temporaryRoot();
+    write(root, '.agents/project.yaml', 'git_strategy:\n  strategy: solo-main\n  meta:\n    strategy_source: chosen\n');
+    const warning = 'codex MCP dbhub starts without the .env loader in .codex/config.toml: set command = "bunx" and put [...] before the current command and args (reason).';
+    const base = {
+      root,
+      upstreamDir: upstream,
+      drift: [],
+      archivedSkills: [],
+      archivedSkillsDir: join(root, '.template/pre-agents-migration/skills'),
+      heldBack: [],
+      envNewKeys: [],
+    };
+
+    const alone = collectParityFindings({ ...base, compatErrors: [], compatWarnings: [warning] });
+    expect(alone).toHaveLength(1);
+    expect(alone[0]).toMatchObject({ surface: 'mcp', path: '.codex/config.toml', blocking: false, side: 'kept' });
+    expect(alone[0].evidence).toBe(`informational: ${warning}`);
+
+    const error = 'codex MCP openapi mismatch: expected {"a":1}, found {"a":2}';
+    const folded = collectParityFindings({ ...base, compatErrors: [error], compatWarnings: [warning] });
+    expect(folded).toHaveLength(1);
+    expect(folded[0].path).toBe('.codex/config.toml');
+    expect(folded[0].blocking).toBe(true);
+    expect(folded[0].evidence).toBe(`${error}; informational: ${warning}`);
+  });
+
+  test('a leftover .envrc gets one informational row and is never touched; none without it', () => {
+    const root = temporaryRoot();
+    const upstream = temporaryRoot();
+    write(root, '.agents/project.yaml', 'git_strategy:\n  strategy: solo-main\n  meta:\n    strategy_source: chosen\n');
+    const findings = (): ReturnType<typeof collectParityFindings> => collectParityFindings({
+      root,
+      upstreamDir: upstream,
+      drift: [],
+      compatErrors: [],
+      archivedSkills: [],
+      archivedSkillsDir: join(root, '.template/pre-agents-migration/skills'),
+      heldBack: [],
+      envNewKeys: [],
+    });
+
+    expect(findings()).toEqual([]);
+
+    write(root, RETIRED_ENVRC, 'dotenv_if_exists .env\nexport MY_OWN_PATH=/opt/tool\n');
+    const rows = findings();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ surface: 'components', path: '.envrc', blocking: false, suggested: 'keep project' });
+    expect(rows[0].evidence).toStartWith('informational: upstream retired direnv');
+    expect(rows[0].evidence).toContain('Left untouched');
+    expect(readFileSync(join(root, RETIRED_ENVRC), 'utf8')).toBe('dotenv_if_exists .env\nexport MY_OWN_PATH=/opt/tool\n');
+  });
+
+  test('a retired harness launch script gets one informational row and package.json is never touched', () => {
+    const root = temporaryRoot();
+    const upstream = temporaryRoot();
+    write(root, '.agents/project.yaml', 'git_strategy:\n  strategy: solo-main\n  meta:\n    strategy_source: chosen\n');
+    const findings = (): ReturnType<typeof collectParityFindings> => collectParityFindings({
+      root,
+      upstreamDir: upstream,
+      drift: [],
+      compatErrors: [],
+      archivedSkills: [],
+      archivedSkillsDir: join(root, '.template/pre-agents-migration/skills'),
+      heldBack: [],
+      envNewKeys: [],
+    });
+
+    // A project's own `claude` script with another job is not the retired one.
+    write(root, 'package.json', `${JSON.stringify({ scripts: { claude: 'echo hi', test: 'playwright test' } })}\n`);
+    expect(findings()).toEqual([]);
+
+    const pkg = `${JSON.stringify({ scripts: {
+      claude: 'bun --no-env-file scripts/launch.ts claude',
+      codex: 'dotenv -o -e .env -- codex',
+      opencode: 'opencode',
+    } })}\n`;
+    write(root, 'package.json', pkg);
+    expect(retiredHarnessScripts(root)).toEqual(['claude', 'codex']);
+    const rows = findings();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ surface: 'package', path: 'package.json', blocking: false, suggested: 'keep project' });
+    expect(rows[0].evidence).toStartWith('informational: upstream retired the harness launch scripts `claude`, `codex`');
+    expect(rows[0].evidence).toContain('Left untouched');
+    expect(readFileSync(join(root, 'package.json'), 'utf8')).toBe(pkg);
+  });
+
+  test('a playwright-cli config with the old shared profile gets one informational row; a clean, absent or broken one gets none', () => {
+    const root = temporaryRoot();
+    const upstream = temporaryRoot();
+    write(root, '.agents/project.yaml', 'git_strategy:\n  strategy: solo-main\n  meta:\n    strategy_source: chosen\n');
+    const findings = (): ReturnType<typeof collectParityFindings> => collectParityFindings({
+      root,
+      upstreamDir: upstream,
+      drift: [],
+      compatErrors: [],
+      archivedSkills: [],
+      archivedSkillsDir: join(root, '.template/pre-agents-migration/skills'),
+      heldBack: [],
+      envNewKeys: [],
+    });
+
+    expect(legacyPlaywrightProfileKeys(root)).toEqual([]);
+    expect(findings()).toEqual([]);
+
+    write(root, PLAYWRIGHT_CLI_CONFIG, JSON.stringify({ browser: { browserName: 'chromium', isolated: false, userDataDir: '.playwright/user-data' } }));
+    expect(legacyPlaywrightProfileKeys(root)).toEqual(['browser.isolated: false', 'browser.userDataDir']);
+    const both = findings();
+    expect(both).toHaveLength(1);
+    expect(both[0]).toMatchObject({ surface: 'components', path: '.playwright/cli.config.json', blocking: false, side: 'kept', suggested: 'merge' });
+    expect(both[0].evidence).toStartWith('informational: browser.isolated: false and browser.userDataDir still set');
+    expect(both[0].evidence).toContain('remove both keys');
+    expect(both[0].evidence).toContain('browser-sessions.md');
+    expect(both[0].evidence).toContain('ADR-0008');
+
+    write(root, PLAYWRIGHT_CLI_CONFIG, JSON.stringify({ browser: { userDataDir: '/tmp/x' } }));
+    expect(findings()[0].evidence).toContain('remove that key');
+
+    // `isolated: true` is not the legacy shape; only `false` shares a profile.
+    write(root, PLAYWRIGHT_CLI_CONFIG, JSON.stringify({ browser: { isolated: true, launchOptions: { headless: true } } }));
+    expect(findings()).toEqual([]);
+
+    write(root, PLAYWRIGHT_CLI_CONFIG, '{ not json');
+    expect(findings()).toEqual([]);
+  });
+
+  test('a project skill that opens a browser on a disk profile gets one informational row per file, every line named, the file untouched', () => {
+    const root = temporaryRoot();
+    const upstream = temporaryRoot();
+    write(root, '.agents/project.yaml', 'git_strategy:\n  strategy: solo-main\n  meta:\n    strategy_source: chosen\n');
+    const skill = [
+      '# Sprint testing',
+      'playwright-cli -s=TK-{n} open --profile=.playwright/profiles/TK-{n}',
+      'Add `--persistent` only if you need it: `playwright-cli -s=TK-1 open https://app --persistent`',
+      '',
+    ].join('\n');
+    write(root, '.agents/skills/sprint-testing/SKILL.md', skill);
+    write(root, 'AGENTS.md', `Open \`playwright-cli -s=W1 open --profile="${join(root, '.playwright/profiles/W1')}"\`.\n`);
+    const findings = (): ReturnType<typeof collectParityFindings> => collectParityFindings({
+      root,
+      upstreamDir: upstream,
+      drift: [],
+      compatErrors: [],
+      archivedSkills: [],
+      archivedSkillsDir: join(root, '.template/pre-agents-migration/skills'),
+      heldBack: [],
+      envNewKeys: [],
+    });
+
+    expect(browserProfileDrift(root)).toEqual([
+      { file: 'AGENTS.md', line: 1, flag: `--profile=${join(root, '.playwright/profiles/W1')}`, reason: 'profile inside the repo' },
+      { file: '.agents/skills/sprint-testing/SKILL.md', line: 2, flag: '--profile=.playwright/profiles/TK-{n}', reason: 'relative profile' },
+      { file: '.agents/skills/sprint-testing/SKILL.md', line: 3, flag: '--persistent', reason: 'persistent' },
+    ]);
+    const rows = findings();
+    expect(rows).toHaveLength(2);
+    expect(rows.find(r => r.path === '.agents/skills/sprint-testing/SKILL.md')).toMatchObject({ surface: 'skills', blocking: false, suggested: 'keep project' });
+    expect(rows.find(r => r.path === 'AGENTS.md')).toMatchObject({ surface: 'instructions', blocking: false });
+    const evidence = rows.find(r => r.path === '.agents/skills/sprint-testing/SKILL.md')!.evidence;
+    expect(evidence).toStartWith('informational: line 2 --profile=.playwright/profiles/TK-{n} (relative profile); line 3 --persistent (persistent)');
+    expect(evidence).toContain('browser-sessions.md');
+    expect(readFileSync(join(root, '.agents/skills/sprint-testing/SKILL.md'), 'utf8')).toBe(skill);
+  });
+
+  test('the disk-profile detector ignores the doctrine, placeholders, other CLIs and the vendor flag docs', () => {
+    const root = '/work/repo';
+    const quiet = [
+      '2. **Never `--persistent`.** Persistence is `--profile=<absolute dir>` or nothing.',
+      'a named session per worker (`-s=<label>`); never `--persistent`',
+      'nunca --persistent: `playwright-cli list` vacío',
+      'only `--browser --config --headed --persistent --profile` (confirmed via `playwright-cli open --help`)',
+      'playwright-cli -s=loom open <url> --profile=<abs root>/loom --browser=chrome',
+      'playwright-cli -s=loom open <url> --profile=~/.agentic-qa/playwright-profiles/loom',
+      'playwright-cli -s=loom open <url> --profile="$HOME/.agentic-qa/playwright-profiles/loom"',
+      'playwright-cli -s=loom open <url> --profile=/Users/me/.agentic-qa/playwright-profiles/loom',
+      String.raw`playwright-cli -s=loom open <url> --profile=%USERPROFILE%\.agentic-qa\playwright-profiles\loom`,
+      'bun run api:login staging --profile W1',
+      'resend emails list --profile staging',
+      'docker compose --profile test up --abort-on-container-exit',
+      '`--profile <name>`: writes tokens under `.auth/profiles/<name>/`',
+    ].join('\n');
+    expect(browserProfileSitesIn('.agents/skills/x/SKILL.md', quiet, root)).toEqual([]);
+
+    // The vendor playwright-cli skill documents its own flag; a relative profile in it is still a project edit.
+    const vendor = 'playwright-cli open --persistent\nplaywright-cli open --profile=/path/to/profile\nplaywright-cli -s=TK-1 open --profile=.playwright/profiles/TK-1\n';
+    expect(browserProfileSitesIn('.claude/skills/playwright-cli/SKILL.md', vendor, root)).toEqual([
+      { file: '.claude/skills/playwright-cli/SKILL.md', line: 3, flag: '--profile=.playwright/profiles/TK-1', reason: 'relative profile' },
+    ]);
+
+    // Repo-root spellings and a bare relative name on a browser line.
+    const loud = [
+      'playwright-cli -s=K open --profile=<repo>/.playwright/profiles/K',
+      'playwright-cli -s=K open --profile="$PWD/profiles/K"',
+      'playwright-cli -s=K open --profile=TK-1',
+      'pw open --persistent >/dev/null 2>&1',
+    ].join('\n');
+    expect(browserProfileSitesIn('scripts.sh', loud, root).map(s => s.reason)).toEqual([
+      'profile inside the repo',
+      'profile inside the repo',
+      'relative profile',
+      'persistent',
+    ]);
+  });
+
+  test('the shipped skills and instructions carry no disk-profile line', () => {
+    expect(browserProfileDrift(join(import.meta.dir, '..', '..'))).toEqual([]);
+  });
+
   test('archived skills nudge once: this run, plus unreported archive entries, until their marker exists', () => {
     const root = temporaryRoot();
     const archive = join(root, '.template/pre-agents-migration/skills');
@@ -661,6 +877,106 @@ describe('the allow-list merge is reported, never silent', () => {
       allowListAdded: [],
     });
     expect(findings.find(f => f.path === '.claude/settings.json')).toBeUndefined();
+    // A declined deny alone is the project's standing decision, not news.
+    expect(collectParityFindings({ ...permissionInput(root, temporaryRoot()), denyListDeclined: ['Bash(env)'] })
+      .find(f => f.path === '.claude/settings.json')).toBeUndefined();
+  });
+
+  test('deny additions share the one settings row, with the declined entries named', () => {
+    const root = temporaryRoot();
+    const rows = collectParityFindings({
+      ...permissionInput(root, temporaryRoot()),
+      allowListAdded: ['Skill(pr-review-lead)'],
+      denyListAdded: ['Read(.env)', 'Bash(printenv*)'],
+      denyListDeclined: ['Bash(env)'],
+    }).filter(f => f.path === '.claude/settings.json');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].blocking).toBe(false);
+    expect(rows[0].evidence).toContain('1 permission(s) added to permissions.allow: Skill(pr-review-lead)');
+    expect(rows[0].evidence).toContain('2 rule(s) added to permissions.deny: Read(.env), Bash(printenv*)');
+    expect(rows[0].evidence).toContain('declined via updater.declined_denies: Bash(env)');
+    expect(rows[0].evidence).toContain('ask/hooks/env untouched');
+    expect(rows[0].evidence).not.toContain('deny/ask');
+  });
+
+  test('hook additions, skips and a folded key share the one settings row', () => {
+    const root = temporaryRoot();
+    const rows = collectParityFindings({
+      ...permissionInput(root, temporaryRoot()),
+      hooksAdded: ['PostToolUse(*) node "$CLAUDE_PROJECT_DIR/.agents/hooks/personality-reinject.mjs"'],
+      hooksDeclined: ['PostToolUse(Edit|Write|MultiEdit) node "$CLAUDE_PROJECT_DIR/.agents/hooks/doc-contracts.mjs"'],
+      settingsDuplicatesFolded: ['hooks.PostToolUse'],
+    }).filter(f => f.path === '.claude/settings.json');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].blocking).toBe(false);
+    expect(rows[0].evidence).toContain('1 hook command(s) added as new groups: PostToolUse(*)');
+    expect(rows[0].evidence).toContain('declined via updater.declined_hooks: PostToolUse(Edit|Write|MultiEdit)');
+    expect(rows[0].evidence).toContain('repeated key(s) folded into one list (JSON keeps only the last): hooks.PostToolUse');
+    expect(rows[0].evidence).toContain('deny/ask/env untouched');
+  });
+
+  test('a hook skipped for a missing script raises the row alone; a declined hook alone does not', () => {
+    const root = temporaryRoot();
+    const skipped = collectParityFindings({ ...permissionInput(root, temporaryRoot()), hooksSkipped: ['PostToolUse(*) node "$CLAUDE_PROJECT_DIR/.agents/hooks/gone.mjs"'] })
+      .filter(f => f.path === '.claude/settings.json');
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0].evidence).toContain('not added, the script they run is missing: PostToolUse(*)');
+    expect(collectParityFindings({ ...permissionInput(root, temporaryRoot()), hooksDeclined: ['PostToolUse(*) node x.mjs'] })
+      .find(f => f.path === '.claude/settings.json')).toBeUndefined();
+  });
+});
+
+/** The minimum `collectParityFindings` input for the permission rows. */
+function permissionInput(root: string, upstreamDir: string): Parameters<typeof collectParityFindings>[0] {
+  return {
+    root,
+    upstreamDir,
+    drift: [],
+    compatErrors: [],
+    archivedSkills: [],
+    archivedSkillsDir: join(root, '.template/pre-agents-migration/skills'),
+    heldBack: [],
+    envNewKeys: [],
+  };
+}
+
+describe('the opencode.jsonc deny gap is one paste row, never a rewrite', () => {
+  const upstreamOpencode = '{\n  "permission": {\n    "bash": { "*": "ask", "printenv*": "deny", },\n    "read": { "*.env": "deny" },\n  },\n}\n';
+
+  test('a project lacking upstream denies gets one mcp row with the block in its note', () => {
+    const root = temporaryRoot();
+    const upstream = temporaryRoot();
+    write(upstream, 'opencode.jsonc', upstreamOpencode);
+    write(root, 'opencode.jsonc', '{ "permission": { "bash": { "*": "ask" } } }\n');
+    const rows = collectParityFindings(permissionInput(root, upstream)).filter(f => f.path === 'opencode.jsonc');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].surface).toBe('mcp');
+    expect(rows[0].blocking).toBe(false);
+    expect(rows[0].suggested).toBe('merge');
+    expect(rows[0].side).toBe('kept');
+    expect(rows[0].evidence).toContain('lacks 2 upstream deny rule(s) (bash: printenv*; read: *.env)');
+    expect(rows[0].note).toContain('```jsonc');
+    expect(rows[0].note).toContain('"printenv*": "deny",');
+  });
+
+  test('folds onto the file\'s existing drift row', () => {
+    const root = temporaryRoot();
+    const upstream = temporaryRoot();
+    write(upstream, 'opencode.jsonc', upstreamOpencode);
+    write(root, 'opencode.jsonc', '{ "permission": {} }\n');
+    const rows = collectParityFindings({ ...permissionInput(root, upstream), drift: [{ path: 'opencode.jsonc', reason: 'watched' }] })
+      .filter(f => f.path === 'opencode.jsonc');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].evidence).toContain('upstream deny rule(s)');
+    expect(rows[0].suggested).toBe('merge');
+  });
+
+  test('no gap, no row', () => {
+    const root = temporaryRoot();
+    const upstream = temporaryRoot();
+    write(upstream, 'opencode.jsonc', upstreamOpencode);
+    write(root, 'opencode.jsonc', upstreamOpencode);
+    expect(collectParityFindings(permissionInput(root, upstream)).find(f => f.path === 'opencode.jsonc')).toBeUndefined();
   });
 });
 
@@ -680,6 +996,32 @@ describe('the husky hooks carry the gates split downstream', () => {
     expect(frameworkGatesNote('. "$(dirname -- "$0")/framework-gates.sh"\nframework_gates_pre_push\n', '.husky/pre-push')).toBeNull();
     // A mention in a comment is not an adoption.
     expect(frameworkGatesNote('# see framework-gates.sh\nbun run types:check\n', '.husky/pre-commit')).toContain('Adopt the gates split');
+    // commit-msg gets its own function, and the block forwards git's message file.
+    expect(frameworkGatesNote('bunx commitlint --edit "$1"\n', '.husky/commit-msg')).toContain('framework_gates_commit_msg "$1"');
+    expect(frameworkGatesNote('. "$(dirname -- "$0")/framework-gates.sh"\nframework_gates_commit_msg "$1"\n', '.husky/commit-msg')).toBeNull();
+  });
+
+  test('a project that already had its own commit-msg hook gets the row with the block to paste', () => {
+    const root = temporaryRoot();
+    const upstream = temporaryRoot();
+    write(root, '.husky/commit-msg', 'bunx commitlint --edit "$1"\n');
+    write(upstream, '.husky/commit-msg', 'GATES="$(dirname -- "$0")/framework-gates.sh"\nif [ -f "$GATES" ]; then\n  . "$GATES"\n  framework_gates_commit_msg "$1"\nfi\n');
+
+    const findings = collectParityFindings({
+      root,
+      upstreamDir: upstream,
+      drift: [{ path: '.husky/commit-msg', reason: 'project commit-message checks live here' }],
+      compatErrors: [],
+      archivedSkills: [],
+      archivedSkillsDir: join(root, '.template/pre-agents-migration/skills'),
+      heldBack: [],
+      envNewKeys: [],
+    });
+
+    const commitMsg = findings.find(f => f.path === '.husky/commit-msg');
+    expect(commitMsg!.evidence).toContain('does not source .husky/framework-gates.sh');
+    expect(commitMsg!.note).toContain('framework_gates_commit_msg "$1"');
+    expect(commitMsg!.blocking).toBe(false);
   });
 
   test('both hooks get the row, and pre-commit can carry both nudges at once', () => {
@@ -743,7 +1085,7 @@ describe('renderParityReport', () => {
     expect(report.surfaces.find(r => r.surface === 'mcp')?.cell).toBe('1 hallazgo: .codex/config.toml');
 
     const prompt = report.prompt;
-    expect(prompt.startsWith('Parity review after `bun run up` (upstream upex-galaxy/agentic-qa-boilerplate@abcdef1, project lock 1234567).')).toBe(true);
+    expect(prompt.startsWith('Parity review after `bun sync` (upstream upex-galaxy/agentic-qa-boilerplate@abcdef1, project lock 1234567).')).toBe(true);
     expect(prompt).toContain('WAIT for a decision per row');
     expect(prompt).toContain('(keep project | take upstream | merge) BEFORE editing anything');
     expect(prompt).toContain('| # | Surface | File | Now | What differs (evidence) | Suggested |');
@@ -1227,14 +1569,40 @@ describe('the dry-run table marks what the apply step resolves by itself', () =>
 
   test('the mark and its legend appear on a dry-run only', () => {
     const dry = buildParityPrompt([compat, drift], { ...META, dryRun: true });
-    expect(dry).toContain('Parity review after `bun run up --dry-run`');
+    expect(dry).toContain('Parity review after `bun sync --dry-run`');
     expect(dry).toContain(`skills alias missing ${RESOLVED_BY_APPLY_MARK}`);
     expect(dry).toContain('this table lists MORE work than the run that applies');
     expect(dry).not.toContain(`"1. RULES" ${RESOLVED_BY_APPLY_MARK}`);
 
     const real = buildParityPrompt([compat, drift], META);
     expect(real).not.toContain(RESOLVED_BY_APPLY_MARK);
-    expect(real).toContain('Parity review after `bun run up` (upstream');
+    expect(real).toContain('Parity review after `bun sync` (upstream');
+  });
+});
+
+describe('retiredMcpNote', () => {
+  const upstream = JSON.stringify({ mcpServers: { context7: { command: 'bunx' } } });
+  test('names a retired server the project keeps, says why, and offers keep or remove', () => {
+    const project = JSON.stringify({ mcpServers: { context7: { command: 'bunx' }, playwright: { command: 'bunx' } } });
+    const note = retiredMcpNote('.mcp.json', project, upstream);
+    expect(note).not.toBeNull();
+    expect(note!.clause).toContain('upstream retired "playwright"');
+    expect(note!.note).toContain('/playwright-cli');
+    expect(note!.note).toContain('keep project');
+  });
+  test('silent when the project dropped it too, when upstream still has it, and on a non-MCP file', () => {
+    expect(retiredMcpNote('.mcp.json', upstream, upstream)).toBeNull();
+    const both = JSON.stringify({ mcpServers: { playwright: { command: 'bunx' } } });
+    expect(retiredMcpNote('.mcp.json', both, both)).toBeNull();
+    expect(retiredMcpNote('AGENTS.md', '# a', '# b')).toBeNull();
+  });
+  test('reads the Codex and OpenCode registries too', () => {
+    const codexProject = '[mcp_servers.playwright]\ncommand = "bunx"\n';
+    const codexUpstream = '[mcp_servers.context7]\ncommand = "bunx"\n';
+    expect(retiredMcpNote('.codex/config.toml', codexProject, codexUpstream)!.clause).toContain('playwright');
+    const ocProject = '{ "mcp": { "playwright": { "type": "local" } } }';
+    const ocUpstream = '{ "mcp": { "context7": { "type": "local" } } }';
+    expect(retiredMcpNote('opencode.jsonc', ocProject, ocUpstream)!.clause).toContain('playwright');
   });
 });
 
@@ -1255,6 +1623,10 @@ describe('harnessLevelMcpNote', () => {
     expect(harnessLevelMcpNote('.mcp.json', both, both)).toBeNull();
     expect(harnessLevelMcpNote('AGENTS.md', '# a', '# b')).toBeNull();
   });
+  test('silent on a harness-level server upstream never committed: nothing moved, so there is nothing to migrate', () => {
+    const project = JSON.stringify({ mcpServers: { context7: { command: 'bunx' }, exa: { type: 'http', url: 'https://mcp.exa.ai/mcp' } } });
+    expect(harnessLevelMcpNote('.mcp.json', project, upstream)).toBeNull();
+  });
   test('reads the Codex and OpenCode registries too', () => {
     const codexProject = '[mcp_servers.postman]\nurl = "https://mcp.postman.com/mcp"\n';
     const codexUpstream = '[mcp_servers.context7]\ncommand = "bunx"\n';
@@ -1262,5 +1634,45 @@ describe('harnessLevelMcpNote', () => {
     const ocProject = '{ "mcp": { "tavily": { "type": "remote", "url": "https://mcp.tavily.com/mcp/" } } }';
     const ocUpstream = '{ "mcp": { "context7": { "type": "local" } } }';
     expect(harnessLevelMcpNote('opencode.jsonc', ocProject, ocUpstream)!.clause).toContain('tavily');
+  });
+});
+
+describe('context map rows (informational)', () => {
+  function base(root: string): ParityInput {
+    return { root, upstreamDir: temporaryRoot(), drift: [], compatErrors: [], archivedSkills: [], archivedSkillsDir: join(root, 'x'), heldBack: [], envNewKeys: [] };
+  }
+  function put(root: string, rel: string, body: string): void {
+    const full = join(root, rel);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, body);
+  }
+
+  test('a placeholder map with the old markdown map beside it is one non-blocking row naming both', () => {
+    const root = temporaryRoot();
+    put(root, '.agents/skills/business-data-context/references/business-data-map.html', '<!-- placeholder: run project-context mode data to generate this map -->\n<html></html>');
+    put(root, '.context/business/business-data-map.md', '# old');
+    const rows = collectParityFindings(base(root)).filter(f => f.path.includes('business-data-map'));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].blocking).toBe(false);
+    expect(rows[0].surface).toBe('skills');
+    expect(rows[0].evidence).toContain('informational:');
+    expect(rows[0].evidence).toContain('placeholder');
+    expect(rows[0].evidence).toContain('.context/business/business-data-map.md');
+    expect(rows[0].evidence).toContain('project-context mode data');
+  });
+
+  test('a generated map, or a skill the project does not have, raises no row', () => {
+    const root = temporaryRoot();
+    put(root, '.agents/skills/business-api-context/references/business-api-map.html', '<!-- generated by project-context mode api; edited in place by business-api-context refresh; do not hand-edit -->\n<html></html>');
+    const rows = collectParityFindings(base(root)).filter(f => f.path.includes('-map.html'));
+    expect(rows).toEqual([]);
+  });
+
+  test('a skill folder without its map raises the no-map row', () => {
+    const root = temporaryRoot();
+    put(root, '.agents/skills/business-e2e-context/SKILL.md', 'x');
+    const rows = collectParityFindings(base(root)).filter(f => f.path.includes('business-e2e-map'));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].evidence).toContain('has no map');
   });
 });

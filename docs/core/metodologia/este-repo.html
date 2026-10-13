@@ -6,7 +6,7 @@
     <title>Este repo y el IQL</title>
     <meta
       name="description"
-      content="Cómo este boilerplate implementa el IQL: los 8 stages y sus skills, la escalera de artefactos, dónde vive la doctrina, las integraciones, los MCPs y el árbol .context/PBI."
+      content="Cómo este boilerplate implementa el IQL: los stages y sus skills, la escalera de artefactos, dónde vive la doctrina, las integraciones, los MCPs y el árbol .context/PBI."
     />
     <meta name="docs-order" content="60" />
     <link rel="stylesheet" href="../../assets/docs.css" />
@@ -33,7 +33,7 @@
         <strong>En esta página</strong>
         <ol>
           <li><a href="#metodo-e-implementacion">Método e implementación</a></li>
-          <li><a href="#stages">Los 8 stages y quién los ejecuta</a></li>
+          <li><a href="#stages">Los stages y quién los ejecuta</a></li>
           <li><a href="#perfiles">Perfil manual y perfil agéntico</a></li>
           <li><a href="#escalera">La escalera de artefactos</a></li>
           <li><a href="#quality-gate">El quality gate: GO / CAUTION / NO-GO</a></li>
@@ -52,8 +52,8 @@
       <p>
         El <a href="iql.html">IQL (Integrated Quality Lifecycle)</a> es la metodología de UPEX: 15
         steps agrupados en tres fases (<a href="early-game.html">Early-Game</a>,
-        <a href="mid-game.html">Mid-Game</a> y <a href="late-game.html">Late-Game</a>) y ocho stages
-        que se ejecutan y se gatean. La versión oficial está en
+        <a href="mid-game.html">Mid-Game</a> y <a href="late-game.html">Late-Game</a>) y una
+        escalera de stages que se ejecutan y se gatean. La versión oficial está en
         <a href="https://www.upexgalaxy.com/metodologia" target="_blank" rel="noopener"
           >upexgalaxy.com/metodologia</a
         >.
@@ -66,7 +66,7 @@
         agente ejecuta, la evidencia prueba cada conclusión y la persona toma la decisión.
       </p>
 
-      <h2 id="stages">Los 8 stages y quién los ejecuta</h2>
+      <h2 id="stages">Los stages y quién los ejecuta</h2>
       <p>
         Los stages tienen nombre y nunca número. La numeración vieja chocaba con los steps del IQL,
         así que sobrevive en un solo lugar: la tabla de equivalencias de
@@ -75,11 +75,14 @@
 
       <figure>
         <div class="frame scroll on-dark">
-          <img src="../../assets/iql/iql-loop.svg" alt="El bucle del IQL: 8 stages en 4 momentos" />
+          <img
+            src="../../assets/iql/iql-loop.svg"
+            alt="El bucle del IQL: los stages en cuatro momentos"
+          />
         </div>
         <figcaption>
-          Los ocho stages agrupados en cuatro momentos. Producción vuelve a alimentar el análisis
-          del ciclo siguiente.
+          Los stages agrupados en cuatro momentos. Producción vuelve a alimentar el análisis del
+          ciclo siguiente.
           <a href="../../assets/iql/iql-loop.svg" target="_blank" rel="noopener"
             >Ver a tamaño completo</a
           >
@@ -198,10 +201,10 @@
       <dl class="defs">
         <dt>Onboarding</dt>
         <dd>
-          Se hace una vez por proyecto. <code>project-discovery</code> genera la base de
-          <code>.context/</code> por ingeniería inversa, <code>project-context</code> produce los
-          mapas de negocio y el master test plan, y <code>adapt-framework</code> conecta KATA con el
-          stack del proyecto.
+          Se hace una vez por proyecto. <code>project-discovery</code> genera por ingeniería inversa
+          el mapa de dominio y el de infraestructura (dentro de sus context skills),
+          <code>project-context</code> produce los mapas de negocio y el master test plan, y
+          <code>test-framework-adaptation</code> conecta KATA con el stack del proyecto.
         </dd>
         <dt>Sprint close</dt>
         <dd>
@@ -212,11 +215,11 @@
       <p>
         Cada stage tiene además un contrato agéntico: qué hace el agente, qué firma la persona, qué
         evidencia tiene que sobrevivir, cuánta autonomía tiene y si hace falta un verificador
-        separado. Ningún stage pasa de 3 en la escala de autonomía. Automation, el único que llega a
-        3 dentro de su plan, es también el único con verificador obligatorio (<code
-          >/pr-review-lead</code
-        >
-        o <code>/judgment-day</code> en contexto limpio).
+        separado. Ningún stage pasa de 3 en la escala de autonomía, salvo Regression, que puede
+        llegar a 4 en un GO limpio (una corrida sin fallas no necesita firma; un CAUTION o un NO-GO
+        sí). Automation es el único con verificador obligatorio (<code>/pr-review-lead</code> o
+        <code>/judgment-day</code> en contexto limpio). El contrato completo está en
+        <code>.agents/skills/agentic-qa-core/references/stage-gates.md</code>.
       </p>
 
       <h2 id="perfiles">Perfil manual y perfil agéntico</h2>
@@ -284,8 +287,9 @@
             <tr>
               <td>Producto</td>
               <td>
-                <strong>MTP</strong> Master Test Plan: el Epic <code>QA Master Test Plan</code> más
-                <code>.context/master-test-plan.md</code>
+                <strong>MTP</strong> Master Test Plan: la descripción del Epic
+                <code>QA Master Test Plan</code> (copia local en
+                <code>.context/PBI/qa-artifacts/master-test-plan.md</code>)
               </td>
               <td>(no tiene)</td>
               <td>1 por proyecto</td>
@@ -395,32 +399,29 @@ components    -&gt;  módulo del producto  (qué parte del producto toca)</code>
 
       <h2 id="quality-gate">El quality gate: GO / CAUTION / NO-GO</h2>
       <p>
-        El veredicto de release lo emite <code>regression-testing</code> (los umbrales exactos son
-        los de su <code>SKILL.md</code>) con un puntaje ponderado (máximo 9) a partir de cuatro
-        factores: pass rate, regresiones, tests críticos y tests flaky.
+        El veredicto de release lo emite <code>regression-testing</code> con un puntaje ponderado a
+        partir de cuatro factores: pass rate, regresiones, tests críticos y tests flaky. La tabla de
+        puntos, los umbrales de cada veredicto y los vetos viven en su <code>SKILL.md</code>
+        (fase Report &amp; Decide); esta página no los copia para que no queden viejos.
       </p>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th>Puntaje</th>
               <th>Veredicto</th>
               <th>Qué pasa</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td>7 o más</td>
               <td><span class="badge green">GO</span></td>
               <td>Release aprobado</td>
             </tr>
             <tr>
-              <td>4 a 6</td>
               <td><span class="badge warn">CAUTION</span></td>
               <td>Revisión manual y riesgos aceptados documentados; la persona decide</td>
             </tr>
             <tr>
-              <td>Menos de 4</td>
               <td><span class="badge">NO-GO</span></td>
               <td>Release bloqueado: se arreglan las regresiones y se vuelve a correr</td>
             </tr>
@@ -430,9 +431,10 @@ components    -&gt;  módulo del producto  (qué parte del producto toca)</code>
       <p>
         Hay vetos que ignoran el puntaje: nunca hay GO automático si falla un test
         <code>@critical</code>, si existe una regresión de severidad alta o crítica, o si el pass
-        rate está por debajo de 90%. Cada falla se clasifica como REGRESSION, FLAKY, KNOWN,
-        ENVIRONMENT o NEW TEST, y la palabra FLAKY solo se permite con al menos cinco corridas de
-        historial.
+        rate queda por debajo del mínimo que fija el skill. Cada falla cae en una sola de las clases
+        que define el skill (KNOWN se parte en KNOWN-BLOCKED y KNOWN ISSUE; ver
+        <a href="late-game.html#clases-de-falla">Late-Game</a>), y la palabra FLAKY solo se permite
+        con al menos cinco corridas de historial.
       </p>
 
       <h2 id="doctrina">Dónde vive la doctrina</h2>
@@ -443,11 +445,12 @@ components    -&gt;  módulo del producto  (qué parte del producto toca)</code>
       <dl class="defs">
         <dt><code>AGENTS.md</code></dt>
         <dd>
-          La memoria del agente, cargada en cada sesión: reglas críticas (§1), capa de
-          comportamiento (§2, espejo humano en
-          <a href="../personalidad.html">Personalidad de la IA</a>), modo de orquestación (§3), mapa
-          de qué cargar por tarea (§4), registro de skills y MCPs (§5) y resolución de herramientas
-          (§6).
+          La memoria del agente, en capas. <code>AGENTS.md</code> carga en cada sesión: la frase
+          obligatoria de cada regla crítica (§1), la capa de comportamiento entera (§2, espejo
+          humano en <a href="../personalidad.html">Personalidad de la IA</a>), el núcleo del modo de
+          orquestación (§3) y un router. El router nombra las secciones de
+          <code>.agents/instructions/</code> que se leen a pedido: mapa de qué cargar por tarea
+          (§4), registro de skills y MCPs (§5), resolución de herramientas (§6) y el resto.
         </dd>
         <dt><code>.agents/skills/REGISTRY.md</code></dt>
         <dd>
@@ -464,6 +467,16 @@ components    -&gt;  módulo del producto  (qué parte del producto toca)</code>
           La biblioteca compartida de doctrina: un archivo por tema, y cada uno abre diciendo qué
           regla lo cita. La lista es la de la carpeta (<code>ls</code>).
         </dd>
+        <dt><code>iql-context</code></dt>
+        <dd>
+          La skill que le da al agente el índice de esta metodología: por qué el proceso tiene los
+          stages que tiene, qué es cada artefacto de la escalera, dónde se hace cumplir cada
+          invariante. Es conocimiento puro, nunca ejecuta un stage, y se carga sola cuando preguntas
+          "por qué se hace así?". Cada proyecto la adapta en dos lugares:
+          <code>qa.methodology</code> en <code>.agents/project.yaml</code> (qué stages corre y con
+          qué rigor) y <code>.agents/skills/iql-context/references/project-overrides.md</code> (sus
+          reglas y excepciones propias).
+        </dd>
       </dl>
 
       <h2 id="skills">Skills</h2>
@@ -473,7 +486,9 @@ components    -&gt;  módulo del producto  (qué parte del producto toca)</code>
         descripción, o la invocas por nombre. Las de la comunidad las instala
         <code>cli/install.ts</code> a nivel de proyecto y no están versionadas en el repo. El
         catálogo es <code>.agents/skills/REGISTRY.md</code> (generado por
-        <code>bun run skills:registry</code>; <code>AGENTS.md</code> §5 tiene la misma tabla).
+        <code>bun run skills:registry</code>).
+        <code>.agents/instructions/agent-skills-and-mcps.md</code> es el router de frases
+        disparadoras que el agente usa para elegir skill, no el inventario.
       </p>
 
       <h2 id="comandos">Comandos</h2>
@@ -488,9 +503,10 @@ components    -&gt;  módulo del producto  (qué parte del producto toca)</code>
       <h2 id="integraciones">Integraciones</h2>
       <p>
         Las skills nunca nombran una herramienta concreta. Escriben una etiqueta como
-        <code>[DB_TOOL]</code> y la tabla de resolución de <code>AGENTS.md</code> (§6) decide qué
-        herramienta es. Si cambias la fila, cambias el backend sin tocar ninguna skill. La regla
-        general: primero la CLI (gasta menos tokens) y el MCP como fallback.
+        <code>[DB_TOOL]</code> y la tabla de resolución de
+        <code>.agents/instructions/agent-tool-resolution.md</code> decide qué herramienta es. Si
+        cambias la fila, cambias el backend sin tocar ninguna skill. La regla general: primero la
+        CLI (gasta menos tokens) y el MCP como fallback.
       </p>
       <div class="table-wrap">
         <table>
@@ -513,19 +529,20 @@ components    -&gt;  módulo del producto  (qué parte del producto toca)</code>
               <td><code>[AUTOMATION_TOOL]</code></td>
               <td>Navegador</td>
               <td><code>/playwright-cli</code></td>
-              <td>MCP de Playwright</td>
+              <td>Ninguno: es el único camino, no hay MCP de navegador</td>
             </tr>
           </tbody>
         </table>
       </div>
       <p>
         Dos filas de ejemplo; la tabla completa, con todas las etiquetas, es la de
-        <code>AGENTS.md</code> §6. La modalidad del TMS se decide una vez por proyecto. En
-        <strong>jira-xray</strong>, ATP y ATR son Test Plan y Test Execution de Xray. En
-        <strong>jira-native</strong> (sin Xray) viven en custom fields de la historia y comentarios,
-        y los test cases son issues de tipo Test. Las guías de conexión están en
-        <a href="../setup/jira-xray.html">Jira y Xray</a>, <a href="../setup/dbhub.html">DBHub</a>,
-        <a href="../setup/openapi.html">OpenAPI</a> y
+        <code>.agents/instructions/agent-tool-resolution.md</code>. La modalidad del TMS se decide
+        una vez por proyecto. En las dos, ATP y ATR son ítems Test Plan y Test Execution: de Xray en
+        <strong>jira-xray</strong>, work types nativos de Jira en <strong>jira-native</strong> (sin
+        Xray). Solo cuando ese work type falta en una instancia jira-native se usan el custom field
+        de la historia y, sin campo, un comentario. Los test cases son issues de tipo Test. Las
+        guías de conexión están en <a href="../setup/jira-xray.html">Jira y Xray</a>,
+        <a href="../setup/dbhub.html">DBHub</a>, <a href="../setup/openapi.html">OpenAPI</a> y
         <a href="../exploracion/postman.html">Postman</a>.
       </p>
 
@@ -543,8 +560,9 @@ components    -&gt;  módulo del producto  (qué parte del producto toca)</code>
         >).
       </p>
       <p>
-        Qué hace cada server y cuándo se usa está en la tabla de MCPs de <code>AGENTS.md</code> §5;
-        las variables que necesita cada uno las lista <code>bun run setup:doctor</code>.
+        Qué hace cada server y cuándo se usa está en la tabla de MCPs de
+        <code>.agents/instructions/agent-skills-and-mcps.md</code>; las variables que necesita cada
+        uno las lista <code>bun run setup:doctor</code>.
       </p>
 
       <h2 id="pbi">El árbol <code>.context/PBI/</code></h2>
@@ -562,7 +580,7 @@ components    -&gt;  módulo del producto  (qué parte del producto toca)</code>
             <tr>
               <th>Tier</th>
               <th>Fuente de verdad</th>
-              <th>¿En git?</th>
+              <th>En git?</th>
               <th>Cómo se recupera</th>
             </tr>
           </thead>
@@ -590,7 +608,8 @@ components    -&gt;  módulo del producto  (qué parte del producto toca)</code>
       </div>
       <p>
         El árbol completo, con el tier de cada ruta, está en
-        <code>.context/PBI/README.md</code> (versionado) y en <code>AGENTS.md</code> §9.
+        <code>.context/PBI/README.md</code> (versionado) y en
+        <code>.agents/instructions/agent-local-context-pbi.md</code>.
       </p>
       <p>Tres reglas para trabajar con esta caché:</p>
       <ul>
@@ -610,11 +629,17 @@ components    -&gt;  módulo del producto  (qué parte del producto toca)</code>
         </li>
       </ul>
       <p>
-        Fuera de <code>PBI/</code> viven los artefactos de proyecto: los mapas en
-        <code>.context/business/</code>, <code>.context/master-test-plan.md</code> y las decisiones
-        de arquitectura de tests en <code>.context/ADR/</code>. El estado de sesión va en
-        <code>.session/</code>, para que un re-sync no lo pise. Para ver qué está cubierto sin
-        llamar a Jira, <code>bun run tests:map</code> genera un mapa de cobertura en HTML.
+        Fuera de <code>PBI/</code>, <code>.context/</code> guarda solo los archivos de los que el
+        repo es la fuente de verdad: las decisiones de arquitectura de tests en
+        <code>.context/ADR/</code> y <code>project-config.md</code>. Todo lo demás se ignora por
+        defecto (la lista la tiene <code>.gitignore</code>). El Master Test Plan no: vive en Jira y
+        su copia está en <code>PBI/qa-artifacts/master-test-plan.md</code>. El estado de sesión va
+        en <code>.session/</code>, para que un re-sync no lo pise. Para ver qué está cubierto sin
+        llamar a Jira, <code>bun run tests:map</code> genera un mapa de cobertura en HTML. Los mapas
+        (dominio y glosario, infraestructura, datos, API, recorridos E2E) no están en
+        <code>.context/</code>: son una síntesis, así que viven dentro de sus context skills como
+        HTML. Los abres en <code>bun run docs</code> (carpeta Mapas de contexto); la IA los lee con
+        <code>bun run context:map</code>.
       </p>
 
       <footer class="doc-footer">

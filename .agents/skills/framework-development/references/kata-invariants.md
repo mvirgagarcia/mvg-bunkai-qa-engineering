@@ -26,7 +26,7 @@ A higher layer may use a lower layer; never the inverse. Steps (3.5) is an optio
 
 | Layer | WHERE (file path) | WHAT (one-line responsibility) | WHY it cannot be collapsed |
 |-------|-------------------|--------------------------------|----------------------------|
-| 1 — TestContext | `tests/components/TestContext.ts` | Global config, faker, environment accessors, logger; agnostic to API/UI. | Shared baseline both ApiBase and UiBase extend. Collapsing into Base couples HTTP with browser. |
+| 1 — TestContext | `tests/components/TestContext.ts` | Playwright drivers, config, environment, DataFactory; agnostic to API/UI. | Shared baseline both ApiBase and UiBase extend. Collapsing into Base couples HTTP with browser. |
 | 2 — ApiBase | `tests/components/api/ApiBase.ts` | HTTP helpers (`apiGET`, `apiPOST`, `apiPUT`, `apiPATCH`, `apiDELETE`) returning typed tuples; auth token state; Allure attach. | Owns `APIRequestContext`. Without it, every Api component re-implements HTTP. |
 | 2 — UiBase | `tests/components/ui/UiBase.ts` | Playwright helpers (`interceptResponse`, `waitForApiResponse`, storage state, attachments). | Owns `Page`. Without it, every Page component re-implements Playwright wiring. |
 | 3 — Domain (`{Resource}Api`, `{Page}Page`) | `tests/components/api/*Api.ts`, `tests/components/ui/*Page.ts` | Business logic surface. ATCs (`@atc('TICKET-ID')`) live here exclusively. | Maps 1:1 to TMS tickets. Collapsing into Base loses traceability and groups unrelated resources. |
@@ -57,7 +57,7 @@ Hard rule: never request `{ ui }` for an API-only test. Never request `{ api }` 
 
 An ATC = Acceptance Test Case = complete mini-flow mapped 1:1 to a TMS ticket via `@atc('TICKET-ID')`. The four ATC sub-rules are non-negotiable — a method violating any of them is not an ATC and must be reclassified or refactored.
 
-- **Atomic mini-flow**: precondition → action → verification → assertions → return. NEVER a single `page.click()` or single `apiGET`. A read-only GET is a Helper (no `@atc`, optional `@step`), not an ATC.
+- **Atomic mini-flow**: precondition → action → verification → assertions → return. NEVER a bare `page.click()` or a bare `apiGET` with no outcome assertion. A GET that only prepares data is a Helper (no `@atc`, optional `@step`); a GET whose response IS the business outcome under test is an ATC (`test-automation/references/kata-architecture.md` Rule 7).
 - **NEVER calls another ATC**: ATCs are atomic. Reusable chains live in the Steps module (Layer 3.5). An ATC calling `this.someOtherAtc(...)` is a CRITICAL reject.
 - **Max 2 positional params; 3+ → object param**: `fn(a, b, c, d)` is FORBIDDEN. Use `fn(args: Args)`. Applies to ATCs and to every Layer 2/3/3.5 method.
 - **Locators inline; extract only if used 2+ times**: locators default inline inside the ATC. Extract to `private readonly someLocator = () => this.page.locator(...)` arrow function on the class only when used in 2+ ATCs of the same component. NEVER extract to a separate `locators/*.ts` file.
@@ -90,7 +90,7 @@ If you are tempted to put an API helper in `tests/utils/`, stop — it depends o
 
 ## 5. Import aliases (INVARIANT)
 
-Aliases are mandatory across `tests/**`, and **this one is now a compiler, not just doctrine**. The
+Aliases are mandatory across `tests/**`, and **a lint rule enforces them, not just doctrine**. The
 alias set is declared in `tsconfig.base.json`; `KATA_IMPORT_ALIASES` in `eslint.config.base.js` is a
 core `no-restricted-imports` block scoped to `tests/**/*.ts` + `playwright.config.ts` that rejects
 every `./` and `../` import there. It is a SECOND block beside `CLI_IMPORT_CLOSURE` (which stays
@@ -99,8 +99,7 @@ scoped to `cli/**` and guards the updater's import closure); the two file sets a
 Three things a reader should know before citing it:
 
 - The rule is core ESLint (`no-restricted-imports`), not `eslint-plugin-import`. Do not
-  attribute it to a plugin nobody installed — that was the previous version of this paragraph's
-  mistake, in reverse.
+  attribute it to a plugin nobody installed.
 - **Dynamic `await import('./x')` is not caught.** The rule matches static import and export
   declarations only.
 - **`eslint.config.js` is project-owned and never overwritten by the sync**, so a downstream project
@@ -108,7 +107,7 @@ Three things a reader should know before citing it:
   (`cli/lib/agent-compatibility-contracts.ts`) fails `agents:compat:check` when a block the base
   exports is absent from the consumer, which is what stops the rule from shipping inert.
 
-Review (`/pr-review-lead`) is no longer the only enforcement point, but it still owns the half a
+Review (`/pr-review-lead`) owns the half a
 lint rule cannot judge: whether the alias chosen is the RIGHT one for the layer.
 
 The alias set is whatever `tsconfig.base.json` `paths` declares (the authority — read it, do not
@@ -117,8 +116,7 @@ FACADE-ONLY consumer.
 
 There is no `@config/*` and no `@components/*`: config is reached through `@variables`, and the
 component tree through the per-layer aliases (`@ui/*`, `@api/*`, `@steps/*`) or the named fixture /
-context entries. Earlier revisions of this file listed both; they never existed in `tsconfig.json`,
-and a framework change that assumes them will not resolve.
+context entries. A framework change that assumes either will not resolve.
 
 Rule: Domain components import from `@schemas/{domain}.types`, NEVER from `@openapi`. Only files under `api/schemas/` may import `@openapi`. Test files import `test` from `@TestFixture`, NOT from `@playwright/test`.
 
@@ -159,7 +157,7 @@ Where new code CAN safely land WITHOUT a major-version bump. Anything not on thi
 | New static fixture data | `tests/data/fixtures/*.json` | Only for reference data (roles, permission matrices, mock responses, configuration trees). Transactional data goes to DataFactory. |
 | New script | `scripts/<name>.ts` | Add the matching `bun run` entry to `package.json`. |
 | New CLI command | `cli/<command>/` | Project-level installer concern; standalone binaries do not affect the runtime test architecture. |
-| New TS path alias | `tsconfig.json` `paths` | Allowed for new layers/folders — but never collapses an existing alias. |
+| New TS path alias | `tsconfig.base.json` `paths` (the alias authority, §5) | Allowed for new layers/folders — but never collapses an existing alias. |
 | New Playwright tag | usage in `test()`/`describe()` | Must be documented in `automation-standards.md` §4 tag table. |
 
 ---
@@ -175,7 +173,7 @@ Mandatory verification matrix when modifying load-bearing surface area. Each row
 | `UiBase.interceptResponse` / `waitForApiResponse` signature | Re-run ALL UI ATCs that use interception; confirm Allure attachments still produce. |
 | `TestContext` constructor or option shape (`TestContextOptions`) | Audit every Layer 2/3/3.5 constructor that calls `super(options)`. Re-run full suite. |
 | Fixture signature in `TestFixture`/`ApiFixture`/`UiFixture` | Grep all consumers (`tests/**/*.test.ts`); update destructures; re-run full suite. |
-| Import alias in `tsconfig.json` paths | Update tsconfig + every import in repo + ESLint config. Run `bun run types:check` + `bun run lint:check`. |
+| Import alias in `tsconfig.base.json` paths | Update `tsconfig.base.json` + every import in repo + ESLint config. Run `bun run types:check` + `bun run lint:check`. |
 | `@atc` / `@step` decorator API or `SENSITIVE_KEYS` set | Re-run full suite; manually inspect Allure step titles for unmasked sensitive values; verify NDJSON line schema unchanged. |
 | `KataReporter` NDJSON line schema or `atc_results.json` aggregation logic | Verify teardown summary still parses; verify TMS sync (`syncToXray`, `syncToJiraDirect`) still consumes correct fields. |
 | `tests/utils/decorators.ts` `storeResult` writer | Confirm NDJSON file is still atomic-append safe; confirm reporter `onEnd` deletes the partial file. |
@@ -193,11 +191,11 @@ Out-of-scope surfaces. Modifying these from a framework-development task is FORB
 - **Generated artifacts**: `api/openapi-types.ts` is generated by `bun run api:sync` from `api/openapi.json`. Never hand-edit. `api/openapi.json` and `api/.openapi-config.json` are gitignored local cache. `kata-manifest.json` is generated by `bun run kata:manifest`. `reports/atc_results.json` and `reports/.atc_partial.ndjson` are runtime artifacts.
 - **Per-ticket test specs** (consumers, not framework): `tests/e2e/**/*.test.ts`, `tests/integration/**/*.test.ts`, and ticket-specific subclasses under `tests/components/{module}/` (the BASE classes `ApiBase`/`UiBase`/`TestContext` are framework; concrete `*Api`/`*Page` for a ticket are consumer code owned by `test-automation`).
 - **Per-ticket QA context**: `.context/PBI/**` (PBI folders, ATPs, ATRs, evidence). Owned by `sprint-testing` / `test-documentation`.
-- **Project-wide context**: `.context/business/**`, `.context/master-test-plan.md`. Owned by `project-context` (modes `data` / `features` / `api` and `test-plan`). (TMS modality + Regression Epic are resolved live by `/test-documentation` from `.agents/project.yaml` and Jira itself — no `.context/` file.)
+- **Project-wide context**: the context maps inside the context map skills (`CONTEXT_MAP_SKILLS` in `cli/lib/context-maps.ts`, each `references/*-map.html`) and the Master Test Plan (the `QA Master Test Plan` Epic description in Jira, cached at `.context/PBI/qa-artifacts/master-test-plan.md`). Each map is owned by the generator its entry names (a `project-context` mode or a `project-discovery` phase), the MTP by `project-context` mode `test-plan`; the skill folders themselves are framework surface, their maps are the project's. (TMS modality + Regression Epic are resolved live by `/test-documentation` from `.agents/project.yaml` and Jira itself — no `.context/` file.)
 - **Credentials and env**: `.env`, `.env.example` (only the variable list may be appended when adding a new framework env var; never values).
 - **Playwright artifacts (gitignored)**: `test-results/`, `tests/data/downloads/`, `playwright/.auth/`.
 - **Test results / TMS sync state**: outputs of CI runs, not framework code.
-- **Skills / AGENTS.md**: owned by `/agentic-qa-core`, `sync-ai-context`, and the SDD orchestrator. A framework change that needs to surface in AI memory must coordinate via `sync-ai-context`, not direct edit.
+- **Skills / instructions**: a framework change that needs to surface in AI memory patches the section under `.agents/instructions/` that owns the fact through mode `instructions` and the decision tree in `instructions-doctrine.md` (`AGENTS.md` itself only for an L0 rule sentence or a ROUTER row, and a row only behind an ADR; the skill table is `agent-skills-and-mcps.md`) and the docs in the same PR (the docs follow-through in `SKILL.md` Phase 3), and `bun run docs:check` proves the router and the quoted scripts.
 
 ---
 
@@ -212,7 +210,7 @@ These are POLICY tables, not INVARIANT rules. They can be amended additively wit
 | Path                                                  | Why it lives here                                                                                                |
 |-------------------------------------------------------|------------------------------------------------------------------------------------------------------------------|
 | `cli/`                                                | Installer + agents:setup + vars:check — project-level tooling, ships with every clone                            |
-| `scripts/`                                            | `bun run` script implementations (`api:sync`, `kata:manifest`, `jira:sync-fields`, `lint:skills`, etc.)          |
+| `scripts/`                                            | `bun run` script implementations (`api:sync`, `kata:manifest`, `jira:sync-fields`, `skills:check`, etc.)         |
 | `.agents/` (structure changes only)                   | Schema for `project.yaml`, `jira-fields.json`, `jira-workflows.json`, `jira-required.yaml`. Values stay manual.  |
 | `tests/utils/`                                        | Agnostic utilities — Allure attach helpers, decorators, formatters. Evolution of the utility layer.              |
 | `tests/components/` (Layer 2 + 3 base classes only)   | `TestContext.ts`, `ApiBase.ts`, `UiBase.ts`. NOT per-module `*Api.ts` / `*Page.ts` (those are test-automation).  |
@@ -221,6 +219,8 @@ These are POLICY tables, not INVARIANT rules. They can be amended additively wit
 | `package.json` deps + scripts                         | Dependency upgrades, script registry, engines. Not test specs in `tests/`.                                       |
 | `.agents/skills/agentic-qa-core/references/`          | Briefing template, dispatch patterns, orchestration doctrine, skill-composition-strategy.                        |
 | `.agents/skills/framework-development/`               | This skill itself — references, scripts, agents/.                                                                |
+| `AGENTS.md`, `.agents/instructions/` (mode `instructions`) | The instruction layers: L0 sentences, sections, the ROUTER (behind its ADR lock), `triggers:`; placement per `instructions-doctrine.md`. |
+| `cli/lib/fixtures/instruction-router-eval.json`       | The router eval's labelled prompts: grows with every trigger miss, never relabelled to hide one.                 |
 
 ### 10.2 FORBIDDEN paths (redirect map)
 
@@ -230,8 +230,8 @@ These are POLICY tables, not INVARIANT rules. They can be amended additively wit
 | `tests/integration/`                                | `/test-automation` — per-ticket API/integration specs                                           |
 | `tests/components/{module}/` (Page/Api/Steps)       | `/test-automation` — module-specific Domain components and Steps                                |
 | `.context/PBI/`                                     | `/sprint-testing` — per-ticket QA context                                                       |
-| `.context/master-test-plan.md`                      | `project-context` mode `test-plan` — regenerative                                               |
-| `.context/business/`                                | `project-context` modes `data`, `features`, `api` — regenerative                                |
+| `.context/PBI/qa-artifacts/master-test-plan.md`     | sync cache of the MTP Epic; `project-context` mode `test-plan` writes the Epic                  |
+| `.agents/skills/<context map skill>/references/*-map.html` | the generator named in `CONTEXT_MAP_SKILLS` (and each skill's own refresh) — regenerative |
 | `api/openapi-types.ts`                              | Generated artifact — regenerated by `bun run api:sync`                                          |
 | `kata-manifest.json`, `reports/atc_results.json`    | Generated artifacts — runtime / build outputs                                                   |
 | `.env`, credentials                                 | Manual edit only — no skill, no AI rewrite                                                      |

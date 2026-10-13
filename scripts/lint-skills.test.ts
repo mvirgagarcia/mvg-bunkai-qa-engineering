@@ -8,7 +8,7 @@
  * `bunx skills add` output).
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
@@ -98,6 +98,8 @@ interface FixtureOptions {
   staleT1Body?: boolean
   sprintTestingKind?: string | null
   extraSkills?: Array<{ slug: string, kind?: string, capabilities?: string[], body?: string }>
+  /** Slugs rendered into `USER_LEVEL_SKILLS` (T4). Omitted = the array is empty. */
+  userLevelSkills?: string[]
 }
 
 function fixture(options: FixtureOptions): string {
@@ -108,7 +110,7 @@ function fixture(options: FixtureOptions): string {
     'const PROJECT_LEVEL_SKILLS: ReadonlyArray<CommunitySkill> = [',
     '  { package: \'https://github.com/resend/resend-skills\', skill: \'resend-cli\' },',
     '];',
-    'const USER_LEVEL_SKILLS: ReadonlyArray<CommunitySkill> = [];',
+    `const USER_LEVEL_SKILLS: ReadonlyArray<CommunitySkill> = [${(options.userLevelSkills ?? []).map(s => `{ package: 'https://example.com/${s}', skill: '${s}' }`).join(', ')}];`,
     '',
   ].join('\n'));
 
@@ -179,6 +181,17 @@ describe('lint-skills tier classification', () => {
     expect(output).not.toMatch(KIND_VIOLATION);
     expect(output).toContain(`Scanning .agents/skills ... ${T1_SKILLS.length} T1 skills (+ 1 community skills committed in the store, tiers from cli/install.ts)`);
     expect(output).toContain('lint:skills passed');
+    expect(exitCode).toBe(0);
+  });
+
+  test('once the instructions are split, TIER-MISMATCH reads the §5 table from the skills section and names it', () => {
+    const root = fixture({ listCommunityInAgentsMd: false });
+    write(root, '.agents/instructions/agent-skills-and-mcps.md', readFileSync(join(root, 'AGENTS.md'), 'utf8'));
+    write(root, 'AGENTS.md', '# AGENTS.md\n\n## 1. CRITICAL RULES\n');
+    const { exitCode, output } = runLint(root);
+
+    expect(output).toContain('[resend-cli] TIER-MISMATCH: skill is in cli/install.ts tier arrays but absent from .agents/instructions/agent-skills-and-mcps.md §5');
+    expect(output).not.toContain('TIER-MISMATCH parse failure');
     expect(exitCode).toBe(0);
   });
 
@@ -275,8 +288,22 @@ describe('lint-skills MCP capabilities (metadata.requires_capabilities)', () => 
     expect(exitCode).toBe(1);
   });
 
-  test('the five vocabulary names pass', () => {
-    const { exitCode, output } = runLint(fixture({ listCommunityInAgentsMd: true, extraSkills: [{ slug: 'acme-flow', kind: 'workflow', capabilities: ['web-search', 'library-docs', 'db', 'api-schema', 'browser'] }] }));
+  test('the vocabulary names pass', () => {
+    const { exitCode, output } = runLint(fixture({ listCommunityInAgentsMd: true, extraSkills: [{ slug: 'acme-flow', kind: 'workflow', capabilities: ['web-search', 'library-docs', 'db', 'api-schema'] }] }));
+
+    expect(output).not.toMatch(CAPABILITY_VIOLATION);
+    expect(exitCode).toBe(0);
+  });
+
+  test('the retired `browser` capability is rejected: browser automation is a CLI, not an MCP', () => {
+    const { exitCode, output } = runLint(fixture({ listCommunityInAgentsMd: true, extraSkills: [{ slug: 'acme-flow', kind: 'workflow', capabilities: ['db', 'browser'] }] }));
+
+    expect(output).toContain('[acme-flow] CAPABILITY-VOCAB: `metadata.requires_capabilities` names `browser`');
+    expect(exitCode).toBe(1);
+  });
+
+  test('`[AUTOMATION_TOOL]` maps to no capability, so a body using it never warns', () => {
+    const { exitCode, output } = runLint(fixture({ listCommunityInAgentsMd: true, extraSkills: [{ slug: 'acme-flow', kind: 'workflow', body: 'Explore the UI via `[AUTOMATION_TOOL]`.' }] }));
 
     expect(output).not.toMatch(CAPABILITY_VIOLATION);
     expect(exitCode).toBe(0);
@@ -299,7 +326,7 @@ describe('lint-skills MCP capabilities (metadata.requires_capabilities)', () => 
   });
 
   test('a tag whose capability is declared, or one inside a fenced block, does not warn', () => {
-    const body = 'Validate rows via `[DB_TOOL]`.\n\n```\nUI via [AUTOMATION_TOOL]\n```\n';
+    const body = 'Validate rows via `[DB_TOOL]`.\n\n```\nSchema via [API_TOOL]\n```\n';
     const { exitCode, output } = runLint(fixture({ listCommunityInAgentsMd: true, extraSkills: [{ slug: 'acme-flow', kind: 'workflow', capabilities: ['db'], body }] }));
 
     expect(output).not.toMatch(CAPABILITY_VIOLATION);
@@ -428,7 +455,7 @@ describe('lint-skills stage owners (check 22) and the §5 table scope', () => {
       '',
       '| Capability | Use for | Rule |',
       '|---|---|---|',
-      '| `browser` | E2E | fallback |',
+      '| `db` | data checks | primary |',
       '',
       '## 6. TOOL RESOLUTION',
       '',
@@ -436,5 +463,125 @@ describe('lint-skills stage owners (check 22) and the §5 table scope', () => {
     const { exitCode, output } = runLint(root);
     expect(output).not.toContain('TIER-MISMATCH:');
     expect(exitCode).toBe(0);
+  });
+});
+
+describe('lint-skills context write scope (check 23, CONTEXT-WRITES)', () => {
+  function contextSkill(root: string, slug: string, writes: string, body = '', refresh: string | null = 'Propose, then apply on approval.'): void {
+    write(root, `.agents/skills/${slug}/SKILL.md`, t1Skill(slug, body, 'context').replace('  kind: context\n', `  kind: context\n  writes: ${writes}\n`));
+    if (refresh !== null) { write(root, `.agents/skills/${slug}/references/refresh.md`, refresh); }
+  }
+
+  test('a context skill writing only its own references/ with a refresh procedure passes', () => {
+    const root = fixture({ listCommunityInAgentsMd: true, extraSkills: [{ slug: 'acme-context', kind: 'context' }] });
+    contextSkill(root, 'acme-context', '[references/]');
+    const { exitCode, output } = runLint(root);
+
+    expect(output).not.toContain('CONTEXT-WRITES:');
+    expect(exitCode).toBe(0);
+  });
+
+  test('a write scope outside references/, or escaping it, is an error', () => {
+    const root = fixture({ listCommunityInAgentsMd: true, extraSkills: [{ slug: 'acme-context', kind: 'context' }] });
+    contextSkill(root, 'acme-context', '[references/, .context/business/, references/../SKILL.md]');
+    const { exitCode, output } = runLint(root);
+
+    expect(output).toContain('names `.context/business/`');
+    expect(output).toContain('names `references/../SKILL.md`');
+    expect(output).not.toContain('names `references/`;');
+    expect(exitCode).toBe(1);
+  });
+
+  test('a non-context skill cannot declare a write scope', () => {
+    const root = fixture({ listCommunityInAgentsMd: true, extraSkills: [{ slug: 'acme-flow', kind: 'workflow' }] });
+    write(root, '.agents/skills/acme-flow/SKILL.md', t1Skill('acme-flow').replace('  kind: workflow\n', '  kind: workflow\n  writes: [references/]\n'));
+    const { exitCode, output } = runLint(root);
+
+    expect(output).toContain('[acme-flow] CONTEXT-WRITES: `metadata.writes` is the context-kind amendment');
+    expect(exitCode).toBe(1);
+  });
+
+  test('a write scope without references/refresh.md, or next to a Jira tag, is an error', () => {
+    const root = fixture({ listCommunityInAgentsMd: true, extraSkills: [{ slug: 'acme-context', kind: 'context' }, { slug: 'beta-context', kind: 'context' }] });
+    contextSkill(root, 'acme-context', '[references/]', '', null);
+    contextSkill(root, 'beta-context', '[references/]', '', 'Then comment on the story via `[ISSUE_TRACKER_TOOL]`.');
+    const { exitCode, output } = runLint(root);
+
+    expect(output).toContain('[acme-context] CONTEXT-WRITES: a context skill that declares `metadata.writes` must carry `references/refresh.md`');
+    expect(output).toContain('[beta-context] CONTEXT-WRITES: a context skill with a write scope carries `[ISSUE_TRACKER_TOOL]`');
+    expect(exitCode).toBe(1);
+  });
+
+  test('`diagrams` is in the capability vocabulary', () => {
+    const { exitCode, output } = runLint(fixture({ listCommunityInAgentsMd: true, extraSkills: [{ slug: 'acme-flow', kind: 'workflow', capabilities: ['diagrams'] }] }));
+
+    expect(output).not.toMatch(CAPABILITY_VIOLATION);
+    expect(exitCode).toBe(0);
+  });
+});
+
+describe('lint-skills T4 loaders (check 24, T4-LOADER)', () => {
+  /** The onboard skill with its user-level loader table, one row per entry. */
+  function onboard(rows: Array<[slug: string, loader: string]>): { slug: string, kind: string, body: string } {
+    return {
+      slug: 'agentic-qa-onboard',
+      kind: 'core',
+      body: [
+        '## Community skills installed at user level',
+        '',
+        '| Skill | Source | Loaded by / when |',
+        '| --- | --- | --- |',
+        ...rows.map(([slug, loader]) => `| \`${slug}\` | example.com | ${loader} |`),
+        '',
+        '## Next steps',
+        '',
+        '| `late-skill` | example.com | `/sprint-testing` |',
+        '',
+      ].join('\n'),
+    };
+  }
+
+  test('every user-level skill with a cited loader or "user-invoked only" passes', () => {
+    const { exitCode, output } = runLint(fixture({
+      listCommunityInAgentsMd: true,
+      userLevelSkills: ['deck-tool', 'slides-tool'],
+      extraSkills: [onboard([
+        ['deck-tool', 'any flow past the threshold in `/sprint-testing`'],
+        ['slides-tool', '**user-invoked only.**'],
+      ])],
+    }));
+
+    expect(output).not.toContain('T4-LOADER:');
+    expect(exitCode).toBe(0);
+  });
+
+  test('a user-level skill with no row fails, and a row outside the section does not count', () => {
+    const { exitCode, output } = runLint(fixture({
+      listCommunityInAgentsMd: true,
+      userLevelSkills: ['deck-tool', 'late-skill'],
+      extraSkills: [onboard([['deck-tool', '`/sprint-testing`']])],
+    }));
+
+    expect(output).toContain('[late-skill] T4-LOADER: in USER_LEVEL_SKILLS but has no row');
+    expect(output).not.toContain('[deck-tool] T4-LOADER:');
+    expect(exitCode).toBe(1);
+  });
+
+  test('a row whose loader cell cites nothing fails', () => {
+    const { exitCode, output } = runLint(fixture({
+      listCommunityInAgentsMd: true,
+      userLevelSkills: ['deck-tool'],
+      extraSkills: [onboard([['deck-tool', 'any flow that needs it']])],
+    }));
+
+    expect(output).toContain('[deck-tool] T4-LOADER: the "Loaded by / when" cell');
+    expect(exitCode).toBe(1);
+  });
+
+  test('user-level skills without the onboard skill fail once, naming the file', () => {
+    const { exitCode, output } = runLint(fixture({ listCommunityInAgentsMd: true, userLevelSkills: ['deck-tool'] }));
+
+    expect(output).toContain('T4-LOADER: .agents/skills/agentic-qa-onboard/SKILL.md is missing');
+    expect(exitCode).toBe(1);
   });
 });

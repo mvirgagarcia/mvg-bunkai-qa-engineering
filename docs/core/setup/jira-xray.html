@@ -59,9 +59,11 @@
       </p>
       <p>
         Hay una segunda modalidad para proyectos sin licencia de Xray, llamada
-        <em>jira-native</em>. En ella el ATP y el ATR viven en custom fields de la historia y los
-        test cases son un work type <code>Test</code> propio. Esta guía cubre la modalidad con Xray;
-        la configuración de jira-native está en
+        <em>jira-native</em>. En ella el ATP y el ATR son work types nativos
+        <code>Test Plan</code> y <code>Test Execution</code> (el custom field de la historia es el
+        fallback cuando la instancia no los tiene) y los test cases son un work type
+        <code>Test</code> propio. Esta guía cubre la modalidad con Xray; la configuración de
+        jira-native está en
         <code>.agents/skills/test-documentation/references/jira-setup.md</code> (sección 3).
       </p>
 
@@ -102,7 +104,10 @@
             <tr>
               <td>Requirement</td>
               <td>Un issue que los tests pueden cubrir</td>
-              <td>Story, Epic y, si quieres, Bug</td>
+              <td>
+                Los tipos con <code>coverable: true</code> en
+                <code>.agents/jira-required.yaml</code>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -124,7 +129,7 @@
           carpetas del Test Repository y para los components.
         </li>
         <li>
-          El repo instalado con <code>bun run setup</code> y un <code>.env</code> creado a partir de
+          El repo instalado con <code>bun setup</code> y un <code>.env</code> creado a partir de
           <code>.env.example</code>.
         </li>
       </ul>
@@ -159,10 +164,12 @@
           <strong>Activa la cobertura de requisitos</strong>
           <p>
             En <strong>Project settings</strong> &gt; <strong>Apps</strong> &gt;
-            <strong>Xray Settings</strong> &gt; <strong>Test Coverage</strong>, marca Story y Epic
-            como issues cubribles (Bug es opcional). En la configuración global de Xray,
-            <strong>Issue Type Mapping</strong>, deja Story y Epic como requirement types y Bug como
-            defect type.
+            <strong>Xray Settings</strong> &gt; <strong>Test Coverage</strong>, marca como cubribles
+            los tipos de issue que <code>.agents/jira-required.yaml</code> declara con
+            <code>coverable: true</code> en <code>work_types</code>. En la configuración global de
+            Xray, <strong>Issue Type Mapping</strong>, pon esos mismos tipos como requirement types,
+            y Bug y Defect como defect types (una Improvement no rompe un criterio, así que queda
+            fuera).
           </p>
         </li>
         <li>
@@ -401,7 +408,7 @@
             <tr>
               <th>Variable</th>
               <th>Para qué</th>
-              <th>¿Obligatoria?</th>
+              <th>Obligatoria?</th>
             </tr>
           </thead>
           <tbody>
@@ -476,7 +483,7 @@
       <p>
         La lista completa y comentada está en <code>.env.example</code>. Las que tienen destino
         <code>github</code> en <code>cli/lib/variables-manifest.ts</code> también son secrets de CI:
-        las sube a GitHub Actions <code>bun run setup --variables</code>.
+        las sube a GitHub Actions <code>bun setup --variables</code>.
       </p>
 
       <h2 id="catalogos">Catálogos locales y <code>jira:check</code></h2>
@@ -562,6 +569,15 @@
 bun run jira:sync-workflows
 bun run jira:sync-link-types
 bun run jira:check</code></pre>
+      <p>
+        Dos tareas de administración tienen su propio skill, <code>jira-administration</code>, con
+        un modo cada una: <code>components</code> reconcilia los Components del proyecto en Jira con
+        los módulos del producto, y <code>instance-migration</code> repunta el repo cuando cambia la
+        URL del sitio de Atlassian. En Claude Code, <code>/jira-administration components</code>; en
+        OpenCode y Codex, "cargá la skill <code>jira-administration</code>, modo
+        <code>components</code>". Los dos modos analizan sin escribir, te muestran el plan y no
+        tocan Jira ni el repo hasta que lo apruebes.
+      </p>
 
       <h2 id="cli-xray">La CLI de Xray</h2>
       <p>
@@ -646,8 +662,9 @@ bun xray plan get PROJ-300</code></pre>
       </ol>
       <p>
         En el día a día no harás esto a mano: los skills crean los planes y las ejecuciones con sus
-        convenciones de nombre (ATP, STP, RTP, ATR, STR, RTR) y los cuelgan del epic de QA que
-        corresponde. Hacerlo una vez sirve para comprobar que permisos y configuración están bien.
+        convenciones de nombre (ATP, STP, RTP, ATR, STR, RTR), crean el Test Set de aceptación de
+        cada historia (ATS) y los cuelgan del epic de QA que corresponde. Hacerlo una vez sirve para
+        comprobar que permisos y configuración están bien.
       </p>
 
       <h2 id="validacion">Validación final</h2>
@@ -661,8 +678,18 @@ bun xray plan get PROJ-300</code></pre>
           El workflow del Test está asignado y la transición <code>start design</code> aparece en un
           Test en Draft.
         </li>
-        <li>La cobertura de requisitos está activa para Story y Epic.</li>
-        <li>Puedes crear un enlace <code>is tested by</code> desde un Test a una historia.</li>
+        <li>
+          La cobertura de requisitos está activa para los tipos que
+          <code>.agents/jira-required.yaml</code> declara con <code>coverable: true</code> (el Epic
+          no es uno de ellos).
+        </li>
+        <li>
+          Un Test Set enlazado a una historia con el tipo <code>tests / is tested by</code> (el Set
+          del lado <code>is tested by</code> de la historia) llena el panel de cobertura de esa
+          historia. Es la arista que crean los skills: el ATS de cada Story. El enlace directo de un
+          Test a la historia también cubre, pero queda como último recurso; el canon está en
+          <code>.agents/skills/agentic-qa-core/references/traceability-linking.md</code>.
+        </li>
         <li>
           <code>bun xray auth status</code> responde autenticado y
           <code>bun xray test list --project PROJ</code> devuelve datos.

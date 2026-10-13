@@ -34,7 +34,7 @@
           sigue.
         </p>
         <div class="meta-row">
-          <span class="badge accent">Fundamentos agénticos</span><span class="badge">8 stages</span
+          <span class="badge accent">Fundamentos agénticos</span
           ><span class="badge">Autonomía 0-5</span>
         </div>
       </header>
@@ -74,11 +74,12 @@
         agente y si otro agente revisa al primero.
       </p>
       <p>
-        El pipeline tiene ocho stages con nombre: Shift-Left, Planning, Execution, Reporting,
-        Documentation, Automation, Regression y Observation. Observation está declarado pero no
-        tiene skill ni checklist, y así lo dice el propio archivo: una checklist vacía parecería un
-        gate que alguien podría marcar. El cierre de sprint tampoco es un stage; es el límite del
-        lote donde se cierran el STP y el STR.
+        La lista de stages con nombre, su orden y el skill dueño de cada uno viven en
+        <code>.agents/skills/agentic-qa-core/references/stage-gates.md</code>; la tabla de abajo
+        recorre cada uno. Observation está declarado pero no tiene skill ni checklist, y así lo dice
+        el propio archivo: una checklist vacía parecería un gate que alguien podría marcar. El
+        cierre de sprint tampoco es un stage; es el límite del lote donde se cierran el STP y el
+        STR.
       </p>
 
       <div class="table-wrap">
@@ -140,6 +141,14 @@
         Fíjate en que la persona casi nunca firma el trabajo operativo. Firma decisiones: qué entra,
         qué se registra como bug, qué merece automatizarse, cuándo se libera. El agente redacta,
         ejecuta y enlaza.
+      </p>
+      <p>
+        La columna "The person signs" decide además qué se pregunta y qué no. Una decisión técnica
+        dentro de un plan ya aprobado la toma el agente y la deja en el reporte como decidida, con
+        la opción que descartó. Solo se escala lo que pertenece a una persona: el comportamiento
+        esperado del producto, una postura de seguridad nueva, una acción irreversible o que sale
+        hacia afuera, y lo que esa columna reserva para el stage en curso. La regla completa está en
+        <code>.agents/skills/agentic-qa-core/references/decision-protocol.md</code>.
       </p>
 
       <h2 id="autonomia">Autonomía 0-5 y el techo en 3</h2>
@@ -259,7 +268,8 @@
         <figcaption>
           Nivel de autonomía por stage según el contrato. Lo punteado es condicional: Automation
           sube a 3 solo dentro del plan aprobado, Regression marca 4 únicamente para un GO limpio, y
-          Observation no tiene skill que lo ejecute.
+          Observation no tiene skill que lo ejecute. El nivel vigente de cada stage está en
+          <code>stage-gates.md</code>.
         </figcaption>
       </figure>
 
@@ -280,9 +290,11 @@
       <h2 id="verificador">El verificador light al cerrar cada stage</h2>
       <p>
         Un DoD puede quedar marcado mientras el artefacto sigue en el status donde Jira lo dejó al
-        crearlo. El verificador light existe para atrapar lo que se saltó en silencio. Son ocho
-        líneas y el agente las responde con lo que ya hizo en el stage, más una sola lectura extra
-        (un <code>Get Issue</code> sobre la clave principal) para confirmar el status.
+        crearlo. El verificador light existe para atrapar lo que se saltó en silencio. Sus líneas
+        son las de la sección "Light stage verifier" de
+        <code>.agents/skills/agentic-qa-core/references/artifact-lifecycle.md</code>, y el agente
+        las responde con lo que ya hizo en el stage, más una sola lectura extra (un
+        <code>Get Issue</code> sobre la clave principal) para confirmar el status.
       </p>
       <pre data-lang="text"><code>Light stage verifier: &lt;Stage&gt;
 [ ] Artifacts exist: cada artefacto del stage, por KEY
@@ -303,11 +315,12 @@
 
       <h2 id="lifecycle">Lifecycle de artefactos</h2>
       <p>
-        Un artefacto creado y nunca movido no se distingue de uno que nadie trabajó. Antes de que
-        existiera esta regla, pasaba en todos los proyectos: ATP congelados en
+        Un artefacto creado y nunca movido no se distingue de uno que nadie trabajó. Sin un
+        lifecycle declarado para cada tipo de trabajo, eso pasa: ATP congelados en
         <code>Planning</code>, Test Sets en <code>Designing</code>, Test Executions en
-        <code>ACTIVE</code>. La causa era que el harness no declaraba lifecycle para esos tipos de
-        trabajo. Cada fila dice dónde nace el artefacto, qué stage lo mueve y dónde termina.
+        <code>ACTIVE</code>. Cada fila dice dónde nace el artefacto, qué stage lo mueve y dónde
+        termina; el canon es
+        <code>.agents/skills/agentic-qa-core/references/artifact-lifecycle.md</code>.
       </p>
 
       <figure>
@@ -544,7 +557,7 @@
             <tr>
               <td><code>.agents/skills/agentic-qa-core/references/stage-gates.md</code></td>
               <td>
-                Los 8 stages, el contrato por stage, la escala de autonomía, las checklists DoD y el
+                Los stages, el contrato por stage, la escala de autonomía, las checklists DoD y el
                 status que cada stage debe dejar
               </td>
             </tr>

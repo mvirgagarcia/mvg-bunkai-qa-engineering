@@ -1,5 +1,5 @@
 import type { ReportSink } from './lib/updater-types.ts';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 import { dirname, join, resolve } from 'node:path';
@@ -11,13 +11,18 @@ import {
   buildCommunitySkillArgs,
   detectAgents,
   discoverRequiredEnvVars,
-  launchCommandsForAgents,
+  ENGRAM_PLUGIN_COMMANDS,
+  engramSetupArgs,
+  mergedHarnesses,
   migrateAgentIds,
+  offerEngramClaudePlugin,
   parseAgentsEnv,
+  partitionDeclinedSkills,
   PROJECT_LEVEL_SKILLS,
   PROJECT_SKILL_DESTINATION,
   remoteHeadRef,
   repairRepositoryCompatibility,
+  USER_LEVEL_SKILLS,
 } from './install.ts';
 import { declaredMcpIds } from './lib/agent-compatibility-contracts.ts';
 import {
@@ -67,6 +72,15 @@ function copyPath(root: string, relativePath: string): void {
   cpSync(join(REPO_ROOT, relativePath), destination, { recursive: true });
 }
 
+/**
+ * A project on one harness deletes the other harnesses' files (ADR-0012), so
+ * the fixture copies what this checkout has, and a test that reads a dropped
+ * harness skips.
+ */
+const HAS_CODEX = existsSync(join(REPO_ROOT, '.codex/hooks.json')) && existsSync(join(REPO_ROOT, '.codex/config.toml'));
+const HAS_CLAUDE = existsSync(join(REPO_ROOT, 'CLAUDE.md'));
+const HAS_ALL_HARNESSES = HAS_CODEX && existsSync(join(REPO_ROOT, 'opencode.jsonc')) && existsSync(join(REPO_ROOT, '.mcp.json'));
+
 function compatibilityFixture(): string {
   const root = temporaryRoot();
   for (const path of [
@@ -80,7 +94,7 @@ function compatibilityFixture(): string {
     '.codex/config.toml',
     '.mcp.json',
     'opencode.jsonc',
-  ]) { copyPath(root, path); }
+  ].filter(path => existsSync(join(REPO_ROOT, path)))) { copyPath(root, path); }
   return root;
 }
 
@@ -143,13 +157,61 @@ describe('installer Codex lifecycle', () => {
       ]);
   });
 
-  test('discovers Codex MCP environment contracts and exposes launch guidance', async () => {
-    // The six DBHUB_* arrive through `env_vars` on the dbhub server: Codex
-    // inherits only `core`, so anything dbhub.toml interpolates has to be
-    // forwarded by name. Every one of these is project-scoped, so the
-    // installer defers them to `bun run setup:doctor` instead of prompting.
-    // No remote server's key appears: those servers run at harness level.
-    expect(await discoverRequiredEnvVars(['codex'], REPO_ROOT)).toEqual([
+  test('wires Engram per agent with engram setup, slim protocol on Claude Code only', () => {
+    expect(engramSetupArgs('claude-code')).toEqual(['setup', 'claude-code', '--protocol=slim']);
+    expect(engramSetupArgs('opencode')).toEqual(['setup', 'opencode']);
+    expect(engramSetupArgs('codex')).toEqual(['setup', 'codex']);
+  });
+
+  describe('offerEngramClaudePlugin', () => {
+    function fakeClaude(results: Record<string, boolean> = {}) {
+      const calls: string[][] = [];
+      const run = (args: string[]) => {
+        calls.push(args);
+        return { ok: results[args.join(' ')] ?? true, stderr: 'boom' };
+      };
+      return { calls, run };
+    }
+    const yes = async () => true;
+
+    test('installs the marketplace then the plugin after a yes', async () => {
+      const claude = fakeClaude();
+      const outcome = await offerEngramClaudePlugin({ nonInteractive: false, hasClaude: () => true, confirm: yes, run: claude.run });
+      expect(outcome).toBe('installed');
+      expect(claude.calls).toEqual(ENGRAM_PLUGIN_COMMANDS);
+    });
+
+    test('never runs the binary in non-interactive mode, nor asks', async () => {
+      const claude = fakeClaude();
+      let asked = false;
+      const outcome = await offerEngramClaudePlugin({ nonInteractive: true, hasClaude: () => true, confirm: async () => { asked = true; return true; }, run: claude.run });
+      expect(outcome).toBe('skipped-non-interactive');
+      expect(asked).toBe(false);
+      expect(claude.calls).toEqual([]);
+    });
+
+    test('runs nothing when declined or when the claude CLI is missing', async () => {
+      const claude = fakeClaude();
+      expect(await offerEngramClaudePlugin({ nonInteractive: false, hasClaude: () => true, confirm: async () => false, run: claude.run })).toBe('declined');
+      expect(await offerEngramClaudePlugin({ nonInteractive: false, hasClaude: () => false, confirm: yes, run: claude.run })).toBe('no-claude-cli');
+      expect(claude.calls).toEqual([]);
+    });
+
+    test('an already-registered marketplace does not block the install; a failed install is reported, never thrown', async () => {
+      const marketplaceFails = fakeClaude({ 'plugin marketplace add Gentleman-Programming/engram': false });
+      expect(await offerEngramClaudePlugin({ nonInteractive: false, hasClaude: () => true, confirm: yes, run: marketplaceFails.run })).toBe('installed');
+      const installFails = fakeClaude({ 'plugin install engram@engram': false });
+      expect(await offerEngramClaudePlugin({ nonInteractive: false, hasClaude: () => true, confirm: yes, run: installFails.run })).toBe('failed');
+    });
+  });
+
+  test.skipIf(!HAS_ALL_HARNESSES)('discovers the MCP environment contracts from the loader filter on every host, and exposes launch guidance', async () => {
+    // Each server names what it reads in its `.env` loader's `--filter`, the
+    // same list on all three hosts: the six DBHUB_* dbhub.toml interpolates,
+    // the two SLACK_MCP_*, the OpenAPI pair. None is core scope (project or
+    // tooling), so the installer defers them to `bun run setup:doctor` instead
+    // of prompting. No remote server's key appears: those run at harness level.
+    const expected = [
       'API_BASE_URL',
       'DBHUB_DATABASE',
       'DBHUB_HOST',
@@ -158,9 +220,20 @@ describe('installer Codex lifecycle', () => {
       'DBHUB_TYPE',
       'DBHUB_USER',
       'OPENAPI_SPEC_PATH',
-    ]);
-    expect(launchCommandsForAgents(['claude-code', 'opencode', 'codex']))
-      .toEqual(['bun claude', 'bun opencode', 'bun codex']);
+      'SLACK_MCP_REACTION_TOOL',
+      'SLACK_MCP_XOXP_TOKEN',
+    ];
+    expect(await discoverRequiredEnvVars(['codex'], REPO_ROOT)).toEqual(expected);
+    expect(await discoverRequiredEnvVars(['claude-code'], REPO_ROOT)).toEqual(expected);
+    expect(await discoverRequiredEnvVars(['opencode'], REPO_ROOT)).toEqual(expected);
+  });
+});
+
+describe('installer harness selection (ADR-0012)', () => {
+  test('the selection is added to the declared list, never shrinks it', () => {
+    expect(mergedHarnesses([], ['claude-code'])).toEqual(['claude']);
+    expect(mergedHarnesses(['codex', 'claude'], ['claude-code', 'opencode'])).toEqual(['codex', 'claude', 'opencode']);
+    expect(mergedHarnesses(['opencode'], [])).toEqual(['opencode']);
   });
 });
 
@@ -177,7 +250,7 @@ describe('compatibility repair lifecycle', () => {
     });
   });
 
-  test('refuses to replace a real Claude skills directory', () => {
+  test.skipIf(!HAS_CLAUDE)('refuses to replace a real Claude skills directory', () => {
     const root = compatibilityFixture();
     mkdirSync(join(root, '.claude/skills'), { recursive: true });
     writeFileSync(join(root, '.claude/skills/owned.txt'), 'preserve me\n');
@@ -186,9 +259,9 @@ describe('compatibility repair lifecycle', () => {
     expect(readFileSync(join(root, '.claude/skills/owned.txt'), 'utf8')).toBe('preserve me\n');
   });
 
-  test('reclaims the skills CLI per-skill symlink shim without losing a skill body', () => {
+  test.skipIf(!HAS_CLAUDE)('reclaims the skills CLI per-skill symlink shim without losing a skill body', () => {
     // `bunx skills add` (project level) writes the body to .agents/skills/<slug>/ and then
-    // creates .claude/skills/ as a REAL directory of per-skill symlinks. `bun run setup`
+    // creates .claude/skills/ as a REAL directory of per-skill symlinks. `bun setup`
     // installs community skills BEFORE repairing compatibility, so this is what a clean
     // clone actually looks like at repair time. Refusing here aborted the install.
     const root = compatibilityFixture();
@@ -207,7 +280,7 @@ describe('compatibility repair lifecycle', () => {
     expect(repairClaudeSkillsAlias(root, 'linux').status).toBe('valid');
   });
 
-  test('still refuses a shim directory that also holds real content', () => {
+  test.skipIf(!HAS_CLAUDE)('still refuses a shim directory that also holds real content', () => {
     const root = compatibilityFixture();
     mkdirSync(join(root, '.agents/skills/playwright-cli'), { recursive: true });
     mkdirSync(join(root, '.claude/skills'), { recursive: true });
@@ -218,7 +291,7 @@ describe('compatibility repair lifecycle', () => {
     expect(readFileSync(join(root, '.claude/skills/hand-written.md'), 'utf8')).toBe('mine\n');
   });
 
-  test('refuses a symlink shim pointing outside the canonical skills store', () => {
+  test.skipIf(!HAS_CLAUDE)('refuses a symlink shim pointing outside the canonical skills store', () => {
     const root = compatibilityFixture();
     mkdirSync(join(root, 'elsewhere/rogue'), { recursive: true });
     mkdirSync(join(root, '.claude/skills'), { recursive: true });
@@ -227,11 +300,11 @@ describe('compatibility repair lifecycle', () => {
     expect(() => repairClaudeSkillsAlias(root, 'linux')).toThrow('Refusing to replace');
   });
 
-  test('installer and updater repairs are idempotent', async () => {
+  test.skipIf(!HAS_CLAUDE)('installer and updater repairs are idempotent', async () => {
     const root = compatibilityFixture();
     const first = repairRepositoryCompatibility(root, 'linux');
     const second = repairRepositoryCompatibility(root, 'linux');
-    expect(first.alias.status).toBe('created');
+    expect(first.alias?.status).toBe('created');
     expect(second).toMatchObject({ shadowingCommandsMoved: [], alias: { status: 'valid' } });
 
     const steps: string[] = [];
@@ -243,7 +316,7 @@ describe('compatibility repair lifecycle', () => {
 });
 
 describe('doctor and updater parity', () => {
-  test('reports file correctness separately from Codex trust and CLI availability', () => {
+  test.skipIf(!HAS_CODEX)('reports file correctness separately from Codex trust and CLI availability', () => {
     const root = compatibilityFixture();
     repairRepositoryCompatibility(root, 'linux');
     const diagnostic = diagnoseAgentCompatibility(root, { platform: 'linux', codexCliDetected: false });
@@ -264,7 +337,7 @@ describe('doctor and updater parity', () => {
     });
   });
 
-  test('reports a missing alias and grouped errors without throwing', () => {
+  test.skipIf(!HAS_CODEX)('reports a missing alias and grouped errors without throwing', () => {
     const root = compatibilityFixture();
     repairRepositoryCompatibility(root, 'linux');
     rmSync(join(root, '.claude/skills'));
@@ -308,6 +381,35 @@ describe('doctor and updater parity', () => {
 // scaffold-day copy forever with no signal. Reporting only: no reinstall path,
 // because an overwrite of a gitignored skill has no backup to restore from.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// T4 user-level skills: a per-skill multiselect. An unchecked skill is stored as
+// declined and stays out of every later offer, a forced re-run included.
+// ---------------------------------------------------------------------------
+
+describe('user-level skill selection', () => {
+  test('a declined skill is held back; the rest are offered in list order', () => {
+    const [first, second, ...rest] = USER_LEVEL_SKILLS;
+    const { offered, declined } = partitionDeclinedSkills(USER_LEVEL_SKILLS, {
+      [`community:global:${first.skill}`]: 'declined',
+      [`community:global:${second.skill}`]: 'installed',
+    });
+    expect(declined).toEqual([first]);
+    expect(offered).toEqual([second, ...rest]);
+  });
+
+  test('a project-level decline does not hide the user-level skill of the same slug', () => {
+    const [first] = USER_LEVEL_SKILLS;
+    const { declined } = partitionDeclinedSkills(USER_LEVEL_SKILLS, { [`community:project:${first.skill}`]: 'declined' });
+    expect(declined).toEqual([]);
+  });
+
+  test('retired skills stay out of the user-level list', () => {
+    const slugs = USER_LEVEL_SKILLS.map(item => item.skill);
+    expect(slugs).not.toContain('bun');
+    expect(slugs).not.toContain('brainstorming');
+  });
+});
 
 describe('community skill version reporting', () => {
   const SHA = 'a'.repeat(40);

@@ -21,7 +21,7 @@
         <h1>Mid-Game: detección</h1>
         <p class="lede">
           La segunda fase del IQL cubre los steps 5 a 9 y la protagoniza el QA Automation Engineer.
-          Su pregunta es «¿el software cumple con los requerimientos?». Aquí se decide qué casos
+          Su pregunta es «el software cumple con los requerimientos?». Aquí se decide qué casos
           merecen persistir y cuáles de ellos se automatizan, para detectar defectos antes del
           release.
         </p>
@@ -65,7 +65,7 @@
           <tbody>
             <tr>
               <th>Pregunta</th>
-              <td>«¿El software cumple con los requerimientos?»</td>
+              <td>«El software cumple con los requerimientos?»</td>
             </tr>
             <tr>
               <th>Enfoque</th>
@@ -95,7 +95,11 @@
       <p>
         Los dos stages del Mid-Game ocurren en el cierre y release del sprint, con nivel L3 ·
         Continuous Detection. Documentation empieza en el Early-Game (step 4) y termina aquí.
-        Automation es el único stage del IQL con verificación separada obligatoria.
+        Automation es el único stage del IQL con verificación separada obligatoria. Los niveles de
+        autonomía y los nombres de transición de las tablas de abajo son una copia para enseñar. La
+        fuente vigente es
+        <code>.agents/skills/agentic-qa-core/references/stage-gates.md</code> para el contrato y la
+        autonomía, y <code>.agents/jira-workflows.json</code> para las transiciones.
       </p>
 
       <h3 id="stage-documentation">Documentation</h3>
@@ -182,7 +186,8 @@
               <td>
                 Escribe el plan (especificación y plan de automatización), implementa sobre la
                 arquitectura del Implementation Standard con el decorador que ata cada método a su
-                caso, corre los tres verificadores y abre el pull request.
+                caso y corre los tres verificadores; el pull request lo abre
+                <code>/git-flow-master</code>.
               </td>
             </tr>
             <tr>
@@ -205,7 +210,10 @@
             </tr>
             <tr>
               <th>Verificador separado</th>
-              <td>Obligatorio: <code>pr-review-lead</code> y <code>judgment-day</code></td>
+              <td>
+                Obligatorio: <code>pr-review-lead</code> o <code>judgment-day</code>, en un contexto
+                limpio
+              </td>
             </tr>
             <tr>
               <th>Roles</th>
@@ -369,7 +377,7 @@
                 Hace trazable cada ATC a su historia (<code>@atc('KEY')</code>) y es lo que los
                 skills saben operar. Sobre un framework que el cliente conserva se aplican sus
                 invariantes (capas, inyección de dependencias, decoradores) con
-                <code>/adapt-framework</code>, sin reescribirlo.
+                <code>/test-framework-adaptation</code>, sin reescribirlo.
               </td>
             </tr>
             <tr>
@@ -451,7 +459,10 @@
         </li>
         <li>
           <strong>Enlazar el ATS a la historia</strong>
-          <p>Enlace <em>Test · is tested by</em>. Es la única arista que da cobertura.</p>
+          <p>
+            Enlace <em>Test · is tested by</em>. Es la arista que da cobertura; el enlace directo de
+            un caso a la historia también cubre, pero solo como último recurso.
+          </p>
         </li>
         <li>
           <strong>Recién ahí, el ATP</strong>
@@ -523,7 +534,7 @@
             <tr>
               <td>L3.5 (opcional)</td>
               <td>Steps</td>
-              <td><code>loginAndSeedCart.step.ts</code></td>
+              <td><code>AuthSteps.ts</code></td>
               <td>Cadenas de precondición reutilizables. No llevan <code>@atc</code>.</td>
             </tr>
             <tr>
@@ -685,7 +696,7 @@
         <a class="card" href="iql.html">
           <span class="badge">Volver</span>
           <h3>El IQL completo</h3>
-          <p>Las tres fases, los ocho stages y el bucle completo.</p>
+          <p>Las tres fases, los stages y el bucle completo.</p>
         </a>
         <a class="card" href="late-game.html">
           <span class="badge accent">Siguiente</span>

@@ -36,7 +36,7 @@ Eight strategies are supported. Each one tells the skill where new branches star
 
 **PR base**: `main` (when PRs are used at all — solo-main often skips PRs entirely).
 
-**Protected branches**: `main`. Confirm before any push.
+**Protected branches**: `main`. A direct push follows `git_strategy.policy.direct_push_to_protected` (`allowed` = push without asking, `confirm` = ask every push, `forbidden` = PR).
 
 **Release model**: continuous; every push is a release.
 
@@ -303,7 +303,7 @@ The combined detection runs in this order. Stop at the first definitive answer.
 2. Inspect `git branch -a`:
    - Only `main` (or `master`) → solo-main.
    - `main` + exactly one of {staging, dev, develop, integration} → main-integration.
-     Record the integration branch name in the second marker.
+     Record the integration branch name in `git_strategy.branches.integration`.
    - `main` + `develop` (Driessen-style) → check for `release/*` or `hotfix/*`.
      If present → gitflow. If only `develop` and `feature/*` → main-integration with develop.
    - `main` + `pre-production` and/or `production` → gitlab-flow.
@@ -366,6 +366,18 @@ Q3: Does the change have shared scaffolding (new types, new base classes, new sc
 └─ No  → re-decompose. Send the planner back to story breakdown.
          A monolithic non-mechanical change without shared scaffolding is a planning smell.
 ```
+
+**Answering it is the deliverable, not the label.** Callers gate on this decision and reject a bare strategy name (`SKILL.md` Compact Rules, the chained-PR rule). Record each answer with the concrete reason drawn from THIS change, stop at the leaf, and return this three-line block:
+
+```
+Chain strategy: feature-branch-chain
+Decision trace: Q1=No (new fixture API and Page components, not a rename or formatter run) ·
+                Q2=No (the specs in slice 2 cannot compile without the fixture added in slice 1) ·
+                Q3=Yes (shared fixture + api/schemas types consumed by slices 2-4) → feature-branch-chain
+Decided by: /git-flow-master §Chained-PR decision tree (branching-strategies.md)
+```
+
+A `Yes` at Q1 ends the walk: write `Q2=n/a · Q3=n/a`; a `Yes` at Q2 writes `Q3=n/a`. Answers that do not lead to the stated leaf, or a "trace" that only repeats the conclusion, are malformed and count as no decision. A re-run (the real diff outgrew the estimate) replaces the whole block; it never appends a second leaf to the old trace.
 
 **Strategy outputs**:
 

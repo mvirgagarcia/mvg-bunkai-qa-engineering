@@ -3,11 +3,22 @@
  * lint-docs.ts — dead-link gate for the human documentation surface.
  *
  * Scans `docs/**` (`.html` and `.md`), the root `README.md`, `INSTALLER.md`
- * and `CONTEXT.md`, and `packages/decks/**` (`.html`), and fails when:
+ * and `CONTEXT.md`, the nested READMEs (`.context/README.md` and the
+ * `README.md` of each direct child of `.context/` and `packages/`), and the
+ * HTML that GitHub Pages publishes (`packages/decks/**`, `packages/pages-home/**`),
+ * and fails when:
  *
  *   - a RELATIVE link (`href="…"`, `src="…"`, markdown `](…)`) does not
  *     resolve to an existing file or directory, relative to the file that
- *     holds it;
+ *     holds it. A published page (`PUBLISHED_MOUNTS`) is resolved the way the
+ *     Pages site serves it: `./decks/x.html` from the portal is
+ *     `packages/decks/x.html` in the repo, `./docs/` is `docs/`, and a link
+ *     into a report tree the suite workflows publish (`REPORT_ROOTS`) is
+ *     skipped, because no source file backs it;
+ *   - a markdown `](…)` link in a committed `.md` under `.agents/`, `.context/`
+ *     or `.claude/` (`LINK_ONLY_ROOTS`) does not resolve, relative to the file.
+ *     Only that check runs there: links inside code spans are examples, and the
+ *     backtick paths of agent docs are `lint-skills.ts` STALE-PATH territory;
  *   - an inline-code path (`` `docs/…` ``, `<code>docs/…</code>`) that starts
  *     with a known repo root does not exist, resolved from the repo root;
  *   - an HTML page under `docs/` lacks a `<title>` or a
@@ -21,6 +32,27 @@
  *     `<pre>`, `<code class="block">`, `<script>` and `<style>` are skipped; a
  *     line marked `volatile-ok: <reason>` is kept. Severity per family in
  *     `VOLATILE_SEVERITY` (both families fail the gate).
+ *   - a repo skill (a committed `.agents/skills/<slug>/SKILL.md`) is missing
+ *     from the skill router table (`roster`), read from
+ *     `.agents/instructions/agent-skills-and-mcps.md` (or `AGENTS.md` in a repo
+ *     that has not split its instructions; `skillRouterSource`). A row in the
+ *     project's own `## Project context skills` table (`agent-project.md`) counts
+ *     too: the skills section is synced, so a skill the project added is
+ *     routed from there. A project-local `<aspect>-context` skill is exempt
+ *     (`isProjectLocalSkillPath`). The human
+ *     pages are NOT checked for a skill list: they point to the generated
+ *     `REGISTRY.md`, because enumerating the skills there is the mutable-set
+ *     copy Critical Rule #17 forbids.
+ *   - a `bun run <name>` quoted in `AGENTS.md`, in an instruction section or in
+ *     the doc surface (fenced
+ *     blocks, decks and the Pages portal included) names a script
+ *     `package.json` does not declare (`script`). Placeholders, file runs
+ *     (`bun run scripts/x.ts`) and prose that only names the command
+ *     (`bun run = npm run`) are ignored.
+ *   - a documentation-contract marker (`LINT.IfChange` / `LINT.ThenChange`,
+ *     ADR-0016) is unbalanced, reuses a label, or names a page that does not
+ *     exist (`contract`). Maintainers' checkout only (`contractsEnforced`); the
+ *     range check itself is `scripts/lint-doc-contracts.ts`, at pre-push and in CI.
  *
  * External URLs, `mailto:` / `tel:` / `data:` / `javascript:`, bare anchors
  * and template placeholders are ignored; a `#fragment` or `?query` is stripped
@@ -36,7 +68,7 @@
  * before anyone creates them (`OPTIONAL_PATHS`). The inline-path check does
  * not run on `packages/decks/**`: deck slides quote illustrative paths from
  * teaching examples, and other fronts add decks the gate must not trip on.
- * Their relative links ARE checked.
+ * Their relative links and their `bun run` names ARE checked.
  *
  * Usage: bun scripts/lint-docs.ts   (exit 1 on any finding)
  */
@@ -44,6 +76,9 @@
 import type { VolatileKind } from './lib/volatile-facts.ts';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { isProjectLocalSkillPath } from '../cli/lib/updater-core.ts';
+import { contractsEnforced, scanContracts } from './lib/doc-contracts.ts';
+import { listSections, projectSkillRows, SKILL_ROUTER_HEADING, skillRouterSource, skillTableRows } from './lib/instructions.ts';
 import { relativePosix, toPosix } from './lib/posix-path.ts';
 import { isVolatileExemptPath, scanVolatile, volatileRemedy } from './lib/volatile-facts.ts';
 
@@ -53,7 +88,7 @@ export const KNOWN_ROOTS = ['docs/', '.agents/', 'scripts/', 'cli/', 'tests/', '
 export interface DocFinding {
   file: string
   line: number
-  kind: 'link' | 'path' | 'meta' | 'file-line' | 'current-state'
+  kind: 'link' | 'path' | 'meta' | 'file-line' | 'current-state' | 'roster' | 'script' | 'contract'
   target: string
   /** Only `meta` findings on project-owned pages are warnings; everything else fails the gate. */
   severity?: 'error' | 'warning'
@@ -112,6 +147,64 @@ export const OPTIONAL_PATHS = new Set<string>([
   '.agents/compatibility/command-aliases.project.json',
 ]);
 
+/**
+ * Where each published surface lives on the GitHub Pages site
+ * (`.github/workflows/pages.yml` assembles it): site prefix -> repo directory.
+ * The empty prefix is the site root, served from `packages/pages-home/`.
+ * Longest prefix wins.
+ */
+export const PUBLISHED_MOUNTS: ReadonlyArray<readonly [site: string, repo: string]> = [
+  ['decks/', 'packages/decks/'],
+  ['docs/', 'docs/'],
+  ['kata/', 'packages/kata-academy/'],
+  ['', 'packages/pages-home/'],
+];
+
+/**
+ * Top-level site folders no source file backs: the Allure trees the suite
+ * workflows publish per environment (`<env>/<suite>/`). A link into one is a
+ * runtime URL, not a repo path.
+ */
+export const REPORT_ROOTS = ['local', 'qa', 'staging', 'production'] as const;
+
+/** Repo path (posix, relative) -> site path, or null when the file is not published HTML. */
+export function sitePathOf(rel: string): string | null {
+  if (!rel.endsWith('.html')) { return null; }
+  for (const [site, repo] of PUBLISHED_MOUNTS) {
+    if (repo !== '' && rel.startsWith(repo)) { return site + rel.slice(repo.length); }
+  }
+  return null;
+}
+
+/**
+ * Resolve a relative link the way the Pages site does, for a published page.
+ * Returns the repo path that backs the target, `'skip'` for a report tree, or
+ * `'outside'` when the link climbs above the site root.
+ */
+export function resolvePublishedLink(siteFile: string, target: string): string | 'skip' | 'outside' {
+  const parts = siteFile.split('/').slice(0, -1);
+  for (const seg of target.split('/')) {
+    if (seg === '' || seg === '.') { continue; }
+    if (seg === '..') {
+      if (parts.length === 0) { return 'outside'; }
+      parts.pop();
+      continue;
+    }
+    parts.push(seg);
+  }
+  const site = parts.join('/') + (target.endsWith('/') && parts.length > 0 ? '/' : '');
+  if ((REPORT_ROOTS as readonly string[]).includes(parts[0] ?? '')) { return 'skip'; }
+  const sorted = [...PUBLISHED_MOUNTS].sort((a, b) => b[0].length - a[0].length);
+  for (const [prefix, repo] of sorted) {
+    const bare = prefix.replace(/\/$/, '');
+    if (prefix === '' || site === bare || site.startsWith(prefix)) {
+      const rest = prefix === '' ? site : site.slice(Math.min(site.length, prefix.length));
+      return (repo + rest).replace(/\/$/, '') || repo.replace(/\/$/, '');
+    }
+  }
+  return 'outside';
+}
+
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.svelte-kit']);
 
 function walk(dir: string, exts: string[], out: string[]): void {
@@ -124,14 +217,55 @@ function walk(dir: string, exts: string[], out: string[]): void {
   }
 }
 
+/**
+ * The READMEs that live outside `docs/` one level down: `.context/` and its
+ * direct children, and every `packages/*` package. Not a recursive walk:
+ * `.context/PBI/` is a Jira cache that can hold thousands of files.
+ * `.agents/README.md` is `lint-skills.ts` territory.
+ */
+function nestedReadmes(root: string): string[] {
+  const out: string[] = [];
+  for (const base of ['.context', 'packages']) {
+    const dir = join(root, base);
+    if (!existsSync(dir)) { continue; }
+    const own = join(dir, 'README.md');
+    if (existsSync(own)) { out.push(own); }
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const readme = join(dir, entry.name, 'README.md');
+      if (entry.isDirectory() && existsSync(readme)) { out.push(readme); }
+    }
+  }
+  return out;
+}
+
+/** Trees whose markdown is checked for `](…)` links only: agent docs cite paths in backticks, which `lint-skills.ts` STALE-PATH owns. */
+export const LINK_ONLY_ROOTS = ['.agents', '.context', '.claude'] as const;
+
+/**
+ * Committed `.md` files under `LINK_ONLY_ROOTS`, absolute and sorted, minus the
+ * ones `collectDocFiles` already scans in full. Read from `git ls-files`, so a
+ * gitignored Jira cache or community skill is never walked; empty outside a
+ * git work tree.
+ */
+export function collectLinkOnlyFiles(root: string, fullScan: string[]): string[] {
+  const result = Bun.spawnSync(['git', 'ls-files', '-z', '--', ...LINK_ONLY_ROOTS.map(dir => `${dir}/*.md`)], { cwd: root, stdout: 'pipe', stderr: 'ignore' });
+  if (result.exitCode !== 0) { return []; }
+  const full = new Set(fullScan);
+  return result.stdout.toString().split('\0').filter(Boolean).map(rel => join(root, rel)).filter(file => !full.has(file) && existsSync(file)).sort();
+}
+
 /** Every file the gate scans, absolute paths, sorted for stable output. */
 export function collectDocFiles(root: string): string[] {
   const files: string[] = [];
   walk(join(root, 'docs'), ['.html', '.md'], files);
   walk(join(root, 'packages', 'decks'), ['.html'], files);
+  walk(join(root, 'packages', 'pages-home'), ['.html'], files);
   for (const name of ['README.md', 'INSTALLER.md', 'CONTEXT.md']) {
     const full = join(root, name);
     if (existsSync(full)) { files.push(full); }
+  }
+  for (const readme of nestedReadmes(root)) {
+    if (!files.includes(readme)) { files.push(readme); }
   }
   return files.sort();
 }
@@ -149,6 +283,11 @@ function stripSuffix(target: string): string {
   return target.split('#')[0].split('?')[0];
 }
 
+/** Blank inline code spans, keeping offsets stable: a `[x](y)` quoted as code is an example, not a link. */
+function blankInlineCode(text: string): string {
+  return text.replace(/`[^`\n]+`/g, span => ' '.repeat(span.length));
+}
+
 /** Remove fenced code blocks from markdown, keeping line count stable. */
 function blankFences(text: string): string {
   return text.replace(/^(```|~~~)[\s\S]*?\n\1/gm, block => block.replace(/[^\n]/g, ''));
@@ -163,20 +302,25 @@ function rootExists(root: string, path: string): boolean {
   return existsSync(join(root, top));
 }
 
-/** Findings for one file. Exported for the unit test. */
-export function lintDocFile(root: string, file: string): DocFinding[] {
+/**
+ * Findings for one file. Exported for the unit test. `linksOnly` (the
+ * `LINK_ONLY_ROOTS` markdown) checks markdown `](…)` links outside code and
+ * nothing else.
+ */
+export function lintDocFile(root: string, file: string, opts: { linksOnly?: boolean } = {}): DocFinding[] {
   const findings: DocFinding[] = [];
   const raw = readFileSync(file, 'utf8');
   const isMarkdown = file.endsWith('.md');
-  const text = isMarkdown ? blankFences(raw) : raw.replace(/<script[\s\S]*?<\/script>/gi, m => m.replace(/[^\n]/g, ''));
+  const fenced = isMarkdown ? blankFences(raw) : raw.replace(/<script[\s\S]*?<\/script>/gi, m => m.replace(/[^\n]/g, ''));
+  const text = opts.linksOnly ? blankInlineCode(fenced) : fenced;
   const rel = relativePosix(root, file);
   const seen = new Set<string>();
 
-  const linkPatterns = [
-    /\b(?:href|src)\s*=\s*"([^"]*)"/g,
-    /\b(?:href|src)\s*=\s*'([^']*)'/g,
-  ];
-  if (isMarkdown) { linkPatterns.push(/\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)/g); }
+  const markdownLink = /\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)/g;
+  const linkPatterns = opts.linksOnly
+    ? [markdownLink]
+    : [/\b(?:href|src)\s*=\s*"([^"]*)"/g, /\b(?:href|src)\s*=\s*'([^']*)'/g];
+  if (isMarkdown && !opts.linksOnly) { linkPatterns.push(markdownLink); }
 
   for (const pattern of linkPatterns) {
     for (const match of text.matchAll(pattern)) {
@@ -184,11 +328,20 @@ export function lintDocFile(root: string, file: string): DocFinding[] {
       if (!isCheckableLink(target)) { continue; }
       const clean = stripSuffix(target);
       if (clean === '') { continue; }
-      const resolved = resolve(dirname(file), decodeURIComponent(clean));
+      const site = sitePathOf(rel);
+      let resolved = resolve(dirname(file), decodeURIComponent(clean));
+      let outside = false;
+      if (site !== null) {
+        const published = resolvePublishedLink(site, decodeURIComponent(clean));
+        if (published === 'skip') { continue; }
+        // A link above the site root has no target once published: always dead.
+        outside = published === 'outside';
+        if (!outside) { resolved = join(root, published); }
+      }
       const fromRoot = toPosix(relativePosix(root, resolved));
       // A link that climbs into a root this checkout does not have is skipped.
-      if (!fromRoot.startsWith('..') && !rootExists(root, fromRoot)) { continue; }
-      if (!existsSync(resolved)) {
+      if (!outside && !fromRoot.startsWith('..') && !rootExists(root, fromRoot)) { continue; }
+      if (outside || !existsSync(resolved)) {
         const key = `link:${match.index}`;
         if (!seen.has(key)) {
           seen.add(key);
@@ -198,6 +351,7 @@ export function lintDocFile(root: string, file: string): DocFinding[] {
     }
   }
 
+  if (opts.linksOnly) { return findings; }
   const codePatterns = rel.startsWith('packages/decks/') ? [] : [/`([^`\n]+)`/g, /<code>([^<\n]+)<\/code>/g];
   for (const pattern of codePatterns) {
     for (const match of text.matchAll(pattern)) {
@@ -216,6 +370,73 @@ export function lintDocFile(root: string, file: string): DocFinding[] {
   return findings;
 }
 
+/** Slugs in the first column of the skill router table, or null when the table is missing. */
+export function routerSlugs(agentsMd: string): Set<string> | null {
+  const rows = skillTableRows(agentsMd, SKILL_ROUTER_HEADING);
+  return rows === null ? null : new Set(rows.map(row => row.slug));
+}
+
+/** Repo skills: committed skill folders (a gitignored community install does not count). */
+function repoSkills(root: string): string[] {
+  const dir = join(root, '.agents', 'skills');
+  if (!existsSync(dir)) { return []; }
+  const candidates = readdirSync(dir, { withFileTypes: true })
+    .filter(e => e.isDirectory() && existsSync(join(dir, e.name, 'SKILL.md')))
+    .map(e => e.name);
+  const ignored = gitIgnored(root, candidates.map(slug => `.agents/skills/${slug}/SKILL.md`));
+  return candidates
+    .filter(slug => !ignored.has(`.agents/skills/${slug}/SKILL.md`))
+    .filter(slug => !isProjectLocalSkillPath(`.agents/skills/${slug}/SKILL.md`))
+    .sort();
+}
+
+/** `roster` findings: repo skills missing from the skill router table. */
+export function lintRoster(root: string): DocFinding[] {
+  const source = skillRouterSource(root);
+  const skills = repoSkills(root);
+  if (source === null || skills.length === 0) { return []; }
+  const findings: DocFinding[] = [];
+  const router = routerSlugs(readFileSync(source.path, 'utf8'));
+  if (router === null) {
+    return [{ file: source.rel, line: 1, kind: 'roster', target: 'skill router table (### Skills heading not found)' }];
+  }
+  // A skill the project authored is routed from its own `agent-project.md` table, which `bun sync` never overwrites.
+  for (const row of projectSkillRows(root) ?? []) { router.add(row.slug); }
+  for (const slug of skills) {
+    if (!router.has(slug)) { findings.push({ file: source.rel, line: 1, kind: 'roster', target: slug }); }
+  }
+  return findings;
+}
+
+const BUN_RUN = /\bbun run(?:\s+--silent)?\s+([^\s`'"<>()[\]|,;\\]+)/g;
+
+/** `script` findings: `bun run <name>` citations whose name `package.json` does not declare. */
+function scriptNames(pkgFile: string): string[] {
+  if (!existsSync(pkgFile)) { return []; }
+  return Object.keys((JSON.parse(readFileSync(pkgFile, 'utf8')) as { scripts?: Record<string, string> }).scripts ?? {});
+}
+
+export function lintScripts(root: string, files: string[]): DocFinding[] {
+  const pkgFile = join(root, 'package.json');
+  if (!existsSync(pkgFile)) { return []; }
+  const rootScripts = scriptNames(pkgFile);
+  const findings: DocFinding[] = [];
+  for (const file of files) {
+    const rel = relativePosix(root, file);
+    // A package README quotes its own scripts as well as the root ones. Decks
+    // and the Pages portal live under packages/ but teach the root scripts.
+    const pkg = sitePathOf(rel) === null ? /^packages\/([^/]+)\//.exec(rel) : null;
+    const scripts = new Set(pkg ? [...rootScripts, ...scriptNames(join(root, 'packages', pkg[1], 'package.json'))] : rootScripts);
+    const text = readFileSync(file, 'utf8');
+    for (const match of text.matchAll(BUN_RUN)) {
+      const name = match[1].replace(/[.:]+$/, '');
+      if (!/^[a-z0-9]/i.test(name) || name.includes('/') || /\.[cm]?[jt]sx?$/.test(name) || PATTERN_CHARS.test(name)) { continue; }
+      if (!scripts.has(name)) { findings.push({ file: rel, line: lineOf(text, match.index ?? 0), kind: 'script', target: name }); }
+    }
+  }
+  return findings.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : a.line - b.line));
+}
+
 /** Targets git ignores, resolved from the repo root. Empty outside a git work tree. */
 function gitIgnored(root: string, paths: string[]): Set<string> {
   if (paths.length === 0) { return new Set(); }
@@ -228,9 +449,16 @@ function gitIgnored(root: string, paths: string[]): Set<string> {
   return new Set(result.stdout.toString().split('\n').map(line => line.trim()).filter(Boolean));
 }
 
+/** Documentation-contract markers (ADR-0016): balanced, unique labels, every target on disk. */
+export function lintContracts(root: string): DocFinding[] {
+  if (!contractsEnforced(root)) { return []; }
+  return scanContracts(root).findings.map(f => ({ file: f.file, line: f.line, kind: 'contract' as const, target: f.detail }));
+}
+
 export function lintDocs(root: string): { files: number, findings: DocFinding[] } {
   const files = collectDocFiles(root);
-  const raw = files.flatMap(file => lintDocFile(root, file));
+  const linkOnly = collectLinkOnlyFiles(root, files);
+  const raw = [...files.flatMap(file => lintDocFile(root, file)), ...linkOnly.flatMap(file => lintDocFile(root, file, { linksOnly: true }))];
   const isRef = (f: DocFinding): boolean => f.kind === 'link' || f.kind === 'path';
   const refs = raw.filter(isRef);
   const resolvedOf = (f: DocFinding): string => f.kind === 'path'
@@ -238,7 +466,12 @@ export function lintDocs(root: string): { files: number, findings: DocFinding[] 
     : relativePosix(root, resolve(root, dirname(f.file), decodeURIComponent(stripSuffix(f.target))));
   const ignored = gitIgnored(root, [...new Set(refs.map(resolvedOf))]);
   const findings = raw.filter(f => !isRef(f) || !ignored.has(resolvedOf(f)));
-  return { files: files.length, findings };
+  const agentsFile = join(root, 'AGENTS.md');
+  const instructionFiles = listSections(root).map(s => join(root, s.rel));
+  findings.push(...lintRoster(root));
+  findings.push(...lintScripts(root, [...(existsSync(agentsFile) ? [agentsFile] : []), ...instructionFiles, ...files]));
+  findings.push(...lintContracts(root));
+  return { files: files.length + linkOnly.length, findings };
 }
 
 if (import.meta.main) {
@@ -251,6 +484,9 @@ if (import.meta.main) {
       case 'path': return 'missing path';
       case 'file-line': return 'FILE-LINE';
       case 'current-state': return 'CURRENT-STATE';
+      case 'roster': return 'skill not listed';
+      case 'script': return 'unknown script';
+      case 'contract': return 'doc contract';
       default: return 'missing';
     }
   };

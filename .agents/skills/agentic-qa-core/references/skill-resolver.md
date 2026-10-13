@@ -9,20 +9,19 @@ Subagents that re-read every relevant `SKILL.md` before they act burn tokens red
 
 Net effect:
 
-- Subagents trust a 5-15-line "Compact Rules" block instead of opening the full SKILL.md.
+- Subagents trust a short "Compact Rules" block instead of opening the full SKILL.md.
 - Token cost per dispatch drops by an order of magnitude when multiple skills overlap.
 - Orchestration stays auditable — the rules pasted into a briefing are the same rules the orchestrator itself read.
 
-This is a token-saving protocol, not a behavioral one. Subagents are still allowed to read the full SKILL.md when the compact rules are insufficient (see "Limits" below).
+The protocol saves tokens, and it is also the only channel through which a skill's rules reach an executor: a subagent or worker reads its briefing and the files the briefing names, never a skill's `references/` on its own. So a rule meant to BIND an executor is a compact rule (and a component-7 line), not only a reference paragraph: `AGENTS.md` §3 "RULE REACHABILITY", full text in `./orchestration-doctrine.md`. Subagents may still read the full SKILL.md when the compact rules are insufficient (see "Limits" below).
 
 ---
 
 ## The protocol
 
-1. **Build (or read) the registry, once per session.**
-   - At the first significant subagent dispatch (i.e. the first dispatch where `Skills to load` is non-empty), the orchestrator runs `bun scripts/build-skill-registry.ts`.
-   - The script scans `.agents/skills/*/SKILL.md`, extracts compact rules per skill, and writes `.agents/skills/REGISTRY.md`.
-   - If `.agents/skills/REGISTRY.md` already exists AND every `SKILL.md` mtime is older than the registry's mtime, the orchestrator skips the rebuild and reads the cached file directly.
+1. **Read the registry.**
+   - `.agents/skills/REGISTRY.md` is committed. `bun run skills:registry` scans `.agents/skills/*/SKILL.md` (skipping skill folders git ignores, so the file depends only on committed skills), extracts compact rules per skill, and rewrites the file in full on every run.
+   - `bun run skills:registry:check` reports when the committed registry is stale. Rebuild only when it does; otherwise read the file as it is.
 
 2. **Inject `## Project Standards (auto-resolved)` into every briefing.**
    - For each subagent dispatch, the orchestrator picks the relevant skills (see "How orchestrator picks relevant skills" below).
@@ -50,7 +49,7 @@ Per skill, the registry stores one block in this shape:
 - DO NOT: <prohibition>
 - WHEN <condition>: <action>
 - WHEN <condition>: <action>
-- (5 to 15 bullets total — no more)
+- (aim for 5 to 15 bullets; an authored section is carried whole, never truncated)
 
 **Read full SKILL.md when**: <when full read is necessary>
 ```
@@ -75,7 +74,7 @@ Per skill, the registry stores one block in this shape:
 **Read full SKILL.md when**: introducing a new mocking style not covered above, or when the user disputes a TDD verdict.
 ```
 
-The block is at most ~20 lines including blank lines. Anything longer means the orchestrator should consider that skill "too rich for compact" and the subagent must read the full SKILL.md.
+A block aims for at most ~20 lines including blank lines. An AUTHORED block (a `## Compact Rules` section, Strategy A, or a frontmatter `compact_rules:` field) is used whole, with no cap and no truncation, because every binding rule is put there on purpose (AGENTS.md §3 RULE REACHABILITY); a long one costs briefing tokens, never a rule. Only the blind Strategy B scrape is capped (see "Failure modes"), and a capped scrape means the subagent must read the full SKILL.md.
 
 ---
 
@@ -84,11 +83,10 @@ The block is at most ~20 lines including blank lines. Anything longer means the 
 Heuristic, applied per dispatch in order of priority:
 
 1. **Explicit skill mentions in the briefing.** If `Skills to load` lists `/unit-testing`, the registry block for `unit-testing` is included verbatim.
-2. **User-named slugs.** If the user says "use sprint-development for this", the orchestrator includes `sprint-development` even if no skill is loaded.
-3. **Name-match heuristic on the Goal + Context.** The orchestrator scans the dispatch's `Goal` and `Context docs` paths for known skill slugs. Match → include. (E.g. a goal that says "scaffold the bootstrap" includes `project-bootstrap`.)
-4. **Phase-match.** Each SKILL.md frontmatter declares `phase:` (`bootstrap`, `foundation`, `implementation`, etc.). If the orchestrator's current workflow phase matches the briefing's intent, include skills with that phase.
-5. **Context skills: only the aspect the dispatch touches.** A `metadata.kind: context` skill (slug `<aspect>-context`) is injected when the dispatch's Goal, Context docs or touched files name its aspect: a task that writes API tests or reads `.context/business/business-api-map.md` gets `api-context`; one that seeds or asserts on data gets `data-context`; one that must explain or apply the methodology gets `iql-context`. Never all of them: the resolver is a token-saving protocol, and a subagent that touches one aspect pays for one. The relevance call is the orchestrator's, so a dispatch that names no aspect gets no context skill; when in doubt, name the aspect in the Goal.
-6. **Cap at 5 skills per briefing.** Beyond five, the briefing becomes too noisy. The orchestrator picks the top 5 by relevance and lists the rest under "Other skills available — load on demand:".
+2. **User-named slugs.** A skill the user names for the task is included even if no skill is loaded.
+3. **Name-match heuristic on the Goal + Context.** The orchestrator scans the dispatch's `Goal` and `Context docs` paths for known skill slugs. Match → include.
+4. **Context skills: only the aspect the dispatch touches.** A `metadata.kind: context` skill (slug `<aspect>-context`) is injected when the dispatch's Goal, Context docs or touched files name its aspect, by testing level: a task that seeds or asserts on data, writes SQL or reasons about an entity's lifecycle gets `business-data-context`; one that writes API tests or reasons about endpoints, auth or status codes gets `business-api-context`; one that writes UI / E2E tests, scopes a smoke or explores a user flow gets `business-e2e-context`; one that names or labels domain concepts (authoring an ATP, naming test cases, refining ACs in business vocabulary) gets `business-domain-context`; one that wires the framework to the stack, touches environments, CI or auth-in-tests, or sets performance / NFR budgets gets `infra-context`; one that must explain or apply the methodology gets `iql-context`; a project-owned `<aspect>-context` joins on its own aspect. For a context map skill (`CONTEXT_MAP_SKILLS`, `cli/lib/context-maps.ts`) the briefing injects its read COMMAND (`bun run context:map <slug> --section <id>` when the dispatch touches one entity, journey, endpoint group, term or NFR), never the map file path: the raw HTML is mostly SVG (`./business-context-maps.md` §3). Never all of them: the resolver is a token-saving protocol, and a subagent that touches one aspect pays for one. The relevance call is the orchestrator's, so a dispatch that names no aspect gets no context skill; when in doubt, name the aspect in the Goal.
+5. **Cap at 5 skills per briefing.** Beyond five, the briefing becomes too noisy. The orchestrator picks the top 5 by relevance and lists the rest under "Other skills available — load on demand:".
 
 Skills NOT matched are simply not pasted. The subagent can still load any skill at runtime if the registered rules are insufficient.
 
@@ -96,14 +94,11 @@ Skills NOT matched are simply not pasted. The subagent can still load any skill 
 
 ## Cache invalidation
 
-The registry is regenerated when any of these is true:
+Run `bun run skills:registry` when any of these is true:
 
 - **No registry file** at `.agents/skills/REGISTRY.md`.
-- **A SKILL.md is newer than the registry.** The script compares mtimes; any skill with `mtime > registry.mtime` triggers a full rebuild.
-- **A new skill directory exists under `.agents/skills/`** that the registry does not list.
-- **A skill directory was removed.** The registry still references a skill that no longer has a SKILL.md → rebuild and drop the orphan.
-- **The user runs `bun scripts/build-skill-registry.ts`** explicitly. Manual override always rebuilds.
-- **Session start.** A fresh session always re-checks invalidation conditions before reusing the cache.
+- **`bun run skills:registry:check` reports it stale**: a SKILL.md changed, a skill directory was added, or one was removed since the last build.
+- **The user asks for a rebuild.**
 
 The script is idempotent — re-running it on an unchanged repo produces a byte-identical file.
 
@@ -131,19 +126,19 @@ When a subagent's task hits any of the above, the briefing must explicitly tell 
 | Registry file missing AND build script not present      | Orchestrator inlines the briefing without the auto-resolved section, but flags it as a degraded run.               |
 | Build script errors (e.g. malformed frontmatter)        | Orchestrator continues with stale registry if available; otherwise degraded run as above.                          |
 | Skill has no extractable rules (empty body, no bullets) | Registry emits a stub block: `**Compact Rules**: (none extracted — read full SKILL.md)`. Subagent reads full file. |
-| Compact rule block exceeds 15 bullets                   | Script truncates to 15 + appends `(truncated — read full SKILL.md for the rest)`.                                  |
+| Strategy B scrape finds more than 15 bullets            | Script keeps the first 15 + appends `(truncated — read full SKILL.md for the rest)`. An authored `## Compact Rules` section (Strategy A) or a frontmatter `compact_rules:` field is NEVER truncated, whatever its length. |
 | Subagent dispatched without `## Project Standards`      | Acceptable if the dispatch is trivial (Anti-pattern: quick lookup). Required for any dispatch loading >=1 skill.   |
 
 ---
 
 ## Practical contract for skill authors
 
-**Frontmatter-first (authoritative).** A SKILL.md whose frontmatter carries a `compact_rules:` field owns its registry block outright: the build script uses those rules VERBATIM — no extraction, no 15-rule cap, no truncation — and stamps the entry `source: frontmatter`. Accepted shapes: a YAML list of strings (one rule per item), or a block scalar where each non-empty line is one rule (a leading `- ` is stripped). Use it for skills whose binding doctrine outgrows the extraction cap; the author is then responsible for keeping the field in sync with the body, and `bun run skills:registry` picks changes up on the next rebuild (`skills:registry:check` flags staleness). Without the field, extraction applies as below.
+**Frontmatter-first (authoritative).** A SKILL.md whose frontmatter carries a `compact_rules:` field owns its registry block outright: the build script uses those rules VERBATIM — no extraction, no cap, no truncation — and stamps the entry `source: frontmatter`. Accepted shapes: a YAML list of strings (one rule per item), or a block scalar where each non-empty line is one rule (a leading `- ` is stripped). Use it when the compact block must differ from the body section (a skill whose body has no `## Compact Rules`, or whose binding rules are worded for briefings); the author is then responsible for keeping the field in sync with the body, and `bun run skills:registry` picks changes up on the next rebuild (`skills:registry:check` flags staleness). Without the field, extraction applies as below.
 
 To make a skill registry-friendly, authors SHOULD (but are not required to):
 
 1. Add an explicit `## Compact Rules` (or `## Standards`) section near the top of the SKILL.md body. The build script's Strategy A picks this up verbatim; otherwise it falls back to bullet extraction (Strategy B), which is best-effort.
-2. Keep that section to 5-15 bullets, each starting with `DO:`, `DO NOT:`, or `WHEN <cond>:`.
+2. Aim for 5-15 bullets, each starting with `DO:`, `DO NOT:`, or `WHEN <cond>:`. The section is carried WHOLE, never truncated: every bullet in it reaches every briefing (AGENTS.md §3 RULE REACHABILITY), so a long section costs briefing tokens, not rules.
 3. End the section with a single line `**Read full SKILL.md when**: ...` so the registry passes the trigger through verbatim.
 
 Skills that don't follow this still work — Strategy B extracts whatever bullets it finds. But Strategy A is faster, cleaner, and gives the author full control over what subagents see.

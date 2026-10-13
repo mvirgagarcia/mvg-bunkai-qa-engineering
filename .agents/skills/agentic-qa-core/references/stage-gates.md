@@ -100,12 +100,17 @@ approval to advance, while any CAUTION or NO-GO is signed by a person.
 | **Reporting** | Fills the ATR, writes the QA comment, creates and verifies the traceability links | The workflow transition (`qa_sign_off` / `defect_reported`) | ATR as a Test Execution item, links resolved and verified in direction | **2** | **none** |
 | **Sprint close** | Creates or completes the sprint STR (first-to-arrive creates it, the other completes it), sets its Test Environment, links STR → STP via the `testPlan` edge and STR → RTP (dual membership) | The STP's closure — its final scope/progress and the transition to its terminal state | STR as a Test Execution item carrying its Test Environment, STR → STP and STR → RTP links resolved, STP at its terminal state | **2** | **none** |
 | **Documentation** | Derives scenarios by technique, scores ROI, proposes Candidate / Manual / Deferred, persists only the regression-worthy ones | **Every ROI verdict**, the regression epic, the Test Set | ROI score per scenario; the >50% Candidate/Manual alarm answered | **2** | **recommended** — a second agent re-reads the verdicts against the ATR |
-| **Automation** | Writes `spec.md` + `automation-plan.md`, then KATA code with `@atc`, then runs the three verifiers and opens the PR | The plan **before a line of code**; the merge; the call at the third revision loop | Tests green, types clean, lint clean, `@atc` ids resolving to real tickets, manifest fresh | **2 → 3** inside the approved plan | **required** — `/pr-review-lead` or `/judgment-day`, in a clean context |
+| **Automation** | Writes `spec.md` + `automation-plan.md`, then KATA code with `@atc`, then runs the three verifiers and hands off to `/git-flow-master`, which opens the PR (`/test-automation` never runs git itself) | The plan **before a line of code**; the merge; the call at the third revision loop | Tests green, types clean, lint clean, `@atc` ids resolving to real tickets, manifest fresh | **2 → 3** inside the approved plan | **required** — `/pr-review-lead` or `/judgment-day`, in a clean context |
 | **Regression** | Runs the suite, classifies every failure, computes pass-rate and trend, emits GO / CAUTION / NO-GO, writes the RTR (one per verdict, `testPlan → RTP`); the STR only when the run is the sprint close | The CAUTION verdict; never invents the sprint number | Allure report; ≥5 runs of history before the word FLAKY is allowed (below that: INSUFFICIENT HISTORY); rate computed over the last N = min(10, available); RTR → RTP (STR → STP and STR → RTP at sprint close) | **3** (4 for a clean GO) | **none** |
 | **Observation** | *(agentic routine, no skill)* Watches SLOs, error budget, RUM and canary signals; opens items into the backlog; feeds the next Shift-Left pass | The SLOs and the error-budget policy; the decision to stop releases | Product metrics against the project's own targets | **3** | **n/a** |
 
 Read the table with the DoD checklist of the same stage, not instead of it: the
 DoD is the exit bar, the contract is the operating licence.
+
+The "The person signs" column is also the fourth escalation kind of
+`decision-protocol.md` §5: what it lists for the running stage goes to a person,
+and a technical call inside the approved plan that it does not list is the
+agent's, decided and reported. The protocol changes no Autonomy value.
 
 ### Feedforward and feedback
 
@@ -119,7 +124,7 @@ governed — it is either unguided or uncorrected.
 
 Feedforward is cheap and pre-emptive, feedback is expensive and late, and the two
 trade off against each other. That is why **Automation** — a stage whose
-autonomy reaches 3 — is also the only stage with a mandatory separate verifier:
+autonomy rises from 2 to 3 inside the approved plan — is also the only stage with a mandatory separate verifier:
 more rope on the way in is paid for with a harder check on the way out.
 
 ---
@@ -232,7 +237,8 @@ the stage NEEDS REVISION.
 [ ] QA comment posted; ticket transitioned to the correct status
 [ ] Regression follow-up noted for any regression-worthy bug (Stage-4 hand-off); bug retest (xray):
     repro Test's run recorded PASSED/FAILED in the retest Execution
-[ ] Traceability verified — xray: Story↔ATS (`test` slug, coverage) + ATS membership complete +
+[ ] Traceability verified — xray: Story↔ATS (`test` slug, coverage) + ATS membership complete
+    (Xray membership AND one TC→ATS link per member, `traceability-linking.md` §9) +
     Story↔ATP / Story↔ATR (administrative); native: field/comment containers populated
 [ ] Artifact statuses match §"Lifecycle expectations per stage"; light stage verifier run
 ```

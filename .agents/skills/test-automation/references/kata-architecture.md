@@ -37,12 +37,12 @@ Layer 2 — Base Components
         |
         v
 Layer 1 — TestContext
-    Config, logger, faker, environment accessors
+    Playwright drivers (page, request), config, environment, DataFactory
 ```
 
 | Layer | Responsibility | Typical files |
 |-------|---------------|---------------|
-| 1 — TestContext | Global utilities (config, logger, faker, env) | `TestContext.ts` |
+| 1 — TestContext | Playwright drivers, config, env, DataFactory (faker-backed data) | `TestContext.ts` |
 | 2 — Base | HTTP and Playwright helpers | `ApiBase.ts`, `UiBase.ts` |
 | 3 — Domain | Business logic, ATCs | `UsersApi.ts`, `LoginPage.ts` |
 | 3.5 — Steps | Reusable ATC chains for preconditions | `AuthSteps.ts`, `CheckoutSteps.ts` |
@@ -126,7 +126,7 @@ interface TestContextOptions {
 }
 ```
 
-Responsibilities: select URLs/credentials from `config` based on `TEST_ENV`; expose `faker`; expose environment label; provide shared logger/attachment helpers.
+Responsibilities: hold the Playwright drivers (`page`, `request`); select URLs/credentials from `config` based on `TEST_ENV`; expose the environment label (`env`); expose `DataFactory` (the faker-backed test data, through `data`). It has no logger and no `faker` field of its own: faker lives inside `tests/data/DataFactory.ts`.
 
 Do not put Playwright-specific logic here (belongs in UiBase). Do not put HTTP-specific logic here (belongs in ApiBase).
 
@@ -363,16 +363,25 @@ test('TICKET-ID: should persist session after login', async ({ test }) => {
 
 | Type | What it does | `@atc` |
 |------|-------------|--------|
-| Helper | Retrieves data (read-only, no state change) | No — optional `@step` for tracing |
-| ATC | Performs an action that changes state | Yes — `@atc('TICKET-ID')` |
+| Helper | A GET that only prepares data or reads context another step needs | No — optional `@step` for tracing |
+| ATC | An action that changes state, OR a GET whose response IS the business outcome under test | Yes — `@atc('TICKET-ID')` |
 
-A GET that validates access control (403/401) is still a helper — the ATC is the action that established the context. The GET belongs *inside* the ATC as a verification step.
+The question is whether the GET is the subject of the test case. When the TC's expected result is what a read endpoint returns (the right business data and shape, 401 without auth, 403 for the wrong role, 404 for an unknown id), that GET is an ATC: `api-patterns.md` §5 names one ATC per expected outcome, reads included. A GET that only fetches data for a later step is a helper. A GET that confirms an action's effect belongs *inside* that action's ATC as a verification step. A GET whose only assertion is status 200 verifies no business outcome, so it is a disguised helper, not an ATC (`planning-playbook.md`, "Disguised helpers").
 
 ```typescript
-// WRONG — bare GET as an ATC
-@atc('TICKET-ID') async getCurrentUserUnauthorized() { ... }
+// WRONG — a data-preparation GET wearing @atc (no business outcome asserted)
+@atc('TICKET-ID') async getOrderForCheckout(id: string) { /* status 200 only */ }
 
-// RIGHT — GET embedded inside the real action
+// RIGHT — the GET is the outcome under test (access control on a read endpoint)
+@atc('TICKET-ID')
+async getCurrentUserUnauthorized(): Promise<[APIResponse, ApiErrorResponse]> {
+  const [response, body] = await this.apiGET<ApiErrorResponse>('/auth/me');
+  expect(response.status()).toBe(401);
+  expect(body.error).toBeDefined();
+  return [response, body];
+}
+
+// RIGHT — a GET confirming an action stays inside that action's ATC
 @atc('TICKET-ID')
 async loginWithInvalidCredentials(credentials: LoginPayload) {
   const [loginResp] = await this.apiPOST('/auth/login', credentials);
@@ -621,7 +630,7 @@ Never apply decorators to Layer 2 base methods or private helpers. Detailed trac
 For a project that already has Playwright tests and adopts this boilerplate. One area at a time; the old tests keep running until their replacement is proven.
 
 1. **Find ATC candidates.** Read the current tests for blocks that repeat, map each to a Jira/Xray test case, and start with the most reused. Check `kata-manifest.json` first (Critical Rule #12): the boilerplate may already ship the component.
-2. **Adapt Layers 1-2, do not rewrite them.** `TestContext`, `ApiBase` and `UiBase` ship in `tests/components/`; wire your URLs and credentials through `config/variables.ts` and `.env` (`/adapt-framework` does this).
+2. **Adapt Layers 1-2, do not rewrite them.** `TestContext`, `ApiBase` and `UiBase` ship in `tests/components/`; wire your URLs and credentials through `config/variables.ts` and `.env` (`/test-framework-adaptation` does this).
 3. **Extract the first component.** Pick one functional area, create `{Resource}Api` or `{Page}Page`, move its methods in as ATCs with `@atc('{TICKET-ID}')`, helpers with `@step`.
 4. **Register it in the fixture.** Add it to `ApiFixture` / `UiFixture` (`tests/components/`), then rewrite ONE test to use `{ api }` / `{ ui }` / `{ test }` per the fixture selection table (§7).
 5. **Migrate progressively.** One component per change, legacy tests running in parallel, each new ATC shown to behave like the code it replaces before the legacy code goes. Run `bun run kata:manifest` after each.

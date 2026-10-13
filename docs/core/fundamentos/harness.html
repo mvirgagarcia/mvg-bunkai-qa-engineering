@@ -83,32 +83,32 @@
           <tbody>
             <tr>
               <td>Instrucciones</td>
-              <td>¿Qué reglas valen siempre en este repo?</td>
+              <td>Qué reglas valen siempre en este repo?</td>
               <td>Se cargan al abrir la sesión</td>
             </tr>
             <tr>
               <td>Skills</td>
-              <td>¿Cómo se hace esta tarea concreta?</td>
+              <td>Cómo se hace esta tarea concreta?</td>
               <td>Bajo demanda, cuando la tarea coincide con su trigger</td>
             </tr>
             <tr>
               <td>Hooks</td>
-              <td>¿Qué tiene que pasar sí o sí en cierto momento?</td>
+              <td>Qué tiene que pasar sí o sí en cierto momento?</td>
               <td>En eventos del harness (por ejemplo, antes de procesar cada prompt)</td>
             </tr>
             <tr>
               <td>MCP</td>
-              <td>¿A qué sistemas externos puede llegar el agente?</td>
+              <td>A qué sistemas externos puede llegar el agente?</td>
               <td>Cuando el modelo llama a una tool del servidor</td>
             </tr>
             <tr>
               <td>Memoria</td>
-              <td>¿Qué aprendimos en sesiones anteriores?</td>
+              <td>Qué aprendimos en sesiones anteriores?</td>
               <td>Entre sesiones; sobrevive al cierre de la ventana de contexto</td>
             </tr>
             <tr>
               <td>Gates</td>
-              <td>¿Sigue todo lo anterior siendo coherente?</td>
+              <td>Sigue todo lo anterior siendo coherente?</td>
               <td>Antes de un commit, antes de un push y en CI</td>
             </tr>
           </tbody>
@@ -129,9 +129,14 @@
 
       <h2 id="una-fuente">Una fuente, adaptadores finos</h2>
       <p>
-        Este repo funciona en tres harnesses. La tentación obvia sería mantener tres copias de todo
-        (un <code>CLAUDE.md</code> con las reglas, otras en la configuración de OpenCode, otras para
-        Codex). Cada copia empezaría igual y a la tercera semana diría algo distinto.
+        Este repo funciona en tres harnesses. Un proyecto puede declarar solo los que usa en
+        <code>harnesses:</code> (<code>.agents/project.yaml</code>): los gates revisan solo esos, y
+        el boilerplate siempre revisa los tres
+        (<code>.context/ADR/ADR-0012-declared-harnesses.md</code>,
+        <code>.agents/instructions/agent-harnesses.md</code>). La tentación obvia sería mantener
+        tres copias de todo (un <code>CLAUDE.md</code> con las reglas, otras en la configuración de
+        OpenCode, otras para Codex). Cada copia empezaría igual y a la tercera semana diría algo
+        distinto.
       </p>
       <p>
         La alternativa es tener un solo cuerpo de instrucciones y skills, y dejar en cada host un
@@ -139,6 +144,18 @@
         MCP y la API de hooks. <code>AGENTS.md</code> es un formato abierto que OpenCode y Codex
         leen de forma nativa; Claude Code lee <code>CLAUDE.md</code>, así que en este repo ese
         archivo contiene una sola línea, <code>@AGENTS.md</code>, que importa el original.
+      </p>
+      <p>
+        Ese cuerpo está en capas. <code>AGENTS.md</code> carga en cada sesión y guarda solo lo que
+        ata en cada turno, más un router; cada tema vive en su propio archivo bajo
+        <code>.agents/instructions/</code> y se lee cuando el router, o una línea
+        <code>ROUTE:</code> del hook, lo nombra. Así ningún host paga en cada sesión lo que no usa,
+        y Codex, que corta las instrucciones del proyecto en su tope de bytes, recibe el archivo
+        entero. El mecanismo está en el deck
+        <a
+          href="https://upex-galaxy.github.io/agentic-qa-boilerplate/decks/progressive-disclosure/how-it-works.es.html"
+          >Progressive disclosure</a
+        >.
       </p>
 
       <figure class="harness-fig">
@@ -368,7 +385,8 @@
 
       <h2 id="este-repo">Así lo hace este repo</h2>
       <p>
-        La sección 4.5 de <code>AGENTS.md</code> describe el contrato completo. Este es el mapa por
+        La sección 4.5, en <code>.agents/instructions/agent-harnesses.md</code> (el router de
+        <code>AGENTS.md</code> la nombra), describe el contrato completo. Este es el mapa por
         superficie:
       </p>
       <div class="table-wrap">
@@ -384,9 +402,12 @@
           <tbody>
             <tr>
               <td>Instrucciones</td>
-              <td><code>CLAUDE.md</code> (generado, importa <code>AGENTS.md</code>)</td>
-              <td><code>AGENTS.md</code></td>
-              <td><code>AGENTS.md</code></td>
+              <td>
+                <code>CLAUDE.md</code> (generado, importa <code>AGENTS.md</code>), más las secciones
+                de <code>.agents/instructions/</code> a pedido
+              </td>
+              <td><code>AGENTS.md</code>, más las secciones a pedido</td>
+              <td><code>AGENTS.md</code>, más las secciones a pedido</td>
             </tr>
             <tr>
               <td>Skills</td>
@@ -413,12 +434,29 @@
       <h3 id="hook-unico">Un emisor, tres adaptadores</h3>
       <p>
         El texto del hook vive una sola vez, en <code>.agents/hooks/personality-reinject.mjs</code>.
-        En cada prompt reinyecta el contrato de estilo de salida para que no se diluya en una sesión
-        larga, agrega una línea <code>AGENT IDENTITY:</code> (worktree, sesión y harness, que luego
-        terminan en los trailers de cada commit) y avisa si falta el <code>.env</code>. Claude Code
-        y Codex lo ejecutan como hook de comando en el evento <code>UserPromptSubmit</code>.
+        En cada prompt agrega una línea <code>AGENT IDENTITY:</code> (worktree, sesión y harness,
+        que luego terminan en los trailers de cada commit), avisa si falta el <code>.env</code> y
+        clasifica el pedido contra el router de <code>AGENTS.md</code>: por cada sección que el
+        pedido necesita y la sesión todavía no leyó, suma una línea
+        <code>ROUTE: read &lt;archivo&gt;</code>, con un tope de pocas por pedido: el resto va en
+        una sola línea <code>ROUTE-OPTIONAL:</code> que no obliga. Claude Code y Codex lo ejecutan
+        como hook de comando en el evento <code>UserPromptSubmit</code>, y un
+        <code>SessionStart</code> con matcher <code>compact</code> o <code>clear</code> re-arma las
+        rutas después de compactar o de un <code>/clear</code>. En Claude Code, un
+        <code>PostToolUse</code> corre el mismo archivo y, si el agente usa una herramienta sin
+        haber leído lo ruteado, le recuerda una sola vez qué falta (<code>ROUTE-PENDING:</code>).
         OpenCode no tiene hooks de comando, así que su plugin importa las mismas funciones y las
-        empuja al prompt de sistema.
+        empuja al prompt de sistema; en OpenCode 2, que no le pasa el texto del pedido, queda solo
+        el router.
+      </p>
+      <p>
+        Hay un segundo hook, aparte y mucho más chico: <code>.agents/hooks/doc-contracts.mjs</code>.
+        Claude Code y Codex lo corren después de cada edición de archivo (evento
+        <code>PostToolUse</code>). Si la edición cae dentro de una región marcada con
+        <code>LINT.IfChange</code>, suma una línea <code>DOCS:</code> con las páginas que describen
+        ese código, una vez por sesión. Es el aviso; el gate que lo hace cumplir corre en el
+        pre-push y en CI (ver la tabla de abajo). OpenCode no lo registra y depende solo del gate.
+        Vale únicamente en el repo del boilerplate: en un proyecto queda en silencio (ADR-0016).
       </p>
 
       <h3 id="aliases">Una skill, un modo</h3>
@@ -474,7 +512,7 @@
               <td>
                 El shim de <code>CLAUDE.md</code>, el alias de skills, los comandos del proyecto que
                 tapan una skill, los adaptadores de hooks y la paridad de servidores MCP entre los
-                tres formatos
+                formatos de los harnesses en uso
               </td>
             </tr>
             <tr>
@@ -486,16 +524,51 @@
               </td>
             </tr>
             <tr>
+              <td><code>instructions:check</code></td>
+              <td><code>scripts/lint-instructions.ts</code></td>
+              <td>
+                El cuerpo de instrucciones: presupuesto de <code>AGENTS.md</code>, el ROUTER
+                bloqueado detrás de un ADR, el eval del router con pisos de recall y precisión en
+                cada corrida y que cada sección nueva llegue completa
+              </td>
+            </tr>
+            <tr>
+              <td><code>vars:schema:check</code></td>
+              <td><code>scripts/env-schema.ts</code></td>
+              <td>
+                Que <code>.env.core.schema</code> esté al día con el manifiesto y que toda clave con
+                nombre de secreto (TOKEN, SECRET, PASSWORD, API_KEY...) esté marcada
+                <code>@sensitive</code>
+              </td>
+            </tr>
+            <tr>
               <td><code>docs:check</code></td>
               <td><code>scripts/lint-docs.ts</code></td>
               <td>
-                Links relativos rotos, rutas citadas en <code>docs/</code> que no existen y páginas
-                sin <code>&lt;title&gt;</code> o descripción
+                Links relativos rotos (también los links markdown de los <code>.md</code> de
+                <code>.agents/</code>, <code>.context/</code> y <code>.claude/</code>), rutas
+                citadas en <code>docs/</code> que no existen y páginas sin
+                <code>&lt;title&gt;</code> o descripción. Corre en cada push y en CI
+              </td>
+            </tr>
+            <tr>
+              <td>contratos de docs</td>
+              <td><code>scripts/lint-doc-contracts.ts</code></td>
+              <td>
+                Que un cambio dentro de una región <code>LINT.IfChange</code> llegue con todas las
+                páginas que nombra su <code>LINT.ThenChange</code>, o con un commit que diga
+                <code>Docs-Checked: &lt;label&gt; &lt;motivo&gt;</code>. Avisa en el commit, bloquea
+                en el push y en CI. Solo en el repo del boilerplate (ADR-0016)
               </td>
             </tr>
           </tbody>
         </table>
       </div>
+      <p>
+        Aparte de los gates, <code>bun run instructions:audit</code> mide en las transcripciones
+        locales de Claude Code cuántas de las secciones que el hook ruteó leyó de verdad el agente
+        (solo nombres y conteos, nunca contenido).
+      </p>
       <p>
         No todos corren en todos lados. Qué corre en cada hook está en
         <code>.husky/framework-gates.sh</code>: el pre-push corre un subconjunto amplio, el
@@ -514,17 +587,20 @@
         </p>
         <p>
           <strong>Confiar en que el MCP avisa si falta una variable.</strong> Si una variable de
-          <code>.env</code> no está definida, Claude Code pasa el texto literal <code>${VAR}</code>,
-          OpenCode pasa un string vacío, y el servidor muere más tarde, en su primera llamada
-          autenticada. Solo Codex falla al arrancar. Un 401 o una tool que falla sin explicación
-          casi siempre es eso: corrige el <code>.env</code> y reinicia la sesión, porque las
-          variables se leen cuando el harness levanta los servidores.
+          <code>.env</code> no está definida, el loader de <code>.env</code> arranca el servidor sin
+          ella en los tres harnesses, y el servidor muere más tarde, en su primera llamada
+          autenticada. Ninguno falla al arrancar. Un 401 o una tool que falla sin explicación casi
+          siempre es eso: corrige el <code>.env</code> y reinicia la sesión, porque las variables se
+          leen cuando el harness levanta los servidores.
         </p>
         <p>
-          <strong>Lanzar el binario pelado.</strong> <code>bun run claude</code>,
-          <code>bun run opencode</code> y <code>bun run codex</code> envuelven al harness con
-          <code>dotenv -o -e .env</code>, que hace que el <code>.env</code> gane sobre una variable
-          heredada del shell. Sin eso, un valor viejo en tu terminal puede tapar el archivo.
+          <strong>Exportar una variable del proyecto en tu shell.</strong> El harness se abre tal
+          cual (<code>claude</code>, <code>opencode</code>, <code>codex</code> o su app de
+          escritorio) y cada servidor MCP lee <code>.env</code> por su cuenta. Pero una variable que
+          exportaste tú en el perfil de tu shell gana sobre el archivo en todo lo que arranques
+          desde esa terminal, y un valor viejo ahí tapa el <code>.env</code> corregido sin avisar.
+          <code>bun run vars:env:check</code> te dice cuál (solo el nombre y el largo): quítala del
+          perfil o abre una terminal limpia.
         </p>
       </div>
 
@@ -576,7 +652,8 @@
         Páginas relacionadas: <a href="context.html">Context engineering</a> ·
         <a href="orquestacion.html">Orquestación</a> ·
         <a href="agentic-dev.html">Agentic development</a> ·
-        <a href="../setup/index.html">Setup</a>. Fuente canónica: <code>AGENTS.md</code> §4.5 y
+        <a href="../setup/index.html">Setup</a>. Fuente canónica:
+        <code>.agents/instructions/agent-harnesses.md</code> y
         <code>cli/lib/agent-compatibility-contracts.ts</code>.
       </footer>
     </article>

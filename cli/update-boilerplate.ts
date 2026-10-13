@@ -8,25 +8,28 @@
  */
 
 import type { CompatibilityCheck } from './lib/agent-compatibility.ts';
+import type { UpdaterUi } from './lib/ui/updater-run.ts';
 import type { ProtectedWatchEntry } from './lib/updater-drift';
 import type { HarnessMigrationResult } from './lib/updater-harness-migration.ts';
-import type { GateResult, HeldBackComponent, ParityFinding, ParityReport } from './lib/updater-parity';
+import type { GateResult, HeldBackComponent, InstructionRowInput, ParityFinding, ParityReport } from './lib/updater-parity';
 import type { PbiCacheFact } from './lib/updater-pbi';
 import type { Component, DeprecatedFile, ReportSink, RunSummary, UpdaterConfig } from './lib/updater-types';
+import type { PreflightCheck, PreflightResult } from './preflight.ts';
 import { execSync, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
+
 import * as os from 'node:os';
 import * as path from 'node:path';
-
 import pc from 'picocolors';
 import { checkAgentCompatibility, repairAgentSurfaces, SHADOWING_COMMANDS_BACKUP_DIR, SKILLS_ALIAS_DEFERRED_MARKER } from './lib/agent-compatibility.ts';
 import { applyInsertions, planInsertions, projectDelta, SCHEMA_FILE, SCHEMA_SOURCE } from './lib/agents-schema.ts';
+import { declaredHarnesses, isUnderAny, unusedHarnessPaths } from './lib/harness-selection.ts';
 import * as tui from './lib/tui';
+import { startUpdaterUi } from './lib/ui/updater-run.ts';
 import {
+  buildPairedDiff,
   cleanupTempDir,
   createBackupDir,
-  detectGitVersion,
-  gitVersionMeetsMin,
   isLocalTemplateSource,
   LAST_APPLY_FILE,
   readSyncState,
@@ -48,6 +51,18 @@ import {
 } from './lib/updater-harness-migration.ts';
 import { groupIgnoreLines } from './lib/updater-ignore';
 import {
+  deliverProjectInstructions,
+  INSTRUCTIONS_COMPONENT,
+  INSTRUCTIONS_DIR,
+  LEGACY_PROJECT_INSTRUCTIONS,
+  moveLegacyProjectInstructions,
+  PROJECT_INSTRUCTIONS,
+  PROJECT_INSTRUCTIONS_TEMPLATE,
+  RETIRED_SECTION_FILES,
+  runLegacyMigrationCheck,
+} from './lib/updater-instructions';
+import {
+  ABORTED_OUTRO,
   archivedSkillsToReport,
   collectParityFindings,
   PARITY_PROMPT_PATH,
@@ -58,8 +73,10 @@ import {
   runVerdict,
 } from './lib/updater-parity';
 import { makePbiCacheMigrationHook } from './lib/updater-pbi';
-import { CLAUDE_SETTINGS_FILE, mergeAllowList } from './lib/updater-settings';
+import { CLAUDE_SETTINGS_FILE, formatHookCommand, mergeHookGroups, mergePermissionLists, readDeclinedDenies, readDeclinedHooks } from './lib/updater-settings';
 import { parseDotEnvExampleKeys, requiredNow, VAR_MANIFEST } from './lib/variables-manifest.ts';
+import { checkoutRoots } from './lib/worktree.ts';
+import { plainMsg, runUpPreflight } from './preflight.ts';
 
 // --- CONFIGURATION ---
 // Not tied to the lock schema (`schemaVersion: 7` stays): it stamps the lock's
@@ -97,6 +114,16 @@ const CONFIG_CORE_FILES = ['variables.core.ts'];
 // against a template frozen at scaffold time and reports nothing to do.
 const AGENTS_DOCS_FILES = ['README.md', 'project.schema.yaml'];
 const ENV_TEMPLATE_FILES = ['.env.example'];
+// The gitignored files a Claude Code or Codex-managed worktree copies in.
+const WORKTREE_INCLUDE_FILES = ['.worktreeinclude'];
+// Orca's committed repo hooks: provision a new worktree, audit it before removal.
+const ORCA_CONFIG_FILES = ['orca.yaml'];
+// The playwright-cli launch defaults (in memory, headless; ADR-0008). Delivered
+// ONCE when missing, then project-owned: a project may tune the viewport,
+// timeouts or test-id attribute. A copy that still carries the old shared
+// on-disk profile gets an informational parity row instead of an overwrite
+// (`legacyPlaywrightProfileKeys` in cli/lib/updater-parity.ts).
+const PLAYWRIGHT_CLI_CONFIG_FILES = ['cli.config.json'];
 // The varlock env schema, in two halves like `config/variables{.core,}.ts`:
 // `.env.core.schema` is GENERATED from cli/lib/variables-manifest.ts by
 // `bun run vars:schema` and plainly synced; `.env.schema` imports it, carries
@@ -185,10 +212,40 @@ export const RETIRED_COMMAND_WRAPPERS: DeprecatedFile[] = [
   }))),
 ];
 
+// Skills renamed or retired upstream: a renamed skill's new folder arrives
+// through the `skills` component, the old one leaves here. `cleanupDeprecated`
+// also removes the folders it empties, because a skill folder with no SKILL.md
+// fails skills:check.
+const RENAMED_SKILL_REASON = 'skill renamed to test-framework-adaptation (same workflow, new name)';
+const RETIRED_SYNC_REASON = 'skill retired: bun run docs:check gates the skill router and quoted scripts; framework-development and test-framework-adaptation close the docs';
+export const RETIRED_SKILL_FILES: DeprecatedFile[] = [
+  ...[
+    '.agents/skills/adapt-framework/SKILL.md',
+    '.agents/skills/adapt-framework/references/adaptation-workflow.md',
+  ].map(path => ({ path, component: 'skills', reason: RENAMED_SKILL_REASON, deprecatedSince: '8.5' })),
+  ...[
+    '.agents/skills/sync-ai-context/SKILL.md',
+    '.agents/skills/sync-ai-context/references/sync.md',
+  ].map(path => ({ path, component: 'skills', reason: RETIRED_SYNC_REASON, deprecatedSince: '8.5' })),
+];
+
+// The instruction sections once carried a number (`80-git.md`): the renamed
+// files arrive through the `instructions` component, the numbered copies leave
+// here, each saved to `.backups/` first because a project may have kept a merge
+// in one (`updater.protected_paths`).
+export const DEPRECATED_FILES: DeprecatedFile[] = [...RETIRED_COMMAND_WRAPPERS, ...RETIRED_SKILL_FILES, ...RETIRED_SECTION_FILES];
+
 export const COMPONENTS: Component[] = [
   // `skills` stays its own component (not folded into `agent-compatibility` as
-  // upstream dev does): `bun run up skills --skill a,b` narrows it by subdirectory.
+  // upstream dev does): `bun sync skills --skill a,b` narrows it by subdirectory.
   { name: 'skills', type: 'directory', paths: [SKILLS_CANONICAL_DIR] },
+  // The progressive-disclosure sections behind the AGENTS.md ROUTER. Synced
+  // like a skill (overwrite, `.backups/` copy, an "overwritten edit" row,
+  // `updater.protected_paths` to keep a merge), EXCEPT `agent-project.md`: that one
+  // is the project's own (excludePaths below) and arrives once, written from
+  // the generic `agent-project.md.template` this component ships
+  // (`deliverProjectInstructions`, afterApply).
+  { name: INSTRUCTIONS_COMPONENT, type: 'directory', paths: [INSTRUCTIONS_DIR] },
   // One source, three harnesses: the hook emitter and the OpenCode hook
   // adapter. `.claude/skills` is NOT here: it is the generated alias, rebuilt
   // by the afterApply compatibility hook. The `commands` component (the alias
@@ -205,8 +262,8 @@ export const COMPONENTS: Component[] = [
   { name: 'docs', type: 'directory', paths: [...DOCS_SHIPPED_PATHS, ...DOCS_LEGACY_PATHS] },
   { name: 'cli', type: 'directory', paths: ['cli'] },
   { name: 'vscode', type: 'directory', paths: ['.vscode'] },
-  // `.husky/pre-commit` and `.husky/pre-push` are on PROTECTED_WATCHLIST (the
-  // project's gates and their ordering live there): delivered once when missing,
+  // `.husky/pre-commit`, `.husky/pre-push` and `.husky/commit-msg` are on
+  // PROTECTED_WATCHLIST (the project's gates and their ordering live there): delivered once when missing,
   // never overwritten. Everything else under `.husky/` keeps syncing — which is
   // exactly how `framework-gates.sh` reaches a project scaffolded earlier: the
   // gates upstream owns sit in that synced file, and each hook sources it.
@@ -219,6 +276,13 @@ export const COMPONENTS: Component[] = [
   // afterApply hook can only diff against an `.env.example` we have shipped.
   { name: 'env-template', type: 'file-list', paths: ['.'], files: ENV_TEMPLATE_FILES },
   { name: 'env-schema', type: 'file-list', paths: ['.'], files: ENV_SCHEMA_FILES },
+  // Delivered once when missing, then project-owned: a project appends its own
+  // gitignored inputs, and a later sync must not drop them. Without it a
+  // Codex-managed worktree starts with no `.env`, and every MCP loader in
+  // `.codex/config.toml` with it.
+  { name: 'worktree-include', type: 'file-list', paths: ['.'], files: WORKTREE_INCLUDE_FILES, bootstrapOnly: true },
+  { name: 'orca-config', type: 'file-list', paths: ['.'], files: ORCA_CONFIG_FILES, bootstrapOnly: true },
+  { name: 'playwright-cli-config', type: 'file-list', paths: ['.playwright'], files: PLAYWRIGHT_CLI_CONFIG_FILES, bootstrapOnly: true },
 ];
 
 // --- ARG PARSE ---
@@ -284,7 +348,11 @@ export function parseArgs(args: string[]): ParsedArgs {
     }
     else if (aliases[a]) { out.commands.push(aliases[a]); }
     else if (valid.has(a)) { out.commands.push(a); }
+    // The page flags are read by cli/lib/ui/env-detect.ts.
+    else if (a === '--headless' || a === '--ui') { /* known */ }
     else if (!a.startsWith('-')) { tui.log.error(`Comando/componente desconocido: ${a}. Usa --help para ver los validos.`); process.exit(1); }
+    // An unknown flag used to be ignored, so `--dryrun` ran a REAL sync (analysis §8 #28).
+    else { tui.log.error(`Opción desconocida: ${a}. Usa --help para ver las válidas.`); process.exit(1); }
   }
   return out;
 }
@@ -294,7 +362,7 @@ const HELP_TEXT = `
 UPEX QA Boilerplate Updater v${CLI_VERSION} — Ayuda
 
 USO:
-  bun up [comando] [flags]
+  bun sync [comando] [flags]
 
 COMPONENTES: ${COMPONENTS.map(c => c.name).join(', ')}
 ATAJOS:      all, rollback, help
@@ -331,11 +399,17 @@ REPORTE DE PARIDAD (al final de cada corrida, incluido --dry-run):
   portar (lo que upstream agrego) y que conservar (lo que solo tiene el
   proyecto). Los archivos protegidos (AGENTS.md, .agents/project.yaml,
   .mcp.json, opencode.jsonc, .codex/config.toml, .claude/settings.json,
-  .husky/pre-commit, .husky/pre-push, allurerc.mjs, playwright.config.ts, las
+  .husky/pre-commit, .husky/pre-push, .husky/commit-msg, allurerc.mjs, playwright.config.ts, las
   bases KATA de tests/components/, los workflows de CI, …) nunca se
   sobrescriben: solo aparecen en ese reporte. .claude/settings.json, .codex/ y
-  los hooks de .husky/ se entregan UNA vez si faltan. El proyecto suma sus
-  propias rutas protegidas en .agents/project.yaml -> updater.protected_paths
+  los hooks de .husky/ se entregan UNA vez si faltan. De .claude/settings.json
+  solo crecen permissions.allow, permissions.deny y hooks (se agrega lo que
+  upstream tiene y falta, nunca se quita; un hook que falta llega como grupo
+  nuevo, antes del chequeo de compatibilidad); una regla deny que el proyecto
+  no quiere va en updater.declined_denies, un comando de hook en
+  updater.declined_hooks. A opencode.jsonc nunca se le escribe: las reglas
+  deny que le faltan salen como bloque para pegar en el reporte. El proyecto
+  suma sus propias rutas protegidas en .agents/project.yaml -> updater.protected_paths
   (archivos sincronizados que fusiono a mano): mismo trato que la lista de
   upstream. Un archivo sincronizado que el proyecto habia editado y la corrida
   sobrescribio gana una fila (backup en .backups/) que dice como protegerlo.
@@ -377,6 +451,17 @@ SIN TTY:
   asume --auto y lo avisa en una linea, en vez de quedarse esperando en el
   multi-select de la Fase 3.
 
+PAGINA LOCAL (en una terminal con pantalla):
+  La corrida se ve en una pagina local (127.0.0.1, con token) que abre sola:
+  chequeo previo, fases, cada pregunta como tarjeta con sus diffs, y el
+  reporte final. La terminal sigue mostrando el log; si ninguna pagina se
+  conecta en 10 s, las preguntas siguen en la terminal. Con --auto la pagina
+  es de solo lectura. Nunca se abre en CI, sin TTY, desde un agente ni por SSH
+  sin pantalla. Al terminar guarda una copia en .session/runs/up-*.html.
+  --headless             Sin pagina: el flujo de terminal de siempre
+  --ui                   Abre la pagina aunque las reglas digan que no (SSH con
+                         tunel, una terminal manejada por un agente)
+
 FLAGS:
   --auto                 Modo no-interactivo: sincroniza TODO el boilerplate
                          (copia archivos nuevos + sobreescribe divergencias con
@@ -411,36 +496,35 @@ ENV:
                          un consumidor.
 
 EJEMPLOS:
-  bun up                                 # Flujo interactivo (5 fases)
-  bun up skills                          # Solo agent skills
-  bun up skills --skill a,b,c            # Skills especificos
-  bun up --list                          # Listar skills disponibles
-  bun up scripts docs                    # Multiples componentes
-  bun up codex-config                    # Solo el adaptador de Codex
-  bun up --auto                          # CI mode (seguro, preserva lo tuyo)
-  bun up --force                         # Forzar todo del upstream (sin preguntar)
-  bun up --dry-run                       # Preview (con el updater nuevo si hay self-update)
-  bun up --auto --strict                 # CI: falla si queda un contrato roto
-  bun up --auto --no-gates               # Sin gates al final
-  bun up --rollback                      # Restaurar backup
+  bun sync                               # Flujo interactivo (5 fases)
+  bun sync skills                        # Solo agent skills
+  bun sync skills --skill a,b,c          # Skills especificos
+  bun sync --list                        # Listar skills disponibles
+  bun sync scripts docs                  # Multiples componentes
+  bun sync codex-config                  # Solo el adaptador de Codex
+  bun sync --auto                        # CI mode (seguro, preserva lo tuyo)
+  bun sync --force                       # Forzar todo del upstream (sin preguntar)
+  bun sync --dry-run                     # Preview (con el updater nuevo si hay self-update)
+  bun sync --auto --strict               # CI: falla si queda un contrato roto
+  bun sync --auto --no-gates             # Sin gates al final
+  bun sync --rollback                    # Restaurar backup
 `;
 
-// --- PREREQ ---
-function ensureGitVersion(): void {
-  try {
-    const v = detectGitVersion();
-    if (!gitVersionMeetsMin(v)) {
-      tui.log.error(`git ${v.raw} detectado. Se requiere git >= 2.25.0.`);
-      process.exit(2);
-    }
-  }
-  catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    tui.log.error(msg === 'GIT_NOT_FOUND' ? 'git no encontrado. Se requiere git >= 2.25.' : `git: ${msg}`);
-    process.exit(2);
-  }
+// --- RENAMED COMMAND ---
+// The updater was `bun up` until 2026-10 and is `bun sync` now. `up` stays a
+// hidden alias: a project whose package.json only has `up` runs it once, and
+// the `scripts` key sync adds `sync`. The env flag keeps the self-update
+// re-exec child, which inherits npm_lifecycle_event, from repeating the line.
+const RENAMED_NOTICE_ENV = 'UPEX_SYNC_RENAME_NOTICED';
+function noticeRenamedCommand(): void {
+  if (process.env.npm_lifecycle_event !== 'up' || process.env[RENAMED_NOTICE_ENV] === '1') { return; }
+  process.env[RENAMED_NOTICE_ENV] = '1';
+  tui.log.info('Este comando ahora se llama `bun sync`; `bun up` sigue funcionando como alias.');
 }
 
+// --- PREREQ ---
+// The git version, gh session and network checks of a run live in the preflight
+// (`cli/preflight.ts`); `--list` still needs the gh check on its own.
 async function validatePrerequisites(): Promise<void> {
   if (isLocalTemplateSource(TEMPLATE_REPO)) { return; } // plain `git clone`, no gh session involved
   try { execSync('gh --version', { stdio: 'ignore' }); }
@@ -506,13 +590,27 @@ interface RunFacts {
   promptKept: boolean
   /** `.context/PBI/` paths still tracked in git, and where the migration recipe was saved. */
   pbiCache: PbiCacheFact | null
-  /** Permission allow-list entries the additive merge added to `.claude/settings.json`. */
+  /** Permission allow-list entries the additive merge added to `.claude/settings.json` (on --dry-run: would add). */
   allowListAdded: string[]
+  /** `permissions.deny` entries the same merge appended (on --dry-run: would append). */
+  denyListAdded: string[]
+  /** Upstream deny entries left out because the project lists them in `updater.declined_denies`. */
+  denyListDeclined: string[]
+  /** Hook commands the additive hook merge appended to `.claude/settings.json`, formatted (on --dry-run: would append). */
+  hooksAdded: string[]
+  /** Upstream hook commands left out because the project lists them in `updater.declined_hooks`. */
+  hooksDeclined: string[]
+  /** Upstream hook commands left out because the script they run is missing in the project. */
+  hooksSkipped: string[]
+  /** Keys `.claude/settings.json` repeated (a git auto-merge), folded into one list (on --dry-run: would fold). */
+  settingsDuplicatesFolded: string[]
   /** One-line evidence for the unresolved-doctrine ledger row, when AGENTS.md carries debt. */
   doctrineDebt: string | null
+  /** Rows about the instruction sections: the `agent-project.md` stub delivery and a pre-split AGENTS.md. */
+  instructionRows: InstructionRowInput[]
   parity: { findings: ParityFinding[], report: ParityReport } | null
 }
-const runFacts: RunFacts = { compat: null, envNewKeys: [], migration: null, migrationPlanned: false, aliasDeferred: false, shadowingCommandsMoved: [], gates: [], gatesSkippedReason: null, promptKept: false, pbiCache: null, allowListAdded: [], doctrineDebt: null, parity: null };
+const runFacts: RunFacts = { compat: null, envNewKeys: [], migration: null, migrationPlanned: false, aliasDeferred: false, shadowingCommandsMoved: [], gates: [], gatesSkippedReason: null, promptKept: false, pbiCache: null, allowListAdded: [], denyListAdded: [], denyListDeclined: [], hooksAdded: [], hooksDeclined: [], hooksSkipped: [], settingsDuplicatesFolded: [], doctrineDebt: null, instructionRows: [], parity: null };
 
 // --- ENV-VAR DRIFT DETECTION (afterApply hook) ---
 //
@@ -521,7 +619,7 @@ const runFacts: RunFacts = { compat: null, envNewKeys: [], migration: null, migr
 // `.env.example` declares against what the target already has locally (`.env` +
 // local `.env.example`) and surface any upstream-added keys the target is missing.
 //
-// D3: this only PRINTS and OFFERS to run `bun run setup --variables` — it NEVER
+// D3: this only PRINTS and OFFERS to run `bun setup --variables` — it NEVER
 // auto-runs the remote push, and in non-interactive / CI mode it just prints
 // the warning (no prompt, no action).
 
@@ -581,66 +679,132 @@ async function detectEnvVarDrift(
 
   // CI / non-interactive: print only — never prompt, never touch remote (D3).
   if (nonInteractive) {
-    sink.step('Modo --auto: ejecuta `bun run setup --variables` manualmente para poblarlas.');
+    sink.step('Modo --auto: ejecuta `bun setup --variables` manualmente para poblarlas.');
     return;
   }
 
   const proceed = await sink.confirm(
-    'Ejecutar `bun run setup --variables` ahora para poblar las variables faltantes?',
+    'Ejecutar `bun setup --variables` ahora para poblar las variables faltantes?',
     false,
   );
   if (!proceed) {
-    sink.step('Omitido. Puedes ejecutar `bun run setup --variables` cuando quieras.');
+    sink.step('Omitido. Puedes ejecutar `bun setup --variables` cuando quieras.');
     return;
   }
 
-  sink.step('Lanzando `bun run setup --variables`…');
+  sink.step('Lanzando `bun setup --variables`…');
   const res = spawnSync('bun', ['run', 'setup', '--variables'], { stdio: 'inherit' });
   if (res.status !== 0) {
-    sink.warn('`bun run setup --variables` terminó con error o fue cancelado.');
+    sink.warn('`bun setup --variables` terminó con error o fue cancelado.');
   }
 }
 
-// --- CLAUDE PERMISSION ALLOW LIST (afterApply hook) ---
+// --- CLAUDE PERMISSION ALLOW + DENY LISTS (afterApply hook) ---
 //
 // `.claude/settings.json` is bootstrap-only AND watched, so a skill shipped
-// upstream used to arrive without the `Skill(<name>)` entry that authorizes it
-// and silently could not be invoked. This merges ONE array additively —
-// `permissions.allow` — and leaves `deny`, `ask`, `hooks`, `env` and every
-// other key exactly as the project wrote them. See `updater-settings.ts` for
-// why removals are deliberately not remembered.
+// upstream used to arrive without the `Skill(<name>)` entry that authorizes it,
+// and a project scaffolded before the secret deny rules never received them.
+// This merges TWO arrays additively, `permissions.allow` and
+// `permissions.deny`, and leaves `ask`, `hooks`, `env` and every other key
+// exactly as the project wrote them. A deny the project does not want is
+// declined by name in `.agents/project.yaml` -> `updater.declined_denies`.
+// See `updater-settings.ts` for why removals are deliberately not remembered.
 //
 // Backup before write, like every other mutation the run makes: the file is on
-// the watchlist, so a consumer who dislikes the addition restores it from
-// `.backups/` and expresses the removal in `deny`.
-function makeAllowListHook(
+// the watchlist, so a consumer who dislikes an addition restores it from
+// `.backups/` and expresses the removal (`deny` for an allow entry,
+// `updater.declined_denies` for a deny entry).
+function makePermissionListHook(
   templateDir: string,
   sink: ReportSink,
   dryRun: boolean,
 ): (summary: RunSummary) => Promise<void> {
   return async (summary: RunSummary): Promise<void> => {
+    // No Claude Code here: its settings file is not this project's (ADR-0012).
+    if (!declaredHarnesses(process.cwd()).harnesses.includes('claude')) { return; }
+    const declined = readDeclinedDenies(process.cwd());
+    if (declined.error) { sink.warn(`${declined.error}; se ignora y se agregan todas las reglas deny de upstream.`); }
+    const { allowAdded, denyAdded, denyDeclined, merged } = mergePermissionLists(process.cwd(), templateDir, { declinedDenies: declined.entries });
+    runFacts.denyListDeclined = denyDeclined;
     if (dryRun) {
-      runFacts.allowListAdded = mergeAllowList(process.cwd(), templateDir).added;
+      runFacts.allowListAdded = allowAdded;
+      runFacts.denyListAdded = denyAdded;
       return;
     }
-    const localPath = path.join(process.cwd(), CLAUDE_SETTINGS_FILE);
-    const { added, merged } = mergeAllowList(process.cwd(), templateDir);
     if (merged === null) { return; }
+    const localPath = path.join(process.cwd(), CLAUDE_SETTINGS_FILE);
     try {
-      // This run's backup dir when it made one; otherwise its own, so the
-      // pre-write backup contract holds even on a run that wrote nothing else.
-      const dir = summary.backupDir ?? createBackupDir(process.cwd());
-      const backupPath = path.join(dir, CLAUDE_SETTINGS_FILE);
-      fs.mkdirSync(path.dirname(backupPath), { recursive: true });
-      fs.copyFileSync(localPath, backupPath);
+      backupSettingsOnce(summary);
       fs.writeFileSync(localPath, merged, 'utf-8');
     }
     catch (err) {
-      sink.warn(`No se pudo fusionar la allow list de ${CLAUDE_SETTINGS_FILE}: ${err instanceof Error ? err.message : String(err)}`);
+      sink.warn(`No se pudieron fusionar los permisos de ${CLAUDE_SETTINGS_FILE}: ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
-    runFacts.allowListAdded = added;
-    sink.step(`Permisos agregados a ${CLAUDE_SETTINGS_FILE}: ${added.length}`);
+    runFacts.allowListAdded = allowAdded;
+    runFacts.denyListAdded = denyAdded;
+    sink.step(`Permisos agregados a ${CLAUDE_SETTINGS_FILE}: ${allowAdded.length} allow, ${denyAdded.length} deny`);
+  };
+}
+
+// The pre-write backup of `.claude/settings.json`, taken ONCE per run: the
+// hook merge and the permission merge both write the file, and a second copy
+// over the first would make `--rollback` restore the half-merged file.
+let settingsBackupTaken = false;
+
+function backupSettingsOnce(summary: RunSummary): void {
+  if (settingsBackupTaken) { return; }
+  // This run's backup dir when it made one; otherwise its own, so the
+  // pre-write backup contract holds even on a run that wrote nothing else.
+  const dir = summary.backupDir ?? createBackupDir(process.cwd());
+  const backupPath = path.join(dir, CLAUDE_SETTINGS_FILE);
+  fs.mkdirSync(path.dirname(backupPath), { recursive: true });
+  fs.copyFileSync(path.join(process.cwd(), CLAUDE_SETTINGS_FILE), backupPath);
+  settingsBackupTaken = true;
+}
+
+// --- CLAUDE HOOK GROUPS (afterApply hook, BEFORE the compatibility hook) ---
+//
+// The same additive merge for `hooks` (`mergeHookGroups`): an upstream hook
+// command the project lacks under the same event and matcher is appended as a
+// new group, and the project's own groups are never touched. It runs before
+// `makeAgentCompatibilityHook` because `agents:compat:check` REQUIRES some of
+// these groups (the route re-surface `PostToolUse` group, the `SessionStart`
+// re-arm groups): run after it, the check would judge the old file and a
+// project would leave the sync failing its own pre-commit. A command the
+// project does not want is declined by exact text in
+// `.agents/project.yaml` -> `updater.declined_hooks`. Only Claude: Codex's
+// `hooks.json` and the OpenCode plugin are framework files the sync rewrites.
+function makeHookMergeHook(
+  templateDir: string,
+  sink: ReportSink,
+  dryRun: boolean,
+): (summary: RunSummary) => Promise<void> {
+  return async (summary: RunSummary): Promise<void> => {
+    if (!declaredHarnesses(process.cwd()).harnesses.includes('claude')) { return; }
+    const declined = readDeclinedHooks(process.cwd());
+    if (declined.error) { sink.warn(`${declined.error}; se ignora y se agregan todos los hooks de upstream.`); }
+    const { added, declined: left, skipped, duplicatesFolded, merged } = mergeHookGroups(process.cwd(), templateDir, { declinedHooks: declined.entries });
+    runFacts.hooksDeclined = left.map(formatHookCommand);
+    runFacts.hooksSkipped = skipped.map(formatHookCommand);
+    if (dryRun) {
+      runFacts.hooksAdded = added.map(formatHookCommand);
+      runFacts.settingsDuplicatesFolded = duplicatesFolded;
+      return;
+    }
+    if (merged === null) { return; }
+    try {
+      backupSettingsOnce(summary);
+      fs.writeFileSync(path.join(process.cwd(), CLAUDE_SETTINGS_FILE), merged, 'utf-8');
+    }
+    catch (err) {
+      sink.warn(`No se pudieron fusionar los hooks de ${CLAUDE_SETTINGS_FILE}: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    runFacts.hooksAdded = added.map(formatHookCommand);
+    runFacts.settingsDuplicatesFolded = duplicatesFolded;
+    if (added.length > 0) { sink.step(`Hooks agregados a ${CLAUDE_SETTINGS_FILE}: ${added.length}`); }
+    if (duplicatesFolded.length > 0) { sink.step(`${CLAUDE_SETTINGS_FILE}: clave(s) repetida(s) unificada(s) en una lista: ${duplicatesFolded.join(', ')}`); }
   };
 }
 
@@ -734,7 +898,7 @@ export function makeAgentCompatibilityHook(
 // (`scripts/kata-manifest.ts`) and the test tree it scans (`tests/`) do travel
 // through the sync. When either changed this run, regenerate the manifest in
 // the consumer repo so the `kata:manifest:check` gate (and the pre-commit
-// staleness check) does not flag it after a routine `bun run up`. Best-effort:
+// staleness check) does not flag it after a routine `bun sync`. Best-effort:
 // a failure warns (e.g. bun missing from PATH), never aborts.
 function makeKataManifestHook(sink: ReportSink): (summary: RunSummary) => Promise<void> {
   return async (summary: RunSummary): Promise<void> => {
@@ -828,7 +992,7 @@ async function backfillProjectYamlFromSchema(
       ? `el bloque \`${gap.block}\` completo (${gap.paths.length} clave(s))`
       : `${gap.paths.length} clave(s) nueva(s) en \`${gap.block}\`: ${gap.paths.join(', ')}`;
     const proceed = await sink.confirm(
-      `Tu \`${SCHEMA_SOURCE}\` no tiene ${what}. ¿Insertarlas ahora? (insert-only — ningún valor tuyo se modifica)`,
+      `Tu \`${SCHEMA_SOURCE}\` no tiene ${what}. Insertarlas ahora? (insert-only — ningún valor tuyo se modifica)`,
       false,
     );
     if (!proceed) { continue; }
@@ -990,7 +1154,7 @@ function makeYamlBackfillHook(
     }
 
     const proceed = await sink.confirm(
-      `Tu \`${spec.consumerRel}\` no tiene el bloque \`${spec.label}\` (estándar de defect-management). ¿Agregarlo ahora? (insert-only — tus valores existentes nunca se modifican)`,
+      `Tu \`${spec.consumerRel}\` no tiene el bloque \`${spec.label}\` (estándar de defect-management). Agregarlo ahora? (insert-only — tus valores existentes nunca se modifican)`,
       false,
     );
     if (!proceed) {
@@ -1059,7 +1223,7 @@ async function listAvailableSkills(): Promise<void> {
   process.stdout.write(`\n${pc.bold('Skills disponibles:')}\n`);
   for (const skill of skills) { process.stdout.write(`  ${pc.cyan(skill)}\n`); }
   process.stdout.write(`\n${pc.dim(`Total: ${skills.length} skill${skills.length === 1 ? '' : 's'}`)}\n`);
-  tui.log.info('Uso: bun run up skills --skill <nombre[,nombre,...]>');
+  tui.log.info('Uso: bun sync skills --skill <nombre[,nombre,...]>');
   cleanupTempDir(TEMP_DIR);
 }
 
@@ -1150,6 +1314,7 @@ const PROTECTED_WATCHLIST: ProtectedWatchEntry[] = [
   // stay watched for what is genuinely theirs: ordering, and their own gates.
   { path: '.husky/pre-commit', reason: 'project gates and their ordering live here; the gates upstream owns come from the synced .husky/framework-gates.sh, so a hook that does not source it never sees another one' },
   { path: '.husky/pre-push', reason: 'project gates and their ordering live here; the gates upstream owns come from the synced .husky/framework-gates.sh, so a hook that does not source it never sees another one' },
+  { path: '.husky/commit-msg', reason: 'project commit-message checks live here (commitlint, ...); the warn-only checks upstream owns (forensic trailers) come from the synced .husky/framework-gates.sh, so a hook that does not source it never sees another one' },
 ];
 
 /**
@@ -1166,7 +1331,10 @@ export function resolveProtectedWatchlist(cwd: string, warn: (message: string) =
   for (const r of declared.rejected) {
     warn(`updater.protected_paths (.agents/project.yaml): entrada ignorada "${r.value}": ${r.reason}.`);
   }
-  return mergeProtectedWatchlist(PROTECTED_WATCHLIST, declared.paths);
+  // A harness the project does not use (ADR-0012): its registries are neither
+  // delivered when missing nor reported when upstream changes them.
+  const unused = unusedHarnessPaths(cwd);
+  return mergeProtectedWatchlist(PROTECTED_WATCHLIST.filter(e => !isUnderAny(e.path, unused)), declared.paths);
 }
 
 // NOT on the watchlist, deliberately — do not "fix" this asymmetry:
@@ -1185,6 +1353,58 @@ export function resolveProtectedWatchlist(cwd: string, warn: (message: string) =
 //  - `CLAUDE.md` is generated too (see GENERATED_PATHS): its only legitimate
 //    content is `@AGENTS.md`, so "drift" there is a defect, not a merge.
 //  - `README.md` is rewritten wholesale per project; an advisory would be noise.
+
+// --- INSTRUCTION SECTIONS (afterApply hook) ---
+//
+// `agent-project.md` is never synced (excludePaths): a project that still has
+// it under its old name `project.md` gets it moved, content kept; a project
+// without either gets the generic stub, once, behind the leak gate. A project still on the pre-split
+// monolith AGENTS.md gets one row mapping its old headings to the sections;
+// its AGENTS.md is never rewritten. Under --dry-run nothing is written.
+function makeInstructionsHook(sink: ReportSink, dryRun: boolean): () => Promise<void> {
+  return async () => {
+    const cwd = process.cwd();
+    runFacts.instructionRows = [];
+    const legacy = moveLegacyProjectInstructions(cwd, { dryRun });
+    if (legacy.kind === 'moved') {
+      sink.step(`${dryRun ? '[dry-run] Se movería' : 'Movido'} \`${LEGACY_PROJECT_INSTRUCTIONS}\` a \`${PROJECT_INSTRUCTIONS}\` (mismo contenido; las secciones ahora se llaman agent-<tema>).`);
+      runFacts.instructionRows.push({
+        path: PROJECT_INSTRUCTIONS,
+        evidence: `informational: ${dryRun ? 'would be' : 'was'} moved from ${LEGACY_PROJECT_INSTRUCTIONS} byte for byte (the instruction sections carry readable agent- names now); still this project's own and never synced`,
+        suggested: 'keep project',
+      });
+    }
+    else if (legacy.kind === 'both') {
+      runFacts.instructionRows.push({
+        path: LEGACY_PROJECT_INSTRUCTIONS,
+        evidence: `both ${LEGACY_PROJECT_INSTRUCTIONS} (old name) and ${PROJECT_INSTRUCTIONS} exist; only the second is read: merge the old file's rules into it by hand, then delete the old one`,
+        suggested: 'merge',
+      });
+    }
+    // A dry-run move left the file under its old name: the stub would not be delivered.
+    const outcome = legacy.kind === 'moved' ? { kind: 'present' as const } : deliverProjectInstructions(cwd, UPSTREAM_DIR, { dryRun });
+    if (outcome.kind === 'delivered') {
+      sink.step(`${dryRun ? '[dry-run] Se crearía' : 'Creado'} \`${PROJECT_INSTRUCTIONS}\` desde la plantilla generica (tus reglas propias van ahi).`);
+      runFacts.instructionRows.push({
+        path: PROJECT_INSTRUCTIONS,
+        evidence: `informational: ${dryRun ? 'would be' : 'was'} delivered once from upstream's generic stub (${PROJECT_INSTRUCTIONS_TEMPLATE}); it is this project's own from now on and never synced`,
+        suggested: 'keep project',
+      });
+    }
+    else if (outcome.kind === 'refused') {
+      sink.warn(`Plantilla de \`${PROJECT_INSTRUCTIONS}\` rechazada: ${outcome.reasons.join('; ')}.`);
+      runFacts.instructionRows.push({
+        path: PROJECT_INSTRUCTIONS_TEMPLATE,
+        evidence: `upstream's stub was NOT delivered, it carries the boilerplate's identity: ${outcome.reasons.join('; ')}; create ${PROJECT_INSTRUCTIONS} by hand (frontmatter id: project) and report the stub upstream`,
+        suggested: 'decide',
+      });
+    }
+    const migration = runLegacyMigrationCheck(cwd, UPSTREAM_DIR);
+    if (migration) {
+      runFacts.instructionRows.push({ path: DOCTRINE_FILE, evidence: migration.evidence, suggested: 'merge', side: 'kept', note: migration.note });
+    }
+  };
+}
 
 /** The PBI cache migration recipe (gitignored, single-use); the parity table carries one row pointing here. */
 const PBI_MIGRATION_PROMPT_PATH = path.join('.agents', 'prompts', 'pbi-cache-migration.md');
@@ -1365,17 +1585,23 @@ function makeParityHook(sink: ReportSink, priorLockSha: string, dryRun: boolean,
     // read-only check stands in, unless the preflight would migrate first
     // (then every contract is expectedly broken and the check says nothing).
     let compatErrors = runFacts.compat?.errors ?? [];
+    let compatWarnings = runFacts.compat?.warnings ?? [];
     if (dryRun && !runFacts.compat) {
       if (runFacts.migrationPlanned) {
         sink.step('[dry-run] Comprobación de compatibilidad omitida: la corrida real migra primero y la evalúa después.');
       }
       else {
-        try { compatErrors = checkAgentCompatibility(cwd).errors; }
+        try {
+          const check = checkAgentCompatibility(cwd);
+          compatErrors = check.errors;
+          compatWarnings = check.warnings;
+        }
         catch (err) { compatErrors = [err instanceof Error ? err.message : String(err)]; }
         // The real run deletes the retired alias wrappers (deprecatedFiles)
         // BEFORE this check; the preview still has them on disk, and the one
-        // whose name is a skill (`adapt-framework`) would read as a command
-        // shadowing it. It is not: it is already on the removal list.
+        // named like a skill the project may still hold (`adapt-framework`,
+        // renamed in the same release) would read as a command shadowing it.
+        // It is not: it is already on the removal list.
         const retired = RETIRED_COMMAND_WRAPPERS.map(d => d.path);
         compatErrors = compatErrors.filter(error => !retired.some(p => error.includes(`: ${p};`)));
       }
@@ -1385,13 +1611,21 @@ function makeParityHook(sink: ReportSink, priorLockSha: string, dryRun: boolean,
       upstreamDir: UPSTREAM_DIR,
       drift: drifted.map(d => ({ path: d.path, reason: d.reason, structural: d.structural === true, source: d.source })),
       compatErrors,
+      compatWarnings,
       archivedSkills,
       archivedSkillsDir,
       heldBack,
       envNewKeys: runFacts.envNewKeys,
       allowListAdded: runFacts.allowListAdded,
+      denyListAdded: runFacts.denyListAdded,
+      denyListDeclined: runFacts.denyListDeclined,
+      hooksAdded: runFacts.hooksAdded,
+      hooksDeclined: runFacts.hooksDeclined,
+      hooksSkipped: runFacts.hooksSkipped,
+      settingsDuplicatesFolded: runFacts.settingsDuplicatesFolded,
       doctrineDebt: runFacts.doctrineDebt,
       doctrineFile: DOCTRINE_FILE,
+      instructionRows: runFacts.instructionRows,
       localEdits: (summary.localEditsOverwritten ?? []).map(edit => ({
         ...edit,
         backupPath: summary.backupDir ? path.join(summary.backupDir, edit.path) : null,
@@ -1499,6 +1733,7 @@ function runHarnessMigration(sink: ReportSink, dryRun: boolean): HarnessMigratio
 
   tui.log.info('Migración cross-harness (Claude → Claude + OpenCode + Codex):');
   for (const line of describeHarnessMigration(plan)) { tui.log.message(`  · ${line}`); }
+  pageNote('info', ['Migración cross-harness (Claude → Claude + OpenCode + Codex):', ...describeHarnessMigration(plan).map(l => `· ${l}`)].join('\n'));
 
   // --dry-run must still SHOW this. Without it the preview would suggest the
   // project's memory is untouched while a real run promotes it to AGENTS.md
@@ -1506,6 +1741,7 @@ function runHarnessMigration(sink: ReportSink, dryRun: boolean): HarnessMigratio
   if (dryRun) {
     if (plan.blockers.length > 0) {
       tui.log.warn(`Bloqueantes que detendrían la migración:\n  - ${plan.blockers.join('\n  - ')}`);
+      pageNote('warn', `Bloqueantes que detendrían la migración: ${plan.blockers.join('; ')}`);
     }
     tui.log.message('  (--dry-run: nada de lo anterior se aplicó. La corrida real lo hace ANTES de sincronizar.)');
     runFacts.migrationPlanned = plan.needed;
@@ -1542,13 +1778,35 @@ function runHarnessMigration(sink: ReportSink, dryRun: boolean): HarnessMigratio
       sink.step(`.gitignore: añadido ${result.ignoredEntriesAdded.join(', ')}.`);
     }
     tui.log.message(`  Copia de seguridad: ${MIGRATION_BACKUP_DIR}/ (gitignored). Revísala antes de borrarla.`);
+    pageNote('info', `Copia de seguridad: ${MIGRATION_BACKUP_DIR}/ (gitignored). Revísala antes de borrarla.`);
     return result;
   }
   catch (error) {
     tui.log.error(error instanceof Error ? error.message : String(error));
-    tui.log.warn('El update se detuvo ANTES de tocar nada. Resuelve lo anterior y vuelve a correr `bun run up`.');
-    process.exit(1);
+    tui.log.warn('El update se detuvo ANTES de tocar nada. Resuelve lo anterior y vuelve a correr `bun sync`.');
+    pageNote('error', error instanceof Error ? error.message : String(error));
+    throw Object.assign(new Error('El update se detuvo ANTES de tocar nada.'), { name: 'UpdaterAbort', exitCode: 1 });
   }
+}
+
+// --- PAGE (installer-ui delivery 2) ---
+/** The page of this run, when it opened; the error handler closes it too. */
+let activeUi: UpdaterUi | null = null;
+/** A line of output that bypasses the sink (migration block), mirrored into the page. */
+function pageNote(level: 'info' | 'warn' | 'error', text: string): void {
+  activeUi?.notice(level, text);
+}
+
+/** Closes the page (summary saved, server stopped) once; safe to call with no page. */
+async function closeUi(status: 'done' | 'done-with-pending' | 'failed' | 'aborted', exit: number): Promise<void> {
+  const ui = activeUi;
+  activeUi = null;
+  if (!ui) { return; }
+  try {
+    const saved = await ui.finish(status, exit);
+    if (saved) { tui.log.info(`Resumen guardado en ${pc.cyan(saved)}`); }
+  }
+  catch { /* closing the page never changes the run's exit */ }
 }
 
 // --- SINK ---
@@ -1559,7 +1817,12 @@ function abortOnCancel<T>(v: T | symbol): T {
   return v;
 }
 
-function buildSink(): ReportSink {
+/**
+ * Today's terminal sink. With the page open it keeps printing every log line
+ * and asks a question only when no page has been connected for 10 s; `signal`
+ * then cancels the prompt the moment the page answers first (owner answer Q6).
+ */
+function buildSink(signal: () => AbortSignal | undefined = () => undefined): ReportSink {
   return {
     phase: (n, label) => tui.phaseHeader(n, label),
     subphase: (label) => {
@@ -1572,7 +1835,7 @@ function buildSink(): ReportSink {
     spinner: () => tui.spinner(),
 
     confirm: async (message, defaultValue = false) => {
-      const r = await tui.confirm({ message, initialValue: defaultValue });
+      const r = await tui.confirm({ message, initialValue: defaultValue, signal: signal() });
       return abortOnCancel<boolean>(r);
     },
 
@@ -1582,7 +1845,7 @@ function buildSink(): ReportSink {
         value: s.name,
         label: `${s.name} (${s.changedCount} cambiados${s.divergedCount > 0 ? `, ${s.divergedCount} divergente${s.divergedCount > 1 ? 's' : ''}` : ''})`,
       }));
-      const r = await tui.multiselect({ message: 'Selecciona componentes a revisar:', options, required: false });
+      const r = await tui.multiselect({ message: 'Selecciona componentes a revisar:', options, required: false, signal: signal() });
       return abortOnCancel<string[]>(r);
     },
 
@@ -1594,13 +1857,14 @@ function buildSink(): ReportSink {
         ? `, +${stats.addedTotal}/-${stats.removedTotal} líneas`
         : '';
       const r = await tui.select({
-        message: `${scope} (${stats.changedCount} archivo(s)${divergedSuffix}${locSuffix}) — ¿como proceder?`,
+        message: `${scope} (${stats.changedCount} archivo(s)${divergedSuffix}${locSuffix}) — cómo proceder?`,
         options: [
           { value: 'all', label: `aceptar todos (${stats.changedCount})` },
           { value: 'pick', label: 'elegir individualmente' },
           { value: 'skip', label: 'saltar scope completo' },
         ],
         initialValue: 'all',
+        signal: signal(),
       });
       return abortOnCancel<string>(r) as 'all' | 'pick' | 'skip';
     },
@@ -1608,7 +1872,7 @@ function buildSink(): ReportSink {
     pickFiles: async (scope, files) => {
       if (files.length === 0) { return []; }
       const options = files.map(f => ({ value: f.entry.path, label: f.label, hint: f.entry.classification }));
-      const r = await tui.multiselect({ message: `Selecciona archivos en ${scope}:`, options, required: false });
+      const r = await tui.multiselect({ message: `Selecciona archivos en ${scope}:`, options, required: false, signal: signal() });
       const selected = new Set(abortOnCancel<string[]>(r));
       return files.filter(f => selected.has(f.entry.path)).map(f => f.entry);
     },
@@ -1638,22 +1902,36 @@ function buildSink(): ReportSink {
         options: opts,
         initialValues,
         required: false,
+        signal: signal(),
       });
       // Expand atomic groups back into their individual lines for the core.
       return abortOnCancel<string[]>(r).flatMap(v => v.split('\n'));
+    },
+
+    pickPackageJsonKeys: async (file, section, keys) => {
+      if (keys.length === 0) { return []; }
+      const r = await tui.multiselect({
+        message: `${file} → ${section}: claves nuevas en upstream (se agregan sin tocar las tuyas):`,
+        options: keys.map(k => ({ value: k.value, label: k.label })),
+        initialValues: keys.filter(k => k.checked).map(k => k.value),
+        required: false,
+        signal: signal(),
+      });
+      return abortOnCancel<string[]>(r);
     },
 
     resolvePackageJsonKey: async (file, section, key, drift) => {
       const body = `=== Tu versión (local) ===\n${drift.localValue}\n\n=== Versión del boilerplate (upstream) ===\n${drift.upstreamValue}`;
       tui.note(body, `${file} → ${section}.${key}`);
       const r = await tui.select({
-        message: `${section}.${key} difiere — ¿qué hacemos?`,
+        message: `${section}.${key} difiere — qué hacemos?`,
         options: [
           { value: 'mine', label: 'Mantener la mía (predeterminado)' },
           { value: 'theirs', label: 'Actualizar a la del boilerplate' },
           { value: 'skip', label: 'Decidir después (preguntar de nuevo)' },
         ],
         initialValue: 'mine',
+        signal: signal(),
       });
       return abortOnCancel<string>(r) as 'theirs' | 'mine' | 'skip';
     },
@@ -1662,19 +1940,20 @@ function buildSink(): ReportSink {
       const body = `=== Cambios upstream ===\n${diff.templateDiff.trim() || '(sin diff)'}\n\n=== Tus cambios locales ===\n${diff.localDiff.trim() || '(sin diff)'}`;
       tui.note(body, `Divergencia en ${entry.path}`);
       const r = await tui.select({
-        message: '¿Como resolver?',
+        message: 'Cómo resolver?',
         options: [
           { value: 'skip', label: 'skip (predeterminado — preservar tu version)' },
           { value: 'theirs', label: 'theirs (descartar locales, usar upstream)' },
           { value: 'mine', label: 'mine (conservar tu version explicitamente)' },
         ],
         initialValue: 'skip',
+        signal: signal(),
       });
       return abortOnCancel<string>(r) as 'skip' | 'theirs' | 'mine';
     },
 
     confirmDelete: async (entry) => {
-      const r = await tui.confirm({ message: `¿Eliminar ${entry.path} localmente? (upstream lo borro)`, initialValue: false });
+      const r = await tui.confirm({ message: `Eliminar ${entry.path} localmente? (upstream lo borro)`, initialValue: false, signal: signal() });
       return abortOnCancel<boolean>(r);
     },
 
@@ -1741,25 +2020,96 @@ function buildSink(): ReportSink {
 }
 
 // --- MAIN ---
+/**
+ * Why the updater must not run from `cwd`, or null when it may.
+ *
+ * Everything the updater keeps between runs is gitignored and cwd-relative:
+ * the `.backups/` that `--rollback` restores, the `.template/` markers and the
+ * doctrine ledger, the single-use prompts under `.agents/prompts/`. Run from a
+ * linked worktree, all of it lands in the worktree and dies with it, and the
+ * next run in the primary sees none of it. So the updater runs in the primary
+ * checkout only.
+ */
+export function worktreeRefusal(cwd = process.cwd()): string | null {
+  const roots = checkoutRoots(cwd);
+  if (roots === null || !roots.linked) { return null; }
+  return 'Este checkout es un worktree. `bun sync` guarda backups (para --rollback), marcadores y prompts '
+    + 'dentro del checkout, y en un worktree se pierden al borrarlo. Ejecuta `bun sync` en el checkout '
+    + `principal: ${roots.primaryRoot}`;
+}
+
 async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
+  noticeRenamedCommand();
 
   if (parsed.help) { process.stdout.write(HELP_TEXT); process.exit(0); }
+  const refusal = worktreeRefusal();
+  if (refusal !== null) {
+    tui.log.error(refusal);
+    tui.outro(ABORTED_OUTRO);
+    process.exit(1);
+  }
   if (parsed.rollback) { rollbackFromBackup(); process.exit(0); }
   if (parsed.listSkills) { await listAvailableSkills(); process.exit(0); }
 
-  ensureGitVersion();
-  await validatePrerequisites();
+  // The page opens on a real terminal with a screen; CI, a pipe, an agent or
+  // SSH keep today's terminal flow, and so does `--headless`. A self-update
+  // re-exec child picks up the page its parent opened (installer-ui plan §5-§6).
+  let terminalSignal: AbortSignal | undefined;
+  const terminalSink = buildSink(() => terminalSignal);
+  try {
+    activeUi = await startUpdaterUi({
+      argv: process.argv.slice(2),
+      repoRoot: process.cwd(),
+      repoName: path.basename(process.cwd()),
+      version: CLI_VERSION,
+      terminal: terminalSink,
+      setTerminalSignal: (sig) => { terminalSignal = sig; },
+      onTerminalCancel: () => {
+        tui.cancel('Aborted by user.');
+        void closeUi('aborted', 130).then(() => process.exit(130));
+      },
+      diffFor: entry => buildPairedDiff(entry, UPSTREAM_DIR, process.cwd()),
+      groupIgnoreLines: lines => groupIgnoreLines(lines),
+      print: line => tui.log.info(line),
+    });
+  }
+  catch (err) {
+    tui.log.warn(`No se pudo abrir la página (${err instanceof Error ? err.message : String(err)}); la corrida sigue en la terminal.`);
+  }
+  const ui = activeUi;
+
+  // PREFLIGHT (installer-ui preflight.md §3): what would fail halfway, in seconds.
+  const migrationRows = (): PreflightCheck[] => {
+    const plan = planHarnessMigration();
+    if (!plan.needed && plan.blockers.length === 0) { return []; }
+    return [{ id: 'harness-migration', group: ui?.lang === 'en' ? 'This machine' : 'Esta máquina', label: ui?.lang === 'en' ? 'Cross-harness migration' : 'Migración cross-harness', value: ui?.lang === 'en' ? 'pending' : 'pendiente', state: 'info', msg: describeHarnessMigration(plan).join(' · '), neededBy: 'fetch' }];
+  };
+  const preflightOpts = { cwd: process.cwd(), templateRepo: TEMPLATE_REPO, lockFile: VERSION_FILE, lang: ui?.lang ?? 'es' as const, extra: migrationRows() };
+  const pre = await runUpPreflight(preflightOpts);
+  printPreflight(pre);
+  if (ui) {
+    if (await ui.preflight(pre, async () => runUpPreflight(preflightOpts)) === 'abort') {
+      tui.outro(ABORTED_OUTRO);
+      await closeUi('aborted', 1);
+      process.exit(1);
+    }
+  }
+  else if (pre.verdict === 'block') {
+    tui.outro(ABORTED_OUTRO);
+    process.exit(pre.checks.some(c => c.id === 'git-version' && c.state === 'block') ? 2 : 1);
+  }
 
   // No terminal on stdin (CI, a pipe, an agent's shell) and no explicit mode:
   // the Phase 3 multi-select would hang forever. Default to --auto and say so.
-  if (!parsed.auto && !parsed.force && !parsed.interactive && !process.stdin.isTTY) {
+  // A page opened with `--ui` answers the questions itself, so it keeps them.
+  if (!ui && !parsed.auto && !parsed.force && !parsed.interactive && !process.stdin.isTTY) {
     parsed.auto = true;
     tui.log.info('stdin no es una terminal: se asume --auto (pasa --interactive para conservar los prompts).');
   }
   const nonInteractive = parsed.auto || parsed.force;
 
-  // Filter components if sub-commands passed (e.g. `bun run up scripts`).
+  // Filter components if sub-commands passed (e.g. `bun sync scripts`).
   let components = COMPONENTS;
   if (parsed.commands.length > 0 && !parsed.commands.includes('all')) {
     const requested = new Set(parsed.commands);
@@ -1775,7 +2125,7 @@ async function main(): Promise<void> {
     components = await resolveSkillFilter(parsed.skills);
   }
 
-  const sink = buildSink();
+  const sink = ui?.sink ?? terminalSink;
 
   // Cross-harness migration: runs BEFORE any component is synced, on purpose.
   // A repo scaffolded when instructions lived in CLAUDE.md and skills in
@@ -1789,7 +2139,7 @@ async function main(): Promise<void> {
   if (migration?.applied && runFacts.migration === null) { runFacts.migration = migration; }
   // What the preflight just wrote is the updater's own dirt: the dirty-tree
   // guard in runUpdate (and in the self-update re-exec child) must not refuse
-  // a tree that was clean before `bun run up` started.
+  // a tree that was clean before `bun sync` started.
   const updaterOwnedPaths = migration ? harnessMigrationTouchedPaths(migration) : [];
   // Lock cursor BEFORE this run advances it: the parity prompt names both shas.
   const priorLockSha = readLock(process.cwd()).templateCommit;
@@ -1812,13 +2162,13 @@ async function main(): Promise<void> {
     // component is synced wholesale and imports picocolors / yaml / boxen /
     // cli-table3 / figures / @clack/prompts / @inquirer/prompts at RUNTIME,
     // all declared only there — syncing the code without the package leaves
-    // `bun run up` crashing on import. `lint-staged` is here because
+    // `bun sync` crashing on import. `lint-staged` is here because
     // `.husky/pre-commit` shells out to `bunx lint-staged`, which reads its
     // config from this file.
     packageJsonSpecs: [
       { path: 'package.json', sections: ['scripts', 'devDependencies', 'dependencies', 'lint-staged'] },
     ],
-    deprecatedFiles: RETIRED_COMMAND_WRAPPERS,
+    deprecatedFiles: DEPRECATED_FILES,
     // Every watched path is project-owned inside a synced component too:
     // delivered once when missing, never overwritten (`.husky/pre-push`, a
     // path from `updater.protected_paths`). Paths no component owns are
@@ -1859,17 +2209,26 @@ async function main(): Promise<void> {
     // silent replacement.
     excludePaths: [
       ...GENERATED_PATHS,
+      // Upstream's own overlay carries the boilerplate's own exceptions (its
+      // Git Strategy): it never travels. A project gets the stub instead.
+      PROJECT_INSTRUCTIONS,
+      // Its name before the `agent-` prefix: the project's own copy is moved by
+      // the instructions hook, never classified by the sync.
+      LEGACY_PROJECT_INSTRUCTIONS,
     ],
     // The boilerplate's own design material. `docs` is a synced component, so
     // without this every consumer project inherits our proposals and backlogs as
     // if they were framework documentation. Mirrored in TEMPLATE_EXCLUDES
     // (packages/create-agentic-qa/src/prepare.ts) — the scaffold prunes them on
-    // first install and this keeps `bun run up` from putting them back.
+    // first install and this keeps `bun sync` from putting them back.
     //
     // `.context/ADR/` needs no entry here: `.context` is not a synced component,
     // so ADRs only ever travel through the scaffold tarball, which prunes them.
     repoOnlyPaths: [
       'docs/reports',
+      // The files of a harness this project does not use (ADR-0012): it
+      // deleted them on purpose, so no detection path re-delivers them.
+      ...unusedHarnessPaths(process.cwd()),
     ],
     // Watchlist files are NOT synced — included in the sparse clone only so
     // the protected-drift detection can read their upstream copies.
@@ -1878,6 +2237,8 @@ async function main(): Promise<void> {
     promptFile: PARITY_PROMPT_PATH,
     hooks: {
       skillsResolver: resolveTemplateSkills,
+      // The page survives the re-exec: the child binds the same port and token.
+      ...(ui ? { beforeReexec: ui.beforeReexec } : {}),
       // afterApply runs while the upstream clone still sits in UPSTREAM_DIR
       // (cleanup happens after). On dry-run only the read-only pieces run (env
       // keys, the parity table), nothing is regenerated or saved. Each hook is
@@ -1887,27 +2248,36 @@ async function main(): Promise<void> {
             sink,
             async () => { runFacts.envNewKeys = computeEnvNewKeys(UPSTREAM_DIR); },
             // Read-only: records what the real run would add, writes nothing.
-            makeAllowListHook(UPSTREAM_DIR, sink, true),
+            makeHookMergeHook(UPSTREAM_DIR, sink, true),
+            makePermissionListHook(UPSTREAM_DIR, sink, true),
             async () => { runFacts.doctrineDebt = runDoctrineLedger(process.cwd(), UPSTREAM_DIR, { dryRun: true }); },
+            makeInstructionsHook(sink, true),
             // Read-only detection so the preview's table matches the real run's.
             makePbiCacheMigrationHook({ promptOutPath: path.join(process.cwd(), PBI_MIGRATION_PROMPT_PATH), dryRun: true }, sink, (fact) => { runFacts.pbiCache = fact; }),
             makeParityHook(sink, priorLockSha, true, watchlist),
           )
         : composeHooks(
             sink,
-            // Alias first: a Claude Code session opened right after
+            // Hook groups before the compat check that requires them: a
+            // sync must never leave the project failing its own gates.
+            makeHookMergeHook(UPSTREAM_DIR, sink, false),
+            // Alias next: a Claude Code session opened right after
             // the sync must already resolve skills through `.claude/skills`.
             makeAgentCompatibilityHook(sink),
             makeKataManifestHook(sink),
-            // Before the compat check reads settings.json? No: after. The merge
-            // only ADDS allow entries, which no compatibility contract asserts
-            // on, and running it late keeps the hook order above untouched.
-            makeAllowListHook(UPSTREAM_DIR, sink, false),
+            // Before the compat check reads settings.json? No: after. This merge
+            // only ADDS allow and deny entries, which no compatibility contract
+            // asserts on (the hook groups, which one does, merged first).
+            makePermissionListHook(UPSTREAM_DIR, sink, false),
             // The unresolved-doctrine ledger. Content-tracked, so unlike every
             // other watched-file nudge it survives `keep project` and clears
             // only when the section is actually written. Runs before the parity
             // hook, which folds its one row in.
             async () => { runFacts.doctrineDebt = runDoctrineLedger(process.cwd(), UPSTREAM_DIR); },
+            // After the sync delivered the sections: the project's own
+            // `agent-project.md` from the stub (once), and the migration row for a
+            // pre-split AGENTS.md. Before the parity hook, which folds them in.
+            makeInstructionsHook(sink, false),
             async () => detectEnvVarDrift(UPSTREAM_DIR, sink, nonInteractive),
             // ONE schema-driven hook for `.agents/project.yaml`, replacing the
             // two hand-written ones (`git_strategy`, `qa_epics`). The two
@@ -1939,7 +2309,8 @@ async function main(): Promise<void> {
     },
   };
 
-  tui.intro(tui.headline(`UPEX QA Boilerplate Updater v${CLI_VERSION}`));
+  // A re-exec child continues the parent's run: its intro is already on screen.
+  if (process.env.UPEX_UPDATER_REEXEC !== '1') { tui.intro(tui.headline(`UPEX QA Boilerplate Updater v${CLI_VERSION}`)); }
 
   const summary = await runUpdate(cfg, sink, {
     auto: parsed.auto,
@@ -1956,18 +2327,57 @@ async function main(): Promise<void> {
   const verdict = runVerdict({ aborted, dryRun: parsed.dryRun, strict: parsed.strict }, runFacts.parity?.findings ?? []);
   if (verdict.reason) { tui.log.error(verdict.reason); }
   tui.outro(verdict.outro);
+  if (ui) {
+    const findings = runFacts.parity?.findings ?? [];
+    if (!aborted) {
+      ui.report({
+        dryRun: parsed.dryRun,
+        auto: nonInteractive,
+        aborted,
+        applied: summary.applied.length,
+        skipped: summary.skipped.length,
+        failed: summary.failed.map(f => ({ path: f.entry.path, reason: f.reason })),
+        upstreamSha: summary.newHeadSha,
+        surfaces: runFacts.parity?.report.surfaces ?? [],
+        findings,
+        prompt: runFacts.parity?.report.prompt,
+        promptPath: !parsed.dryRun && (summary.promptSaved || runFacts.promptKept) ? PARITY_PROMPT_PATH : null,
+        commit: !parsed.dryRun && summary.newHeadSha && (summary.applied.length > 0 || (summary.lastApplyPaths ?? 0) > 0) ? suggestCommitMessage(summary) : null,
+        extraNext: runFacts.aliasDeferred ? [{ title: 'Alias de skills pendiente', text: ALIAS_DEFERRED_NEXT_STEP }] : [],
+      });
+    }
+    const pending = (nonInteractive && summary.skipped.length > 0) || findings.length > 0;
+    await closeUi(aborted ? 'aborted' : verdict.exitCode !== 0 ? 'failed' : pending ? 'done-with-pending' : 'done', verdict.exitCode);
+  }
   if (verdict.exitCode !== 0) { process.exit(verdict.exitCode); }
+}
+
+/** Terminal rows of the preflight: nothing when all is clear (today's output), every warn and block otherwise. */
+function printPreflight(pre: PreflightResult): void {
+  for (const c of pre.checks) {
+    if (c.state !== 'warn' && c.state !== 'block') { continue; }
+    const text = `${c.label}${c.value && c.value !== '-' ? ` (${c.value})` : ''}: ${plainMsg(c.msg ?? '')}`;
+    if (c.state === 'block') { tui.log.error(text); }
+    else { tui.log.warn(text); }
+  }
 }
 
 // Guarded so tests can import COMPONENTS and the pure helpers above
 // (extractIndentedYamlBlock, insertBlockAtEndOfSection) without kicking off a sync.
 if (import.meta.main) {
-  main().catch((err: unknown) => {
+  main().catch(async (err: unknown) => {
     if (err instanceof Error && err.name === 'ExitPromptError') {
       tui.cancel('Aborted by user.');
+      await closeUi('aborted', 130);
       process.exit(130);
     }
+    if (err instanceof Error && err.name === 'UpdaterAbort') {
+      await closeUi('aborted', 1);
+      process.exit(1);
+    }
     tui.log.error(err instanceof Error ? err.message : String(err));
+    activeUi?.notice('error', err instanceof Error ? err.message : String(err));
+    await closeUi('failed', 1);
     process.exit(1);
   });
 }

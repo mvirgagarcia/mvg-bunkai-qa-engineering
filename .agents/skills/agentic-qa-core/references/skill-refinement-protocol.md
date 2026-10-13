@@ -3,7 +3,7 @@
 > Cited by: the session-close step of every skill marked `metadata.stage_owner: true` in its frontmatter, and by `skill-scaffold.md` (the context-skill template).
 > Companion to `session-management.md` §3 (the companion file this protocol writes lives INSIDE the running skill's scope) and `upstream-feedback.md` (the path a refinement takes when the target skill is upstream-owned).
 
-A session that learns something mid-flight writes a **proposal**, never the skill. The live `SKILL.md` and its `references/` change only through a human OK, per entry, because a skill is not a note: it is committed, loaded into every future session by trigger, projected into every subagent briefing through `REGISTRY.md`, and, for an upstream skill, propagated to every consumer by `bun run up`. A wrong lesson in Engram is a bad recollection. A wrong lesson in a skill is a shipped regression.
+A session that learns something mid-flight writes a **proposal**, never the skill. The live `SKILL.md` and its `references/` change only through a human OK, per entry, because a skill is not a note: it is committed, loaded into every future session by trigger, projected into every subagent briefing through `REGISTRY.md`, and, for an upstream skill, propagated to every consumer by `bun sync`. A wrong lesson in Engram is a bad recollection. A wrong lesson in a skill is a shipped regression.
 
 ---
 
@@ -24,7 +24,7 @@ Entry genre already in the repo: `orca-orchestration/references/gotchas.md` rows
 
 | Moment | Write | Owner |
 |---|---|---|
-| A lesson is noticed | Append ONE block (§3) to `.session/<active-workflow-slug>/<scope>/refinements.md` — a companion file inside the running skill's OWN scope (`session-management.md` §3 permits companions; nothing else under `.session/` is allowed) | the session, unprompted |
+| A lesson is noticed | Append ONE block (§3) to `<<PRIMARY_ROOT>>/.session/<active-workflow-slug>/<scope>/refinements.md` (the primary checkout, also from a worktree) — a companion file inside the running skill's OWN scope (`session-management.md` §3 permits companions; nothing else under `.session/` is allowed) | the session, unprompted |
 | Same moment | `mem_save` with `topic_key: skill-refinement/<target-slug>` so the proposal survives a wiped `.session/` | the session |
 | Session close | The session footer (`session-footer-contract.md` Part 2) gains one line: `Refinements proposed: N → <path>` (`0` and no path when none) | the session |
 | Review | The owner reads the file and answers **apply / drop per entry**. Never auto-applied. An entry without a measurement is dropped at review | human |
@@ -42,7 +42,7 @@ A fleet has the same mechanism at conductor altitude: `.session/orchestration/<s
 - evidence: <date · session label · what was measured, one line>
 - confidence: high | medium | low
 - criteria: stable=yes|no · regenerable=no|yes · changes_behavior=yes|no · paid_for=yes|no
-- upstream: local | upstream (<slug> is synced by `bun run up`; see upstream-feedback.md)
+- upstream: local | upstream (<slug> is synced by `bun sync`; see upstream-feedback.md)
 ```
 
 Every field is mandatory. `criteria` with any wrong value means the entry is Engram material, not a refinement: still record it there, and say so in the line.
@@ -53,7 +53,7 @@ Every field is mandatory. `criteria` with any wrong value means the entry is Eng
 |---|---|
 | Project-owned (a `-context` skill, or any skill the project authored) | Surgical append to `target_file`, then `bun run skills:check`, `bun run skills:registry`, commit |
 | Boilerplate-owned, and this checkout IS the boilerplate | `/framework-development` (its Phase 3 already runs `skills:check`) |
-| Boilerplate-owned, inside a consumer repo | Do NOT edit it here: the next `bun run up` overwrites the file (parity row `overwritten`, backup named). The refinement becomes an upstream issue per `upstream-feedback.md`. `updater.protected_paths` remains the escape hatch for a deliberate private fork, at the stated cost of losing upstream fixes for that file |
+| Boilerplate-owned, inside a consumer repo | Do NOT edit it here: the next `bun sync` overwrites the file (parity row `overwritten`, backup named). The refinement becomes an upstream issue per `upstream-feedback.md`. `updater.protected_paths` remains the escape hatch for a deliberate private fork, at the stated cost of losing upstream fixes for that file |
 
 ## 5 · What stops a wrong lesson from being burned in
 

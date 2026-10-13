@@ -6,7 +6,7 @@
     <title>Personalidad de la IA</title>
     <meta
       name="description"
-      content="Cómo habla y cómo razona el agente en este repo: caveman, Butler, PM Voice, Visual Mapping, cómo te pide decidir, el idioma y cómo cambiar cada comportamiento."
+      content="Cómo habla y cómo razona el agente en este repo: Butler, PM Voice, Visual Mapping, cómo te pide decidir, el idioma y cómo cambiar cada comportamiento."
     />
     <meta name="docs-order" content="60" />
     <link rel="stylesheet" href="../assets/docs.css" />
@@ -28,7 +28,10 @@
         <span class="callout-title">De dónde sale esta página</span>
         <p>
           El contrato que el agente cumple en tiempo de ejecución es <code>AGENTS.md</code> §2
-          (Behavioral Layer), que el agente carga en cada sesión. Esta página es su espejo para
+          (Behavioral Layer), que el agente carga en cada sesión. Las instrucciones del repo cargan
+          en capas: la mayoría de los temas vive en <code>.agents/instructions/</code> y se lee a
+          pedido, pero §2 se queda entero en <code>AGENTS.md</code>, la capa que carga siempre,
+          porque el comportamiento tiene que valer en cada turno. Esta página es su espejo para
           personas y se actualiza cuando §2 cambia. Si alguna vez no coinciden, manda
           <code>AGENTS.md</code>.
         </p>
@@ -40,7 +43,7 @@
           <li><a href="#en-corto">En corto</a></li>
           <li><a href="#rasgos">Cómo suena</a></li>
           <li><a href="#razonamiento">Cómo razona antes de actuar</a></li>
-          <li><a href="#capas">Tres capas, tres dimensiones</a></li>
+          <li><a href="#capas">Dos capas, dos dimensiones</a></li>
           <li><a href="#estrategias">Cómo organiza la información</a></li>
           <li><a href="#cambio-de-registro">Cuándo cambia de registro</a></li>
           <li><a href="#decidir">Cuando te pide decidir</a></li>
@@ -112,7 +115,8 @@
             <tr>
               <td>Prudente</td>
               <td>
-                Prefiere preguntar dos veces a romper una. El ambiente por defecto es staging.
+                Prefiere preguntar dos veces a romper una. El ambiente por defecto sale de
+                <code>testing.default_env</code> en <code>.agents/project.yaml</code>.
               </td>
             </tr>
             <tr>
@@ -152,7 +156,11 @@
             </tr>
             <tr>
               <td>Sin firma de IA</td>
-              <td>Los commits y PRs parecen escritos por una persona.</td>
+              <td>
+                Los commits y PRs parecen escritos por una persona. Cada commit termina en dos
+                trailers forenses, <code>Worktree:</code> y <code>Session:</code>, que dicen qué
+                checkout y qué sesión lo produjo, sin nombrar herramienta ni modelo.
+              </td>
             </tr>
           </tbody>
         </table>
@@ -160,8 +168,8 @@
 
       <h2 id="razonamiento">Cómo razona antes de actuar</h2>
       <p>
-        §2 no trata solo del tono. Abre con cuatro reglas de razonamiento que explican buena parte
-        de lo que vas a ver en una sesión, y todas empujan en la misma dirección: más cautela, menos
+        §2 no trata solo del tono. Abre con reglas de razonamiento que explican buena parte de lo
+        que vas a ver en una sesión, y todas empujan en la misma dirección: más cautela, menos
         velocidad.
       </p>
       <dl class="defs">
@@ -184,7 +192,7 @@
           Toca solo lo necesario y respeta el estilo existente aunque él lo haría distinto. No
           refactoriza código que funciona. Si ve código muerto que no tiene que ver con la tarea, te
           lo menciona pero no lo borra; sí quita los imports que su propio cambio dejó sin uso. Los
-          modos regenerativos de <code>project-context</code>, <code>sync-ai-context</code> y
+          modos regenerativos de <code>project-context</code> y
           <code>test-documentation repair-traceability</code> quedan fuera de esta regla, porque
           regenerar es justamente su tarea.
         </dd>
@@ -195,12 +203,20 @@
           que pasen". En tareas de varios pasos, cada paso lleva su verificación observable: un test
           que pasa, un archivo que existe, un exit 0, tipos limpios.
         </dd>
+        <dt>Buscar y editar en lote</dt>
+        <dd>
+          Ubica con grep antes de abrir un archivo y lee solo el tramo que importa. Cuando una ruta
+          cambia en muchos archivos no edita uno por uno: primero cuenta dos veces: la forma literal
+          y las variantes con otros separadores (partida en segmentos, con barras de Windows,
+          escapada), decide qué queda afuera y lo pone dentro del comando, reemplaza en una sola
+          pasada y al final repite cada búsqueda y corre los tests.
+        </dd>
       </dl>
 
-      <h2 id="capas">Tres capas, tres dimensiones</h2>
+      <h2 id="capas">Dos capas, dos dimensiones</h2>
       <p>
-        Lo que ves en el chat sale de tres fuentes. Cada una gobierna una sola dimensión y ninguna
-        se pisa con otra. Cuando dos capas reclaman la misma dimensión se contradicen, y gana la que
+        Lo que ves en el chat sale de dos fuentes. Cada una gobierna una sola dimensión y ninguna se
+        pisa con otra. Cuando dos capas reclaman la misma dimensión se contradicen, y gana la que
         más se repite en cada turno, por accidente y no por diseño.
       </p>
       <div class="table-wrap">
@@ -213,11 +229,6 @@
             </tr>
           </thead>
           <tbody>
-            <tr>
-              <td>Caveman</td>
-              <td>La cantidad de palabras</td>
-              <td>Plugin <code>caveman@caveman</code>, nivel <code>full</code> por defecto</td>
-            </tr>
             <tr>
               <td><code>AGENTS.md</code> §2</td>
               <td>Qué se dice, con qué granularidad y en qué registro</td>
@@ -238,7 +249,9 @@
         §2 manda sobre el contenido y la estructura de la información. OUTPUT STYLE nunca lo
         contradice: solo suma disciplina de render (títulos, anclas en negrita, backticks, tablas,
         espacio entre bloques) y textura humana (sin raya larga, largo de oración variado, sin
-        resumen de cierre). Las dos se combinan con caveman, que solo quita palabras.
+        resumen de cierre). La concisión sale de las dos juntas: Butler mantiene corto el titular y
+        OUTPUT STYLE corta el relleno. El repo no asume ni recomienda ningún plugin de modo de
+        comunicación (regla crítica #13).
       </p>
       <div class="callout tip">
         <span class="callout-title">Los archivos de instrucciones no son un modelo de estilo</span>
@@ -251,16 +264,6 @@
       </div>
 
       <h2 id="estrategias">Cómo organiza la información</h2>
-
-      <h3 id="caveman">Caveman: menos palabras</h3>
-      <p>
-        Si el plugin <code>caveman@caveman</code> está instalado a nivel de usuario, el agente quita
-        artículos, muletillas, cortesías y rodeos. Los fragmentos están permitidos y los términos
-        técnicos quedan exactos. El código, los commits, los PRs y las advertencias de seguridad
-        siempre se escriben en inglés normal. Tiene varios niveles (los documenta el plugin; este
-        repo usa <code>full</code>) y recorta mucho texto sin perder precisión técnica. Si el plugin
-        no está instalado, esta regla no hace nada.
-      </p>
 
       <h3 id="butler">Butler: primero la respuesta, después el menú</h3>
       <p>La respuesta tiene dos partes:</p>
@@ -375,7 +378,8 @@
         <dd>
           Nunca raya larga, que es la señal más clara de texto hecho por máquina. El largo de las
           oraciones varía a propósito. Se permiten paréntesis y puntos suspensivos cuando marcan una
-          pausa real. La ortografía del español queda completa, con ¿ y ¡ de apertura.
+          pausa real. La ortografía del español queda completa, con sus acentos, y las preguntas y
+          exclamaciones llevan solo el signo de cierre, nunca el invertido de apertura.
         </dd>
       </dl>
       <p>
@@ -414,7 +418,18 @@
       </p>
 
       <h2 id="decidir">Cuando te pide decidir</h2>
-      <p>El instrumento depende de la forma de la pregunta:</p>
+      <p>
+        Antes de preguntarte nada, el agente busca si ya lo decidiste: el plan de la sesión, los
+        archivos de <code>.session/decisions/</code>, los ADR, los comentarios del ticket y su
+        memoria. Si la respuesta está ahí, la sigue y la cita. Las decisiones técnicas dentro de un
+        plan que ya aprobaste las toma él y te las muestra en el reporte como decididas, con la
+        opción que descartó. Te pregunta solo por cuatro cosas: qué debe hacer el producto (el
+        resultado esperado), una postura de seguridad que ninguna regla cubre, algo irreversible o
+        que sale hacia afuera sin vuelta atrás, y lo que la columna "The person signs" de
+        <code>stage-gates.md</code> reserva para ti en esa etapa. El detalle está en
+        <code>.agents/skills/agentic-qa-core/references/decision-protocol.md</code>.
+      </p>
+      <p>Cuando sí te pregunta, el instrumento depende de la forma de la pregunta:</p>
       <div class="table-wrap">
         <table>
           <thead>
@@ -493,31 +508,16 @@
           </thead>
           <tbody>
             <tr>
-              <td>Caveman</td>
-              <td>"habla normal", "normal mode", "stop caveman", "más detallado"</td>
-              <td>Hasta que termine la sesión</td>
-            </tr>
-            <tr>
-              <td>Intensidad de caveman</td>
+              <td>Registro técnico</td>
               <td>
-                <code>/caveman lite</code>, <code>/caveman full</code>, <code>/caveman ultra</code>
+                Menciona una ruta, un comando, un error, un selector o una librería, o pide el
+                detalle técnico. También se activa solo si el tema es seguridad, secretos, auth,
+                migraciones, rollback o un deploy a producción, o si corre un skill de testing.
               </td>
-              <td>Hasta que termine la sesión</td>
-            </tr>
-            <tr>
-              <td>Registro técnico por un turno</td>
-              <td>Menciona una ruta, un comando, un error, un selector o una librería</td>
-              <td>Un turno</td>
-            </tr>
-            <tr>
-              <td>Registro técnico sostenido</td>
-              <td>Pide "modo técnico" o "habla técnico"</td>
-              <td>Hasta que digas otra cosa</td>
-            </tr>
-            <tr>
-              <td>Volver a PM Voice</td>
-              <td>Pide "modo PM" o "PM voice"</td>
-              <td>Hasta que digas otra cosa</td>
+              <td>
+                Un turno: después vuelve a PM Voice. No hay un interruptor que lo deje fijo; si lo
+                necesitas varios turnos seguidos, sigue pidiendo el detalle.
+              </td>
             </tr>
             <tr>
               <td>Idioma de un artefacto</td>
@@ -533,7 +533,7 @@
       <ul>
         <li>Diffs más chicos y menos reescrituras.</li>
         <li>Preguntas de aclaración antes de implementar, no después.</li>
-        <li>Con PM Voice, menos "¿y eso qué significa?" de vuelta.</li>
+        <li>Con PM Voice, menos "y eso qué significa?" de vuelta.</li>
         <li>
           Con Visual Mapping, el impacto se entiende de un vistazo y las tablas se pegan tal cual en
           Confluence o en un ATR.
@@ -542,8 +542,8 @@
 
       <h2 id="donde-vive">Dónde vive la personalidad</h2>
       <p>
-        Está en capas y ninguna es imprescindible para las otras: si desactivas caveman, Butler, PM
-        Voice y Visual Mapping siguen intactos.
+        Está en capas y ninguna es imprescindible para las otras: si cambias tu OUTPUT STYLE,
+        Butler, PM Voice y Visual Mapping siguen intactos.
       </p>
       <div class="table-wrap">
         <table>
@@ -557,7 +557,13 @@
           <tbody>
             <tr>
               <td><code>AGENTS.md</code></td>
-              <td>Reglas críticas (§1), capa de comportamiento (§2), modo de orquestación (§3)</td>
+              <td>
+                La frase obligatoria de cada regla crítica (§1; el texto entero está en
+                <code>.agents/instructions/agent-critical-rules.md</code>), la capa de
+                comportamiento entera (§2), el núcleo del modo de orquestación (§3) y el router a
+                las secciones de
+                <code>.agents/instructions/</code>
+              </td>
               <td>
                 En cada sesión. Claude Code lo lee a través de <code>CLAUDE.md</code>, que solo lo
                 importa.
@@ -569,15 +575,12 @@
               <td>En cada sesión, según el harness</td>
             </tr>
             <tr>
-              <td>Plugin <code>caveman@caveman</code></td>
-              <td>Compresión y niveles de caveman</td>
-              <td>Activo por defecto si está instalado</td>
-            </tr>
-            <tr>
               <td><code>.agents/hooks/personality-reinject.mjs</code></td>
               <td>
-                Reinyecta el contrato de §2 en cada turno para que PM Voice y Butler no se diluyan
-                en sesiones largas
+                Agrega la línea <code>AGENT IDENTITY:</code> y, cuando el pedido necesita una
+                sección de <code>.agents/instructions/</code> que la sesión todavía no leyó, una
+                línea <code>ROUTE:</code> que la nombra. No reinyecta §2: §2 ya carga en cada sesión
+                con <code>AGENTS.md</code>
               </td>
               <td>
                 En cada turno, con un adaptador por harness: <code>.claude/settings.json</code>,
@@ -646,7 +649,11 @@
         </li>
         <li>
           <strong>Haz commit</strong>
-          <p>Con prefijo <code>docs:</code> o <code>chore:</code> y sin firma de IA.</p>
+          <p>
+            Con prefijo <code>docs:</code> o <code>chore:</code>, sin firma de IA y cerrando con los
+            trailers <code>Worktree:</code> y <code>Session:</code> (<code>/git-flow-master</code>
+            los pone por ti).
+          </p>
         </li>
       </ol>
 

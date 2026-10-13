@@ -184,3 +184,17 @@ env.d.ts
 .agents/skills/skill-creator/
 !skills-lock.json
 !**/skills-lock.json
+
+# ----- 2026-10-13 (sync) -----
+.playwright/profiles/
+.playwright-cli/
+storage-state-*.json
+!.env.provider.schema
+.context/*
+!.context/README.md
+!.context/project-config.md
+!.context/ADR/
+!.context/regression-history/
+!.context/reports/
+!.context/PBI/
+.agents/skills/diagram-design/

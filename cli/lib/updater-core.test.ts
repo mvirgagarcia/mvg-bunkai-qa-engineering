@@ -9,11 +9,13 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import {
   advanceSyncStateV7,
   classifyFile,
+  collectContextMapBootstrap,
   componentOwnedPaths,
   computeComponentAdvancement,
   computeDelta,
   detectLocalEdits,
   dirtyTreeExemptions,
+  dropDeprecatedDeletes,
   foreignDirtyPaths,
   isBootstrapOnlyFile,
   isLocalTemplateSource,
@@ -94,7 +96,7 @@ const CLI: Component = { name: 'cli', type: 'directory', paths: ['cli'] };
 const CFG = { components: [CLI], selfUpdateComponent: 'cli', versionFile: '.template/boilerplate.lock.json' };
 
 describe('dirty-tree guard: self-update re-exec', () => {
-  // Bunkai PR #234: `bun run up --auto` ran the migration preflight, the parent
+  // Bunkai PR #234: `bun sync --auto` ran the migration preflight, the parent
   // refreshed `cli/` and re-exec'd, and the CHILD aborted on the dirty tree the
   // parent had just produced; `--force` was the only way through.
 
@@ -185,7 +187,7 @@ describe('dirty-tree guard: self-update re-exec', () => {
     // The downstream repos are Spanish. With `core.quotepath` at its default,
     // git wraps any non-ASCII path in quotes and escapes its UTF-8 bytes as
     // octal. Decoding those wrong gives a path that matches no exemption and
-    // hashes to nothing, so the dirty-tree guard aborts `bun run up` naming a
+    // hashes to nothing, so the dirty-tree guard aborts `bun sync` naming a
     // file that does not exist. Drive the real binary, not a hand-typed line.
     const root = temporaryRoot();
     git(root, ['init', '--quiet', '--initial-branch=main']);
@@ -824,5 +826,64 @@ describe('project-local context skills (a consumer\'s `<aspect>-context/` is nev
     const delta = computeDelta(template, [SKILLS], state, local, []);
     expect(delta.map(e => e.path)).toEqual(['.agents/skills/iql-context/SKILL.md']);
     expect(delta.some(e => e.classification === 'deleted-upstream')).toBe(false);
+  });
+});
+
+describe('dropDeprecatedDeletes', () => {
+  test('a deprecated file leaves through the cleanup, not the delete prompt; every other entry stays', () => {
+    const deprecated = [{ path: '.agents/skills/adapt-framework/SKILL.md' }];
+    const entries = [
+      { path: '.agents/skills/adapt-framework/SKILL.md', classification: 'deleted-upstream' },
+      { path: '.agents/skills/gone/SKILL.md', classification: 'deleted-upstream' },
+      { path: '.agents/skills/adapt-framework/SKILL.md', classification: 'locally-diverged' },
+    ];
+    expect(dropDeprecatedDeletes(entries, deprecated)).toEqual(entries.slice(1));
+    expect(dropDeprecatedDeletes(entries, [])).toEqual(entries);
+  });
+});
+
+describe('collectContextMapBootstrap: context map skills delivered once', () => {
+  const skills: Component[] = [{ name: 'skills', type: 'directory', paths: ['.agents/skills'] }];
+
+  function seedTemplate(template: string): void {
+    for (const f of ['SKILL.md', 'references/business-data-map.html', 'references/refresh.md']) {
+      const full = join(template, '.agents/skills/business-data-context', f);
+      mkdirSync(dirname(full), { recursive: true });
+      writeFileSync(full, 'x');
+    }
+  }
+
+  test('an absent folder is delivered whole, as new-upstream bootstrap entries', () => {
+    const template = temporaryRoot();
+    const repo = temporaryRoot();
+    seedTemplate(template);
+    const entries = collectContextMapBootstrap(skills, template, repo);
+    expect(entries.map(e => e.path).sort()).toEqual([
+      '.agents/skills/business-data-context/SKILL.md',
+      '.agents/skills/business-data-context/references/business-data-map.html',
+      '.agents/skills/business-data-context/references/refresh.md',
+    ]);
+    expect(entries.every(e => e.classification === 'new-upstream' && e.component === 'skills')).toBe(true);
+  });
+
+  test('a present folder, even missing files, is the project\'s and gets nothing', () => {
+    const template = temporaryRoot();
+    const repo = temporaryRoot();
+    seedTemplate(template);
+    mkdirSync(join(repo, '.agents/skills/business-data-context'), { recursive: true });
+    expect(collectContextMapBootstrap(skills, template, repo)).toEqual([]);
+    // Still project-local for every overwrite / delete decision.
+    expect(isProjectLocalSkillPath('.agents/skills/business-data-context/references/business-data-map.html')).toBe(true);
+  });
+
+  test('no component owning the skills dir, or a path already in the delta, delivers nothing twice', () => {
+    const template = temporaryRoot();
+    const repo = temporaryRoot();
+    seedTemplate(template);
+    expect(collectContextMapBootstrap([{ name: 'docs', type: 'directory', paths: ['docs'] }], template, repo)).toEqual([]);
+    const narrowed: Component[] = [{ name: 'skills', type: 'directory', paths: ['.agents/skills/business-data-context'] }];
+    const first = collectContextMapBootstrap(narrowed, template, repo);
+    expect(first).toHaveLength(3);
+    expect(collectContextMapBootstrap(narrowed, template, repo, first)).toEqual([]);
   });
 });

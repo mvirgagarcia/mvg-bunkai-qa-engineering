@@ -3,7 +3,7 @@
  * build-skill-registry.ts — emits `.agents/skills/REGISTRY.md`.
  *
  * Token-saving cache for the Skill Resolver protocol. Scans
- * `.agents/skills/*\/SKILL.md`, extracts a 5-15-line "Compact Rules" block per
+ * `.agents/skills/*\/SKILL.md`, extracts a "Compact Rules" block per
  * skill, and writes a single registry file the orchestrator pastes into every
  * subagent briefing under `## Project Standards (auto-resolved)`.
  *
@@ -24,10 +24,13 @@
  *     `- ` is stripped).
  *   - A (body section): if the SKILL.md body contains a section literally
  *     titled `## Compact Rules` or `## Standards`, use the bullets from that
- *     section verbatim, capped at 15 rules (truncation appends a marker).
+ *     section verbatim. Never capped, never truncated: the section is authored,
+ *     and AGENTS.md §3 RULE REACHABILITY puts every binding rule there so the
+ *     registry carries it into briefings. A cap here once dropped real rules
+ *     from three skills while every check stayed green.
  *   - B (fallback): pick the first 15 bullets from any list in the body, or
  *     the first 15 non-empty lines of the first content section if no bullets.
- *     Same 15-rule cap.
+ *     The cap applies to this blind scrape only (truncation appends a marker).
  *
  * Strategy B blocks are stamped LOW-CONFIDENCE. The scrape is blind: it takes
  * whichever bullets come first, so a dependency list, a table row, or half of a
@@ -38,6 +41,9 @@
  * so it survives a copy-paste of the block into a briefing. The fix for a
  * marked skill is to author a `## Compact Rules` section in it, which moves it
  * to Strategy A and drops the marker.
+ *
+ * Skill folders git ignores (T3 community skills installed on the machine) are
+ * skipped, so the committed registry depends only on committed skills.
  *
  * Idempotency: re-running on an unchanged repo produces a byte-identical file.
  *
@@ -70,7 +76,8 @@ const SKILLS_DIR = join(REPO_ROOT, '.agents', 'skills');
 const CACHE_DIR = SKILLS_DIR;
 const CACHE_FILE = join(CACHE_DIR, 'REGISTRY.md');
 
-const MAX_RULES = 15;
+/** Cap for the Strategy B scrape only; authored blocks are never capped. */
+const MAX_SCRAPED_RULES = 15;
 const _MIN_RULES = 5; // informational; Strategy B may emit fewer.
 
 // -----------------------------------------------------------------------------
@@ -107,8 +114,8 @@ function printHelp(): void {
   console.log(`Usage: bun scripts/build-skill-registry.ts [--check] [--dry-run] [--verbose] [--help]
 
 Builds the per-session skill registry consumed by the Skill Resolver protocol.
-Scans .agents/skills/*/SKILL.md, extracts compact rules per skill, and writes
-.agents/skills/REGISTRY.md.
+Scans .agents/skills/*/SKILL.md (skipping folders git ignores), extracts
+compact rules per skill, and writes .agents/skills/REGISTRY.md.
 
 Flags:
   --check      Verify REGISTRY.md is in sync with current SKILL.md content.
@@ -166,8 +173,35 @@ function listSkillDirs(): string[] {
     const skillPath = join(SKILLS_DIR, e.name, 'SKILL.md');
     if (existsSync(skillPath)) { dirs.push(e.name); }
   }
-  dirs.sort();
-  return dirs;
+  // The registry is committed, so it indexes only what a commit can carry: a
+  // skill folder git ignores (a T3 community skill installed on this machine)
+  // stays out, or the file would differ per machine and carry links that are
+  // dead in the commit.
+  const ignored = gitIgnored(dirs.map(slug => relativePosix(REPO_ROOT, join(SKILLS_DIR, slug))));
+  const kept = dirs.filter(slug => !ignored.has(relativePosix(REPO_ROOT, join(SKILLS_DIR, slug))));
+  for (const slug of dirs) {
+    if (!kept.includes(slug)) { vlog(`[${slug}] skipped: ignored by git`); }
+  }
+  kept.sort();
+  return kept;
+}
+
+/**
+ * Paths git ignores, resolved from the repo root: the `git check-ignore` rule
+ * `scripts/lint-docs.ts` applies to links. Tracked paths are never reported, so
+ * a committed skill under an ignore pattern stays indexed. Empty outside a git
+ * work tree. Paths go without a trailing slash: `dir/` on a symlink is a fatal
+ * pathspec error that would end the whole batch.
+ */
+function gitIgnored(paths: string[]): Set<string> {
+  if (paths.length === 0) { return new Set(); }
+  const result = Bun.spawnSync(['git', 'check-ignore', '--stdin'], {
+    cwd: REPO_ROOT,
+    stdin: new TextEncoder().encode(`${paths.join('\n')}\n`),
+    stdout: 'pipe',
+    stderr: 'ignore',
+  });
+  return new Set(result.stdout.toString().split('\n').map(line => line.trim()).filter(Boolean));
 }
 
 // -----------------------------------------------------------------------------
@@ -241,7 +275,7 @@ function rulesFromFrontmatter(fm: SkillFrontmatter): string[] | null {
  * Strategy A: explicit `## Compact Rules` or `## Standards` section near top.
  * Returns null if no such section exists.
  */
-function extractStrategyA(body: string): { rules: string[], truncated: boolean } | null {
+function extractStrategyA(body: string): string[] | null {
   const lines = body.split('\n');
   let startIdx = -1;
   for (let i = 0; i < lines.length; i++) {
@@ -254,16 +288,14 @@ function extractStrategyA(body: string): { rules: string[], truncated: boolean }
   if (startIdx === -1) { return null; }
 
   const rules: string[] = [];
-  let truncated = false;
   for (let i = startIdx; i < lines.length; i++) {
     const line = lines[i];
     if (/^##\s/.test(line.trim())) { break; } // next section
     const t = bulletText(line);
     if (t === null) { continue; }
-    if (rules.length >= MAX_RULES) { truncated = true; break; }
     rules.push(t);
   }
-  return { rules, truncated };
+  return rules;
 }
 
 /**
@@ -280,7 +312,7 @@ function extractStrategyB(body: string): { rules: string[], truncated: boolean }
   for (const line of lines) {
     const t = bulletText(line);
     if (t === null) { continue; }
-    if (bullets.length >= MAX_RULES) { truncated = true; break; }
+    if (bullets.length >= MAX_SCRAPED_RULES) { truncated = true; break; }
     bullets.push(t);
   }
 
@@ -296,7 +328,7 @@ function extractStrategyB(body: string): { rules: string[], truncated: boolean }
     if (trimmed.startsWith('|')) { continue; }
     if (trimmed.startsWith('```')) { continue; }
     if (trimmed.startsWith('>')) { continue; }
-    if (lineFallback.length >= MAX_RULES) { truncated = true; break; }
+    if (lineFallback.length >= MAX_SCRAPED_RULES) { truncated = true; break; }
     lineFallback.push(trimmed);
   }
   return { rules: lineFallback, truncated };
@@ -349,10 +381,9 @@ function processSkill(slug: string): SkillEntry {
   }
   else {
     const a = extractStrategyA(body);
-    if (a !== null && a.rules.length > 0) {
+    if (a !== null && a.length > 0) {
       strategy = 'A';
-      rules = a.rules;
-      truncated = a.truncated;
+      rules = a;
     }
     else {
       const b = extractStrategyB(body);

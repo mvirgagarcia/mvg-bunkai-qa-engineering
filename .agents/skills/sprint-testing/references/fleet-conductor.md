@@ -31,7 +31,7 @@ Read this ONLY when sprint-wide mode runs with **more than one executor**. The s
 Both must hold:
 
 1. The mode is **sprint-wide**. Single-issue mode never has a fleet (one issue, one executor, by definition).
-2. Either the user asked for it, or `.agents/project.yaml` → `orchestration.max_workers` is greater than 1. An explicit user instruction ALWAYS wins over the yaml default — the default only applies when the user said nothing.
+2. The user asked for it: they answered the executors question with N > 1 (or named a fleet explicitly). `.agents/project.yaml` → `orchestration.max_workers` never turns fleet mode on, whatever its value: it only caps how many workers run per round (§6) once the user has turned it on. An explicit user number for that cap wins over the yaml value.
 
 The **orchestration gate** (binary present + runtime reachable, three-state, canon in `orca-orchestration/SKILL.md`) then decides only ONE thing: who opens the sessions. Gate passes → the orchestration layer launches and supervises them, and the conductor gets a mailbox, native liveness and one-command cleanup. Gate fails → the human opens them, and the conductor keeps every other duty in this file (rounds, briefs, claims, dashboard by file, sprint-altitude record). Run the gate there; never reimplement it here.
 
@@ -139,7 +139,7 @@ Run: <run id — ONLY when this worker was launched without a supervised dispatc
 - no sprint-altitude writes, no token minting, no bulk sync
 - no heartbeats; report once at the end
 - if your own measurement contradicts an instruction in this brief or a later message, STOP and `ask` with both readings and your evidence — never comply silently and never deviate silently
-- <for a non-Claude harness: rename this session to <KEY>-<slug> with /rename as your first action>
+- your session name is set by the conductor (the prompt token on Claude; a conductor-typed `/rename <KEY>` on a non-Claude harness): never try to rename yourself
 ```
 
 **Absolute paths, always.** `.session/` is gitignored and local; a worker that resolves a relative path against the wrong working directory silently reads nothing.
@@ -162,10 +162,10 @@ Rules:
 6. **Validate every line before launch** with a shell syntax check (`bash -n` on a file holding the lines; `zsh -n` where the user's shell is zsh). A line that does not parse is not launched.
 7. The harness invocation itself (binary, model / effort / permission / session-name flags per harness) and which launch path supervises are owned by `orca-orchestration/references/launch-seam.md`. This skill owns only the payload: the `sprint-testing` worker prompt.
 
-Shape (Claude Code; `bun run claude -- <args>` forwards `<args>` verbatim through the `dotenv` wrapper, see `package.json`):
+Shape (Claude Code; the line starts the harness binary bare with its own flags, and the worker gets credentials from the MCP configs' `.env` loader and each script's own loading, never from the launch line):
 
 ```
-PARALLEL_TESTING=true PARALLEL_TICKET=UPEX-123 bun run claude -- <harness flags per launch-seam.md> -n "UPEX-123-checkout-tax" "/sprint-testing UPEX-123 fleet worker env: staging. Brief: <abs path to brief.md>. Run every stage without returning to the prompt until worker_done is sent; stage boundaries are not checkpoints."
+PARALLEL_TESTING=true PARALLEL_TICKET=UPEX-123 claude <harness flags per launch-seam.md> -n "UPEX-123-checkout-tax" "/sprint-testing UPEX-123 fleet worker env: staging. Brief: <abs path to brief.md>. Run every stage without returning to the prompt until worker_done is sent; stage boundaries are not checkpoints."
 ```
 
 The quoted prompt is the payload. On the supervised path it is what the conductor sends to the session the moment it is ready — same text, no shell around it.
@@ -200,6 +200,8 @@ bun run api:login <env> --role admin --profile W2
 **Name the environment first, positionally.** `api-login` is a project-adapted script: every repo owns its own copy, and flag order relative to the environment is not guaranteed identical across copies. Naming the environment positionally, before any flag, works on every copy regardless of how that copy parses `--role` / `--profile`. Read `--help` on the repo you are in when in doubt; never guess a flag.
 
 Each brief then names the **absolute path** of the token file its worker sources (`.auth/profiles/<label>/tokens.env`). One writer either way: the worker sources, never mints.
+
+The browser side follows the same rule. The conductor produces one state file per environment and role the round needs (`.auth/<env>-<role>.json`, recipe in `agentic-qa-core/references/browser-sessions.md` §4) before launch; each brief names its absolute path; the worker only `state-load`s it into its own named session. An expired state is `BLOCKED_AUTH_STALE`, like an expired token.
 
 ---
 
@@ -296,10 +298,10 @@ Two things must be per-worker, and neither one edits the shared file:
 
 | What | Why | How |
 |---|---|---|
-| browser profile / user-data dir | the config ships `isolated: false` with a single `userDataDir`; two browsers on one profile dir collide on the profile lock | give each worker its own session / profile identifier |
+| browser session | two browsers on one profile dir write the same cookies, last writer wins, silently | a named in-memory session per worker (`-s=<label>`): the shipped config keeps every session in memory, so the name IS the isolation; never `--persistent` |
 | output dir | otherwise Bucket A noise and any non-explicit capture cross-contaminates tickets | per-worker config file, or an explicit full destination on every capture |
 
-The mechanics (which flag or env var the installed automation CLI reads for an alternate config, and the session identifier form) belong to the `/playwright-cli` skill — load it and use what that version documents. Two measured constraints carry over regardless: an alternate config **replaces** the default, it does not merge, so a per-worker config file must be complete; and `outputDir` never applies to `.png`, so every screenshot passes its full destination path anyway (`agentic-qa-core/references/evidence-conventions.md` §5).
+Which session and whose login: `agentic-qa-core/references/browser-sessions.md` §7 (fleets). The verbs belong to `/playwright-cli`. Two measured constraints carry over regardless: an alternate config **replaces** the default, it does not merge, so a per-worker config file must be complete; and `outputDir` never applies to `.png`, so every screenshot passes its full destination path anyway (`agentic-qa-core/references/evidence-conventions.md` §5).
 
 Each worker closes its browser sessions before reporting done. Orphaned browsers eating gigabytes is a measured outcome, not a hypothetical (ADR-0006).
 
@@ -325,7 +327,7 @@ Each worker closes its browser sessions before reporting done. Orphaned browsers
 
 ## 13. Checklist — fleet mode
 
-- [ ] Mode is sprint-wide AND (user asked OR `orchestration.max_workers` > 1) AND the gate was evaluated
+- [ ] Mode is sprint-wide AND the user asked for N > 1 executors (`orchestration.max_workers` caps a round, never switches the mode) AND the gate was evaluated
 - [ ] Gate failed → `launch.txt` written, user told to paste N lines, orchestration layer never named
 - [ ] `roster.md` written: one row per worker (label · issue · session label · handles · state)
 - [ ] One `brief.md` per issue in the round, with ACs **verbatim**, absolute paths, siblings, the declared test-case format, and the no-heartbeat / no-checkpoint / run-to-done / measurement-contradiction rules
@@ -333,7 +335,7 @@ Each worker closes its browser sessions before reporting done. Orphaned browsers
 - [ ] Every worker prompt opens with the skill, its issue key, the token `fleet worker` and its brief path — the only detection channel (§3)
 - [ ] Round size ≤ cap; no two `write` claims on one entity inside the round; `Owner` + `Pattern: Fleet` set on every queue row
 - [ ] Tokens minted by the conductor before launch, environment named positionally, one profile per worker; every brief names the absolute token path; no worker logs in (§7)
-- [ ] Per-worker browser profile + output dir; shared `.playwright/cli.config.json` untouched and its `outputDir` neutral
+- [ ] Per-worker named browser session + explicit capture paths; browser state files provisioned by the conductor; shared `.playwright/cli.config.json` untouched and its `outputDir` neutral
 - [ ] Dashboard presented at the round checkpoint: native liveness first, `BLOCKED_` grep second, staleness > 20 min flagged
 - [ ] Every worker released / closed as it finishes — not at the end of the round
 - [ ] Sprint `progress.md` entry + STP comment + queue row + issue archive written by the CONDUCTOR, one per closed issue, after Stage 3 verified

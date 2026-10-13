@@ -99,7 +99,10 @@
         declara qué hace el agente, qué firma la persona, qué evidencia exige y con cuánta autonomía
         trabaja (escala 0-5). Los steps quedan dentro del stage como su desglose. Ninguno de los
         cuatro stages del Early-Game necesita un verificador separado, y en los cuatro el rol es QA
-        Analyst como executor.
+        Analyst como executor. Los niveles de autonomía y los nombres de transición de las tablas de
+        abajo son una copia para enseñar. La fuente vigente es
+        <code>.agents/skills/agentic-qa-core/references/stage-gates.md</code> para el contrato y la
+        autonomía, y <code>.agents/jira-workflows.json</code> para las transiciones.
       </p>
 
       <h3 id="stage-shift-left">Shift-Left (antes del sprint)</h3>
@@ -267,7 +270,9 @@
               <th>Transiciones en Jira</th>
               <td>
                 US: Ready For QA → In Test (<em>Start Testing</em>)<br />
-                US: In Test → BLOCKED (<em>defect reported</em>)
+                US: In Test → BLOCKED (<em>defect reported</em>), con
+                <code>qa.formal_blocked_gate: true</code>; si no, la historia queda en In Test con
+                el bug enlazado
               </td>
             </tr>
             <tr>
@@ -335,7 +340,7 @@
       </div>
 
       <div class="callout tip">
-        <span class="callout-title">¿Y el step 4?</span>
+        <span class="callout-title">Y el step 4?</span>
         <p>
           El step 4 (Priorización Risk-Based) pertenece al Early-Game, pero corre dentro del stage
           Documentation, que se extiende hasta el Mid-Game. Su contrato completo está en
@@ -524,12 +529,15 @@
               </td>
             </tr>
             <tr>
-              <td>MCPs (OpenAPI, base de datos, tracker, navegador)</td>
+              <td>MCPs y CLIs (schema de la API, base de datos, tracker, navegador)</td>
               <td><span class="badge accent">Adaptable</span></td>
               <td>
-                Así lee el agente schema, datos y tracker. Regla del boilerplate: el MCP lee y nunca
-                ejecuta (la API se ejercita con curl y el token de la CLI), y un MCP configurado
-                está en rojo hasta que responde de verdad.
+                Así lee el agente schema, datos y tracker. En este repo los MCPs son los que declara
+                <code>.mcp.json</code> (schema de la API y base de datos, entre otros); el tracker
+                se opera con la CLI <code>/acli</code> (el MCP de Atlassian es opcional) y el
+                navegador con <code>/playwright-cli</code>, sin MCP. Regla del boilerplate: el MCP
+                lee y nunca ejecuta (la API se ejercita con curl y el token de la CLI), y un MCP
+                configurado está en rojo hasta que responde de verdad.
               </td>
             </tr>
             <tr>
@@ -740,6 +748,8 @@
               <td>3 · QA</td>
               <td>
                 Ready For QA → In Test → QA Approved, con desvío a BLOCKED si se reporta un defecto
+                y <code>qa.formal_blocked_gate</code> está activo (si no, queda en In Test con el
+                bug enlazado)
               </td>
             </tr>
             <tr>
@@ -845,7 +855,7 @@
         <a class="card" href="iql.html">
           <span class="badge">Volver</span>
           <h3>El IQL completo</h3>
-          <p>Las tres fases, los ocho stages y el bucle completo.</p>
+          <p>Las tres fases, los stages y el bucle completo.</p>
         </a>
         <a class="card" href="mid-game.html">
           <span class="badge accent">Siguiente</span>

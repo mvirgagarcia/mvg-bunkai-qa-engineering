@@ -62,8 +62,8 @@ export type VarDestination = 'local' | 'github';
  *
  * The second case exists because `ATLASSIAN_URL` is deliberately NOT a local
  * variable: while it sat in `.env`, a stale copy in the process environment
- * shadowed the corrected file (both `bun`'s autoload and `dotenv-cli` skip a
- * var that is already set), and `jira:sync-issues` silently rebuilt the PBI
+ * shadowed the corrected file (both `bun`'s autoload and varlock skip a var
+ * that is already set), and `jira:sync-issues` silently rebuilt the PBI
  * cache from a dead Jira site with exit code 0. The host is project identity,
  * so it is anchored to a versioned file that shows up in a diff.
  *
@@ -155,7 +155,7 @@ export interface VarSchemaHints {
  *                    not "required": the installer never blocks on it. false →
  *                    never asked at install, never warned about; surfaced only
  *                    in the closing "Next steps" list with its `obtainHint`,
- *                    and settable later via `bun run setup --variables`.
+ *                    and settable later via `bun setup --variables`.
  *   - `obtainHint`   (NON-critical only) concise where/how-to-get-it pointer
  *                    printed in the closing next-steps section.
  *   - `defaultValue` (special cases only, e.g. TEST_ENV) value the installer
@@ -221,7 +221,7 @@ export const VAR_MANIFEST: VarSpec[] = [
     required: true,
     critical: false,
     defaultValue: 'local',
-    obtainHint: 'defaults to local; reconfigure manually or via the /adapt-framework skill when you adapt the framework to your project-under-test.',
+    obtainHint: 'defaults to local; reconfigure manually or via the /test-framework-adaptation skill when you adapt the framework to your project-under-test.',
     note: 'Which environment to test against. CI env INPUT, not a secret. Has a default, so it never blocks; an undeclared value fails by name at the envDataMap lookup. Installer writes the default; never prompts.',
     schema: { type: 'enum(local, staging)', default: 'local' },
   },
@@ -479,8 +479,8 @@ export const VAR_MANIFEST: VarSpec[] = [
     usedBy: 'openapi MCP (schema read-only)',
     required: false,
     critical: false,
-    obtainHint: 'path/URL to your project OpenAPI spec — set when adapting the framework.',
-    note: 'Path/URL to the OpenAPI spec for the OpenAPI MCP. Local only.',
+    obtainHint: 'the full spec URL, or a file path relative to the repo root; never the endpoint route alone — set when adapting the framework.',
+    note: 'Full URL or repo-root-relative file of the OpenAPI spec for the OpenAPI MCP. Local only.',
     schema: { example: './api/openapi.json' },
   },
   {
@@ -552,11 +552,42 @@ export const VAR_MANIFEST: VarSpec[] = [
     note: 'DBHub MCP password. Local only; sensitive.',
   },
 
+  // TOOLING scope, consumed by the local `slack-aurora` MCP (the Slack bot).
+  // The server reads exactly these two names, so every host forwards them by
+  // name. Validated at the point of use: a project without the bot leaves both
+  // empty and never calls a Slack tool. The reaction allowlist is workspace
+  // identity (channel ids), which is why it lives in `.env` and never in a
+  // committed MCP file.
+  {
+    name: 'SLACK_MCP_XOXP_TOKEN',
+    destinations: ['local'],
+    secret: true,
+    scope: 'tooling',
+    usedBy: 'slack-aurora MCP (Slack bot: read, post, react)',
+    required: false,
+    critical: false,
+    obtainHint: 'Slack app → OAuth & Permissions → the bot token (only if this project runs the Slack bot).',
+    note: 'Slack token for the slack-aurora MCP. Local only; sensitive.',
+    schema: { docs: 'https://github.com/korotovsky/slack-mcp-server' },
+  },
+  {
+    name: 'SLACK_MCP_REACTION_TOOL',
+    destinations: ['local'],
+    secret: false,
+    scope: 'tooling',
+    usedBy: 'slack-aurora MCP (enables reactions_add / reactions_remove)',
+    required: false,
+    critical: false,
+    obtainHint: 'comma-separated Slack channel ids the bot may react in, or true for all; empty = reactions off.',
+    note: 'Reaction-tool allowlist for the slack-aurora MCP. Local only; workspace channel ids never go in a committed file.',
+    schema: { example: 'C0123456789,C0987654321' },
+  },
+
   // --- Private report portal (TOOLING, CI-only, opt-in) ---
   // Read by `scripts/ci/publish-allure-portal.ts` through a named `requiredEnv`
   // throw, and only when the suite workflows find `PORTAL_URL` set: the
   // presence of that one secret IS the feature switch, and the script is the
-  // point of use. Declared here so `bun run setup --variables --remote` can
+  // point of use. Declared here so `bun setup --variables --remote` can
   // push them and the doctor can list them; never in `.env`, never a blocker.
   // Runbook: .agents/skills/regression-testing/references/private-hosting-setup.md
   {

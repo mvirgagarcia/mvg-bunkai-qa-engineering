@@ -15,52 +15,47 @@ The directory has two roles:
 
 | File | What it is | Who edits it | How to regenerate |
 |---|---|---|---|
-| `project.yaml` | Human-edited project config: project name, repo paths, URLs, MCP server names, issue-tracker metadata, default env. ALSO holds the `git_strategy:` block (this repo's git workflow — read by `git-flow-master`; see §"`git_strategy`" below), the `updater:` block (files `bun run up` must keep as the project's own; see §"`updater`" below), and the `orchestration:` block (defaults for supervised multi-session worker fleets — read by `orca-orchestration`; see §"`orchestration`" below). | You (project owner) / `git-flow-master` (git_strategy block) / `orca-orchestration` (orchestration block) | `bun run agents:setup` (identity/env fields) or edit by hand. The `git_strategy:` block is filled by `git-flow-master` Strategy Setup, NOT by `agents:setup`. |
+| `project.yaml` | Human-edited project config: project name, repo paths, URLs, MCP server names, issue-tracker metadata, default env. ALSO holds the `git_strategy:` block (this repo's git workflow — read by `git-flow-master`; see §"`git_strategy`" below), the `updater:` block (files `bun sync` must keep as the project's own; see §"`updater`" below), and the `orchestration:` block (defaults for supervised multi-session worker fleets — read by `orca-orchestration`; see §"`orchestration`" below). | You (project owner) / `git-flow-master` (git_strategy block) / `orca-orchestration` (orchestration block) | `bun run agents:setup` (identity/env fields) or edit by hand. The `git_strategy:` block is filled by `git-flow-master` Strategy Setup, NOT by `agents:setup`. |
 | `jira-fields.json` | Auto-generated catalog of every custom field in your Jira workspace, keyed by canonical slug. Each entry has `id`, `type`, optional `name`, `options`, `system`, `provider`. | Generated only — **do not edit by hand** | `bun run jira:sync-fields` |
 | `jira-workflows.json` | Auto-generated catalog of workflow statuses + transitions per `work_type`, keyed by canonical slug. Each `work_type` entry has `jira_issue_type`, `workflow_scheme`, `workflow`, `statuses`, `transitions`. | Generated only — **do not edit by hand** | `bun run jira:sync-workflows` |
 | `jira-link-types.json` | Auto-generated catalog of every issue link type in your Jira workspace (e.g. `blocks`, `relates`, `is caused by`), keyed by canonical slug. Each entry has `id`, `name`, `outward`, `inward`, `exists_in_workspace`. | Generated only — **do not edit by hand** | `bun run jira:sync-link-types` |
 | `jira-required.yaml` | Declarative manifest of the custom fields AND `work_types:` (issue types + canonical statuses + canonical transitions) the methodology requires. The contract between skills and the user's Jira. | Methodology maintainers | Updated when a skill adds or drops a `{{jira.<slug>}}` / `{{jira.work_type.*}}` / `{{jira.status.*}}` / `{{jira.transition.*}}` reference. |
-| `project.schema.yaml` | The TEMPLATE `project.yaml` is compared against: the same file with its placeholders blank, its methodology defaults kept, and every value or comment that is the BOILERPLATE's own identity replaced. Generated upstream, SYNCED here like any other upstream file. `bun run up` uses it to offer the keys this project lacks. | Generated only — **do not edit by hand**, and in a consumer project do not regenerate it either: it is upstream's, not yours | `bun run agents:schema` (boilerplate only). Here: `bun run up`. See what you are missing with `bun run agents:schema --project`. |
+| `project.schema.yaml` | The TEMPLATE `project.yaml` is compared against: the same file with its placeholders blank, its methodology defaults kept, and every value or comment that is the BOILERPLATE's own identity replaced. Generated upstream, SYNCED here like any other upstream file. `bun sync` uses it to offer the keys this project lacks. | Generated only — **do not edit by hand**, and in a consumer project do not regenerate it either: it is upstream's, not yours | `bun run agents:schema` (boilerplate only). Here: `bun sync`. See what you are missing with `bun run agents:schema --project`. |
 | `README.md` | This file. | Methodology maintainers | — |
 
 ## `git_strategy` (block inside `project.yaml`)
 
-The persisted source of truth for **this repository's** git workflow lives as the `git_strategy:` block inside `.agents/project.yaml` (not a separate file). `git-flow-master` reads it before any branch / commit / push / PR / `gh` operation and adapts every action to the declared strategy. When `git_strategy.strategy` is `null`, `git-flow-master` detects the strategy per-invocation and OFFERS **Strategy Setup**, which fills the block.
+The persisted source of truth for **this repository's** git workflow lives as the `git_strategy:` block inside `.agents/project.yaml` (not a separate file). `git-flow-master` reads it before any branch / commit / push / PR / `gh` operation and adapts every action to the declared strategy. While `git_strategy.meta.strategy_source` is `inherited` (the shipped default nobody chose), `git-flow-master` OFFERS **Strategy Setup**, which fills the block and stamps `chosen`.
 
 **Lifecycle**
 
-- **Ships as a template** — the boilerplate's `project.yaml` carries `git_strategy.strategy: null` (like every other field). A fresh project inherits the unset block and fills it on first git use.
+- **Ships as a default, not a decision** — the template (`project.schema.yaml`) carries a working `strategy` value with `meta.strategy_source: inherited`. A fresh project runs on that default until Strategy Setup records a real choice.
 - **Autogenerated** by `git-flow-master` Strategy Setup (pick the flow → create only the branches that flow needs → write the block in place).
 - **Committed / tracked** — part of each project's git workflow contract.
-- **Frozen by `bun run up`** — `project.yaml` is in the updater's `bootstrapOnlyPaths`, so a consumer project's filled strategy is never overwritten.
+- **Frozen by `bun sync`** — `project.yaml` is in the updater's `bootstrapOnlyPaths`, so a consumer project's filled strategy is never overwritten.
 - **Hand-editable** — edit the block to change the workflow, or re-run Strategy Setup.
 - **Not a `{{VAR}}` source** — `vars:check` skips the `git_strategy:` block (its leaves are read directly by the skill, not as template variables).
 
 **Field schema**
 
-| Field | Type | Description |
-|---|---|---|
-| `strategy` | enum | `solo-main` / `main-integration` / `enterprise` / `trunk-based` / `gitflow` / `github-flow` / `gitlab-flow` / `sdet`. `null` until Strategy Setup runs. |
-| `description` | string | Human-readable summary of the chosen flow. |
-| `branches.production` | string | Production / default branch (e.g. `main`). |
-| `branches.integration` | string\|null | Long-lived integration branch, if any (e.g. `staging`). |
-| `branches.ephemeral_pattern` | string\|null | On-demand trunk pattern (e.g. `test/<module>-suite` for `sdet`). |
-| `protected[]` | string[] | Branches requiring explicit confirm before a direct push. |
-| `decisions.promote_method` | enum | `ff-only` / `merge-commit` / `squash` / `n/a`. |
-| `decisions.feature_merge` | enum | `merge-commit` / `squash` / `rebase-merge` / `n/a`. |
-| `decisions.hotfix_policy` | enum | `branch-off-prod-backmerge` / `via-integration` / `none` / `n/a`. |
-| `policy.direct_push_to_protected` | enum | `forbidden` / `confirm` / `allowed` — direct pushes to protected branches. |
-| `policy.admin_bypass` | bool | Team policy: may a repo admin bypass PR/protection for urgent changes? Intent only — real capability depends on the GitHub user's role; the skill re-confirms at runtime. |
-| `policy.require_pr_reviews` | int\|null | Min approvals before merge to a protected branch (informational). |
-| `branch_prefixes.precedence` | list | Order for choosing a prefix when several apply. |
-| `branch_prefixes.naming_with_key` | string | Branch-name template with an issue key (e.g. `test/UPEX-123-slug`). |
-| `branch_prefixes.naming_without_key` | string | Branch-name template without a key. |
-| `meta.setup_version` | int | Strategy Setup schema version. |
-| `meta.created` | string | Date stamped by Strategy Setup. |
+The keys, their allowed values and their shipped defaults are the commented `git_strategy:` block in `.agents/project.schema.yaml`; every leaf carries its own inline comment there. `git-flow-master` owns the semantics (strategy catalogue, Strategy Setup questionnaire, `git:policy` reconciliation), and `bun run git:policy verify` compares the `policy` leaves against the host.
+
+**Policy drift and accepted divergences**
+
+`policy:` records intent; the hosting platform records enforcement, and the two drift (someone tightens protection in the UI, or the block was filled before the remote existed). `git-flow-master` runs `bun run git:policy verify` once per session at the first push / PR / merge intent, reports each mismatch with both values, and lets YOU decide whether to align the yaml, change the host (`bun run git:policy apply`), or accept the divergence. It never edits the block on its own.
+
+Accepting is the third answer, and it is recorded in the yaml, not in prose:
+
+| Key | What it records |
+|---|---|
+| `policy.accepted_divergences[]` | One entry per divergence the project signed off. `field` names a `verify` finding verbatim (`<branch>.<policy_field>`, e.g. `main.direct_push_to_protected`); `enforced`, `accepted` (the date) and `reason` say what the host does and why that is right here. |
+| `meta.policy_source` | `verified` = the host matches the yaml exactly; `accepted` = it matches modulo the listed divergences; `declared` = never reconciled, or an unaccepted drift is open. Only `verify --stamp` writes `verified` or `accepted`, together with the date in `meta.policy_verified`. |
+
+What an entry changes: `verify` reports a matching finding under ACCEPTED instead of DRIFT and exits 0; an entry that matches no finding is reported as STALE, so the list cannot quietly keep dead exceptions; a field whose host side could not be read (no admin rights on the ruleset, `gh` offline) is not called stale, because absence of data is not data; and `apply` carries the host's side of an accepted field forward instead of deriving it away, so applying the policy never opens the branch the divergence keeps closed. Nothing outside the list is relaxed: every other drift still exits 1.
 
 ## `updater` (block inside `project.yaml`)
 
-`bun run up` never overwrites the files on its protected watchlist (`PROTECTED_WATCHLIST` in `cli/update-boilerplate.ts`; `AGENTS.md` and `.agents/project.yaml` are two of them, and `bun run up --dry-run` prints the rest): a watched file inside a synced component is delivered once when missing, then it is project-owned, and when upstream's copy changes the parity report shows a drift row with evidence (keys, headings or hunks) instead of touching it. The `updater:` block lets a project extend that list.
+`bun sync` never overwrites the files on its protected watchlist (`PROTECTED_WATCHLIST` in `cli/update-boilerplate.ts`; `AGENTS.md` and `.agents/project.yaml` are two of them, and `bun sync --dry-run` prints the rest): a watched file inside a synced component is delivered once when missing, then it is project-owned, and when upstream's copy changes the parity report shows a drift row with evidence (keys, headings or hunks) instead of touching it. The `updater:` block lets a project extend that list.
 
 ```yaml
 updater:
@@ -84,11 +79,78 @@ updater:
   schema_exempt: [orchestration] # top-level block NAMES, not key paths
 ```
 
-`bun run up` compares this file against `project.schema.yaml` to full depth and offers to insert what upstream has and you lack. A block you removed on purpose would be re-offered on every run forever, and a warning that recurs forever is one people silence wholesale — which costs them the real gaps too. Listing it here silences that block and nothing else.
+`bun sync` compares this file against `project.schema.yaml` to full depth and offers to insert what upstream has and you lack. A block you removed on purpose would be re-offered on every run forever, and a warning that recurs forever is one people silence wholesale — which costs them the real gaps too. Listing it here silences that block and nothing else.
 
 - **Block names only.** `orchestration`, not `orchestration.max_workers`. The prompt is per block, so the opt-out is too.
 - **It silences, it does not fix.** An exempt block is still absent. `bun run agents:schema --project` prints what is silenced alongside what is missing, so the decision stays visible.
 - **Same carve-out as `protected_paths`**: read directly by the updater, so `vars:check` skips it.
+
+### `updater.declined_denies`
+
+Upstream deny rules this project does not want in `.claude/settings.json`.
+
+```yaml
+updater:
+  protected_paths: []
+  declined_denies: ['Bash(env)'] # exact entries, written as in permissions.deny
+```
+
+`.claude/settings.json` is never overwritten, but two of its lists grow on every `bun sync`: entries upstream has in `permissions.allow` or `permissions.deny` and the project lacks are appended after the project's own, after a backup. Nothing is removed or reordered, and `ask`, `env` and every other key stay as written (`hooks` has its own additive merge, below). That is how a project scaffolded before a deny rule shipped (the secret denies, for one) receives it. An allow entry you do not want is re-expressible in `deny`, which wins; a deny entry has no stronger list, so you decline it here.
+
+- **Exact entries, per rule.** `Bash(env)`, not a pattern over entries. Every other upstream deny, including one a later release adds, still arrives: listing `.claude/settings.json` in `protected_paths` would not opt out (the file is already watched) and would not be the right size anyway.
+- **It never removes.** A declined entry the file already holds stays until you delete it by hand; the list only stops the updater from adding it back.
+- **A malformed value fails toward more denies.** Anything but a list of strings is reported at the run and ignored.
+- **`opencode.jsonc` is never written.** Its `permission` block is JSONC with ordered rules (the last match wins), so the upstream deny rules it lacks become one parity row on the MCP surface with the block to paste in the saved prompt. The block also carries the upstream exceptions that follow a missing deny (`"*.env.example": "allow"` after `"*.env.*": "deny"`), so pasting keeps the order. To decline one there, list the pattern yourself with another action (`"printenv*": "ask"`): a pattern the project lists, whatever its action, is never reported.
+- **Same carve-out as `protected_paths`**: read directly by the updater (`readDeclinedDenies` in `cli/lib/updater-settings.ts`), so `vars:check` skips it.
+
+### `updater.declined_hooks`
+
+Upstream hook commands this project does not want in `.claude/settings.json`.
+
+```yaml
+updater:
+  declined_hooks: ['node "$CLAUDE_PROJECT_DIR/.agents/hooks/doc-contracts.mjs"'] # exact command text
+```
+
+The `hooks` block grows on every `bun sync` too, before the compatibility check runs: an upstream hook command the project lacks under the same event and matcher is appended as a NEW group at the end of that event's list, after a backup. The project's own groups are never edited, reordered or removed. That is how a hook group `agents:compat:check` starts requiring (the route re-surface `PostToolUse` group, ADR-0017) reaches a project scaffolded before it, instead of leaving pre-commit, pre-push and CI red until someone edits the file by hand.
+
+- **Exact command text, every event.** A listed command is left out wherever upstream runs it; the run reports it as declined.
+- **A required hook stays required.** Declining a command `agents:compat:check` asserts on keeps that check red: the opt-out is for hooks the check does not require.
+- **A command whose script you lack is not added.** It is reported instead, because a hook pointing at a missing file fails on every event.
+- **A repeated key is folded, not lost.** A git auto-merge can leave `"PostToolUse"` twice in one object; `JSON.parse` keeps only the last. The merge folds both lists into one and reports it.
+- **Same carve-out as `protected_paths`**: read directly by the updater (`readDeclinedHooks` in `cli/lib/updater-settings.ts`), so `vars:check` skips it.
+
+## `harnesses` (top-level list in `project.yaml`)
+
+Which host harnesses this project uses, any of `claude`, `opencode`, `codex` (ADR-0012).
+
+```yaml
+harnesses: [claude] # e.g. a team on Claude Code only
+```
+
+- **What it decides**: every compatibility gate (`agents:compat:check`, `setup:doctor`, the installer, `bun sync`) checks only the listed harnesses. A harness left out may delete its files (`HARNESS_FILES` in `cli/lib/harness-selection.ts`), and the updater stops delivering them.
+- **Absent or `null`**: detected from the files present. A harness is in use while ANY of its files exists, so deleting one file of a harness still fails its contract; nothing found at all checks all three.
+- **Who writes it**: `bun setup` adds the agents you select (union only, it never removes one) and then offers to delete the files of each harness left out (default keep). Edit the list by hand to drop one.
+- **The boilerplate itself** checks all three, whatever its own yaml says.
+- Read directly by `cli/lib/harness-selection.ts`, so `vars:check` skips it.
+
+## `secrets` (block inside `project.yaml`)
+
+Where secret VALUES come from (ADR-0010). `.env` / `.env.local` is the default; a secret manager is the advanced option.
+
+```yaml
+secrets:
+  provider: local # local | 1password
+  onepassword:
+    vault: null # the vault the op:// references point at
+    account: null # sign-in shorthand from `op account list`; null = the CLI default account
+    auth: app # app (desktop app locally, service account in CI) | service-account (token only)
+```
+
+- **What it decides**: with a manager selected, `bun setup` writes the committed overlay `.env.provider.schema`, which holds references only (`op(op://vault/item/field)`), never values. A non-empty `.env` / `.env.local` value still wins over the vault.
+- **Validation**: an unknown `provider` or `auth` throws (`cli/lib/secret-providers.ts`) rather than guess a source; a missing block reads as `local`.
+- **Steps and CI**: `INSTALLER.md` ("Secret manager (advanced)").
+- Read directly by the installer, not a `{{VAR}}` source.
 
 ## `orchestration` (block inside `project.yaml`)
 
@@ -96,7 +158,7 @@ Default settings for **supervised multi-session worker fleets** — one conducto
 
 ```yaml
 orchestration:
-  max_workers: 4        # concurrent workers per round
+  max_workers: 4        # concurrent workers per round (example value)
   default_agent: claude # claude | codex | opencode
   default_model: ''     # full provider model id; empty = the harness default
   default_effort: high  # harness effort level when supported
@@ -118,11 +180,11 @@ orchestration:
 
 **Naming the orchestrator here is what lets a skill stop hardcoding it.** A project on a different orchestrator keeps the whole doctrine and swaps the values of the `orchestration:` block.
 
-**An explicit user instruction in the conductor session always overrides these defaults for that run** — they are the fallback only when the user says nothing (e.g. "launch 6 workers" beats `max_workers: 4` for that dispatch). `bun run vars:check` reports any leaf as `DECLARED_BUT_UNUSED` until a skill or doc references it by name; that warning does not fail the check.
+**An explicit user instruction in the conductor session always overrides these defaults for that run** — they are the fallback only when the user says nothing (e.g. "launch 6 workers" beats `max_workers` for that dispatch). `bun run vars:check` reports any leaf as `DECLARED_BUT_UNUSED` until a skill or doc references it by name; that warning does not fail the check.
 
 ## Variable syntax conventions
 
-Three families of syntax coexist across skills, commands and docs (`{{VAR}}`, `<<VAR>>`, `{{jira.*}}`), and the table below shows the several shapes each one takes. Each resolves from a different place:
+Three families of syntax coexist across skills, commands and docs (`{{VAR}}`, `<<VAR>>`, `{{jira.*}}`), and the table below shows the shapes each one takes. Each resolves from a different place:
 
 | Syntax | Meaning | Resolves from | Validated by |
 |---|---|---|---|
@@ -135,11 +197,22 @@ Three families of syntax coexist across skills, commands and docs (`{{VAR}}`, `<
 | `{{jira.status.<work_type>.<slug>}}` | **Jira status reference** — portable pointer to a workflow status's literal name (e.g. `"Ready For QA"`). Use case: `acli workitem update --status "{{jira.status.story.ready_for_qa}}"`. Optional sub-keys: `.id` (numeric status id) and `.category` (`new` / `indeterminate` / `done`). | `.agents/jira-workflows.json` → `<work_type>.statuses.<slug>` (default sub-key: `.name`). Both `<work_type>` and `<slug>` must be declared in `.agents/jira-required.yaml` under `work_types.<work_type>.required_statuses`. | `bun run vars:check` (manifest declaration + catalog presence + valid sub-key). |
 | `{{jira.transition.<work_type>.<slug>}}` | **Jira transition reference** — portable pointer to a workflow transition's `id` (e.g. `"41"`). The default sub-key is `.id` because it removes the ambiguous-transition gotcha documented in `.agents/skills/acli/references/gotchas.md` — invoke transitions unambiguously via REST `POST /rest/api/3/issue/{key}/transitions` with `{"transition":{"id":"…"}}`. Optional sub-key: `.name` (transition literal name) for callers that prefer `acli`'s name-based interface. | `.agents/jira-workflows.json` → `<work_type>.transitions.<slug>` (default sub-key: `.id`). Both `<work_type>` and `<slug>` must be declared in `.agents/jira-required.yaml` under `work_types.<work_type>.required_transitions`. | `bun run vars:check` (manifest declaration + catalog presence + valid sub-key). |
 
-The `{{…}}` vs `<<…>>` distinction is intentional: it removes the previous ambiguity where both project data and ephemeral session data shared the same `{{VAR}}` syntax.
+The `{{…}}` vs `<<…>>` distinction is intentional: project data and ephemeral session data never share one syntax.
+
+### Checkout roots: `<<REPO_ROOT>>` and `<<PRIMARY_ROOT>>`
+
+Two session variables name a directory, and they differ the moment a session runs inside a linked git worktree (Orca, `claude --worktree`, a Codex-managed worktree, a plain `git worktree add`):
+
+| Variable | Resolves to | Use it for |
+|---|---|---|
+| `<<REPO_ROOT>>` | `git rev-parse --show-toplevel`: THIS checkout, the worktree when there is one | tracked files the session reads or edits: code, skills, docs, configs, the committed `test-specs/` |
+| `<<PRIMARY_ROOT>>` | `dirname "$(git rev-parse --path-format=absolute --git-common-dir)"`: the primary checkout, the same value from the primary and from every worktree of it | durable GITIGNORED state: `.session/**` (plans, progress, handoffs, refinements, upstream drafts), PBI `[LOCAL]` files and `evidence/`, `.context/reports/` |
+
+In the primary checkout both resolve to the same path. In a worktree, anything written under `<<REPO_ROOT>>` that git ignores dies when the worktree is removed, so durable state is always written to and resumed from `<<PRIMARY_ROOT>>`, by absolute path. `bun run worktree:audit <path>` lists what a worktree still holds before it is removed, and `--rescue` copies the state class to the same path under `<<PRIMARY_ROOT>>`.
 
 ### Active environment
 
-`project.yaml` has a top-level `environments:` map (defaults: `local` + `staging`; you can add `production`, `qa`, `dev`, `uat`, etc.). Each environment declares the same leaves, listed under `environments:` in `project.yaml`. Skills don't hardcode "staging" or "local" anywhere — they reference the bare form (`{{WEB_URL}}` etc.) and the AI resolves it against the **active environment** for the current session:
+`project.yaml` has a top-level `environments:` map (the shipped set is the one `project.schema.yaml` lists; add or drop environments to match your project). Each environment declares the same leaves, listed under `environments:` in `project.yaml`. Skills don't hardcode "staging" or "local" anywhere — they reference the bare form (`{{WEB_URL}}` etc.) and the AI resolves it against the **active environment** for the current session:
 
 1. If the user explicitly chose an env this session ("run regression against production"), use that.
 2. Otherwise fall back to `testing.default_env` from `project.yaml`.
@@ -158,7 +231,19 @@ When a document genuinely needs to compare environments (e.g. the constitution's
 
 Both `/sprint-testing` and `/test-documentation` resolve it at their modality gate, alongside `{{TMS_CLI}}`, and keep it sticky for the session. An unset or unrecognized value is treated as `auto` — a missing knob is the default, never a hard stop. The rationale for each value (and the cost of each override) is in `.agents/skills/sprint-testing/SKILL.md` §"Which stage creates the TCs", which is the authoritative section.
 
-Because it is a scalar leaf of a top-level section, `bun run vars:check` validates `{{TC_CREATION_STAGE}}` like any other flat project variable — no linter change was needed to register it.
+Because it is a scalar leaf of a top-level section, `bun run vars:check` validates `{{TC_CREATION_STAGE}}` like any other flat project variable.
+
+### Browser pair mode
+
+`testing.browser.pair_mode` decides whether agentic browser sessions run in the AI's own browser or as **Agentic Pair Testing**, where the human and the AI test together in the human's own running Chrome (`playwright-cli attach`). Skills read it directly; it is not a `{{VAR}}` token.
+
+| Value | Meaning |
+|---|---|
+| `null` (shipped default) | not chosen yet: the first agentic browser session presents both modes, and the answer is saved here once as `true` or `false` |
+| `true` | pair testing is the default mode |
+| `false` | dedicated sessions by default; pair testing only on explicit request, after one confirmation |
+
+Unattended runs (CI, scheduled routines, a worker with no human watching) never pair, whatever the value. Canon, including what several sessions on one Chrome can and cannot share: `.agents/skills/agentic-qa-core/references/browser-sessions.md` §6.
 
 ## Workflows
 
@@ -169,8 +254,8 @@ When you clone this boilerplate into a new project:
 1. Copy `.env.example` to `.env` and fill in:
    - `LOCAL_USER_EMAIL` / `STAGING_USER_EMAIL` and the matching passwords (test users).
    - `ATLASSIAN_EMAIL` / `ATLASSIAN_API_TOKEN` (get a token at <https://id.atlassian.com/manage-profile/security/api-tokens>). The Atlassian **site URL** does not go here — it is `issue_tracker.atlassian_url` in `.agents/project.yaml`, the source of truth, because a stale copy in `.env` silently shadowed the real value. Confirm with `bun run --silent jira:url`.
-2. Run `bun run agents:setup` to walk through the project variables interactively. The CLI walks the flat sections (project, backend, frontend, database, issue_tracker, testing) first, then asks which environments your project has (default: `local` + `staging`; you can add `production`, `dev`, `qa`, `uat`, etc.) and prompts for the env-scoped vars (the leaves under `environments:` in `project.yaml`) in each. It validates `testing.default_env` against the env list, shows the `# TODO:` description and example for every field, and writes back to `.agents/project.yaml` preserving comments. Alternative: edit `.agents/project.yaml` by hand.
-3. Run `bun run jira:sync-fields` to discover your Jira workspace's custom fields. Writes `.agents/jira-fields.json` (~100-150 fields typical). Resolves slug collisions deterministically — see `--allow-collisions` if you hit one.
+2. Run `bun run agents:setup` to walk through the project variables interactively. The CLI walks the flat sections (project, backend, frontend, database, issue_tracker, testing) first, then asks which environments your project has (pre-selected: `DEFAULT_ENVS` in `scripts/agents-setup.ts`; add or drop to match your project) and prompts for the env-scoped vars (the leaves under `environments:` in `project.yaml`) in each. It validates `testing.default_env` against the env list, shows the `# TODO:` description and example for every field, and writes back to `.agents/project.yaml` preserving comments. Alternative: edit `.agents/project.yaml` by hand.
+3. Run `bun run jira:sync-fields` to discover your Jira workspace's custom fields. Writes `.agents/jira-fields.json`. Resolves slug collisions deterministically — see `--allow-collisions` if you hit one.
 4. Run `bun run jira:sync-workflows` to discover your Jira workspace's workflow statuses + transitions for every `work_type` declared in `jira-required.yaml`. Writes `.agents/jira-workflows.json`. Interactive on first run (prompts when a canonical slug doesn't auto-resolve to a workflow's real status / transition); idempotent on subsequent runs unless you pass `--force`.
 5. Run `bun run jira:check` to validate your Jira against the methodology's required-fields **and** required-`work_types` manifest. Address any output:
    - **❌ MISSING** — for a custom field: create the field in Jira admin (Settings → Issues → Custom fields) with the suggested name, type, and options. Re-run `bun run jira:sync-fields --force` then `bun run jira:check`. For a `work_type` / status / transition: amend the workflow in Jira admin so it exposes the required status / transition, then re-run `bun run jira:sync-workflows --force` then `bun run jira:check`.
@@ -219,7 +304,7 @@ When the methodology evolves and needs a brand-new custom field that doesn't exi
 4. Update this README's troubleshooting section if behavior is non-trivial.
 5. Communicate to all boilerplate users (release notes / changelog) that they must create the field in their Jira and rerun `bun run jira:sync-fields --force`.
 
-**The "unmapped" pattern.** When a field is required semantically but no Jira field exists yet, put the slug under `unmapped:` with a `description:` and `used_by:`. Skills then reference it as a literal marker (e.g. `customfield_<slug>`) with HTML-comment TODOs pointing at the manifest. Once a real field is created, move the entry from `unmapped:` to `required:` (with full metadata: `name`, `type`, `options`, …) and replace the literal markers with `{{jira.<slug>}}` syntax. (This is exactly how `acceptance_test_results` was migrated when ATR was first configured: it lived under `unmapped:` while skills referenced `customfield_ATR`, and was promoted once the user created the matching field in Jira admin.)
+**The "unmapped" pattern.** When a field is required semantically but no Jira field exists yet, put the slug under `unmapped:` with a `description:` and `used_by:`. Skills then reference it as a literal marker (e.g. `customfield_<slug>`) with HTML-comment TODOs pointing at the manifest. Once a real field is created, move the entry from `unmapped:` to `required:` (with full metadata: `name`, `type`, `options`, …) and replace the literal markers with `{{jira.<slug>}}` syntax.
 
 ### 5.4 Adding a new required Jira `work_type` / status / transition
 

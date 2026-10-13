@@ -16,7 +16,9 @@
 3. Create the orchestration scope on disk: `.session/orchestration/<slug>/`, where `<slug>` names the
    wave of work (`sprint-42-qa`, `kata-fixtures-refactor`, `regression-2026-09-17`). Everything the
    fleet needs to survive a crash lives there, in the PRIMARY checkout, cited by absolute path.
-4. Seed `run.md`, `roster.md`, `COMMON.md` and `launch.txt` from `templates/`.
+4. Seed `run.md`, `roster.md`, `COMMON.md` and `launch.txt` from `templates/`. When the wave belongs to
+   one workflow skill, `launch.txt` lives in that skill's scope instead and this scope does not get
+   a copy (`references/launch-seam.md` §2.1).
 
 **Everything written inside a worktree dies with the worktree.** Fleet state belongs in the primary
 checkout, and a worker reaches it by absolute path in its prompt — never by a relative path, never by
@@ -46,7 +48,7 @@ orca terminal rename --terminal "$ORCA_TERMINAL_HANDLE" --title "conductor · <s
 #     sentence, and anything that has to be right from the first action — the session-title
 #     token and the no-stopping clause included. Which is why the briefs are written first:
 #     the spec cites them by path.
-orca orchestration task-create --display-name '<KEY>' --spec '/<workflow-skill> <KEY> fleet worker. Read <ABS>/.session/orchestration/<slug>/COMMON.md then <ABS>/.session/orchestration/<slug>/W-<label>.md and execute your brief. Run every stage without returning to the prompt until worker_done is sent; stage boundaries are not checkpoints. Channel: orca orchestration. No heartbeats.' --json </dev/null
+orca orchestration task-create --display-name '<KEY>' --spec '/<workflow-skill> <KEY> fleet worker. Read <ABS>/.session/orchestration/<slug>/COMMON.md then <ABS>/.session/orchestration/<slug>/W-<label>.md and execute your brief. Run every stage without returning to the prompt until worker_done is sent; stage boundaries are not checkpoints. Channel: orca orchestration. No heartbeats. ROUTE-SCOPE: <section ids>' --json </dev/null
 #     <KEY> is the worker's ROSTER NAME, one value everywhere: the ticket key (or <KEY>-<slug>) for a
 #       ticket, a kebab slug for anything else (`volatile-impl`). It is the session name, the tab title
 #       prefix, the task display name and the `Session:` trailer. One token, no extra words between it
@@ -83,15 +85,16 @@ orca terminal rename --terminal <handle> --title "<KEY> · task_<first 4 of the 
 #     --effort requires --model; neither combines with --terminal. --name names a NEW WORKTREE,
 #       not the session: there is no session-name flag on this path (see §1b).
 #     Prerequisites, both invisible from here: the agent's per-machine default arguments must carry
-#       an auto permission mode, and credentials must reach the worker: Claude reads
-#       `.claude/settings.local.json`, OpenCode reads `.auth/opencode/*` (both from `bun run harness:env`),
-#       Codex needs direnv in the interactive shell (G45). references/orca-machine-setup.md §3.
+#       an auto permission mode, and credentials must reach the worker: every MCP server reads the
+#       worktree's own `.env` through the `.env` loader in the MCP configs, and every other process
+#       loads its own config; nothing is exported into the shell. references/orca-machine-setup.md §3.
 
 # 5 · verify readiness AND credentials on the worker's screen, before sending it any work
 orca terminal read --terminal <handle> --screen --json </dev/null
 #     want: the agent's status footer (model, effort) AND evidence credentials loaded
-#     (an MCP tool listed as connected, a direnv export line on Codex, or the worker's own
-#     first probe). No credentials → fix the machine, do not dispatch work to it.
+#     (its MCP servers listed as connected, e.g. `/mcp` on Claude Code, or the worker's own
+#     first probe). No credentials → provision the worktree's `.env` and restart the session, do
+#     not dispatch work to it.
 #     Also the SESSION NAME in the status bar. Claude Code: the identity hook named it from the
 #     prompt token; the bar reads `<KEY>`. OpenCode and Codex have no hook that can: drive the TUI
 #     with `terminal send --enter --text '/rename <KEY>'` once the screen shows it ready, then read
@@ -104,12 +107,13 @@ orca terminal read --terminal <handle> --screen --json </dev/null
 #     Anything longer than a couple of sentences goes in a FILE with a one-line pointer here:
 #     a long --text is truncated and still reports accepted:true with a byte count (G60).
 orca terminal send --terminal <handle> --enter \
-  --text '/sprint-testing <KEY> fleet worker. Read <ABS>/.session/orchestration/<slug>/COMMON.md then <ABS>/.session/orchestration/<slug>/W-<label>.md and execute your brief. Run every stage without returning to the prompt until worker_done is sent; stage boundaries are not checkpoints. Channel: orca orchestration. No heartbeats.' \
+  --text '/sprint-testing <KEY> fleet worker. Read <ABS>/.session/orchestration/<slug>/COMMON.md then <ABS>/.session/orchestration/<slug>/W-<label>.md and execute your brief. Run every stage without returning to the prompt until worker_done is sent; stage boundaries are not checkpoints. Channel: orca orchestration. No heartbeats. ROUTE-SCOPE: <section ids>' \
   --json </dev/null
 #     The prompt MUST OPEN with `/<workflow-skill> <KEY> fleet worker`: that token is what the
 #     identity hook turns into the session name `<KEY>` on Claude Code (there is no name flag here),
 #     and what the workflow skill reads to know it is a fleet worker. Everything after it is the
-#     brief pointer plus the continuation sentence.
+#     brief pointer, the continuation sentence and, LAST, the `ROUTE-SCOPE:` sentence that tells the
+#     prompt hook which instruction sections to route (launch-seam.md §2.1b).
 #     On `agent_prompt_stalled`: the text is usually ALREADY queued. Read the screen or
 #     `worktree ps` before resending, or the worker gets the message twice (G52).
 
@@ -152,7 +156,7 @@ about each:
 | the session-name flag, and any say over the tab title | the roster, the board card and the `Session:` commit trailer all key off the label, and the runtime titles the tab `worker-<task id>` (G71) | the prompt opens with `/<workflow-skill> <KEY> fleet worker` and the identity hook names a Claude Code session `<KEY>` from it; the conductor sends `/rename <KEY>` to the other harnesses (step 5) and renames the tab (step 4b). `references/session-identity.md` §2b |
 | environment variables in the launch line | a worker cannot be marked as a fleet worker by an exported variable | the brief and the prompt token carry it. `sprint-testing` detects worker mode from them, not from the environment |
 | the prompt in the launch itself | the worker starts idle at its prompt | step 6: `terminal send` immediately after readiness. Until it lands, the worker has nothing to do |
-| a launch line that also loads the env file | Claude and OpenCode workers read the surfaces `bun run harness:env` generated; a Codex worker, or any shell-exported variable, depends on the MACHINE having direnv, and nothing reports its absence | step 5: verify credentials on screen BEFORE dispatching work (G45) |
+| a launch line that also loads the env file | every MCP server reads the worktree's own `.env` through the `.env` loader on any harness, and every other process loads its own config; a worktree without `.env` hands every server empty values | step 5: verify credentials on screen BEFORE dispatching work (`references/orca-machine-setup.md` §3.2) |
 
 **The custom-argv path** (`terminal create --command '<the line from launch.txt>'` plus
 `terminal wait --for tui-idle`) keeps exactly one role: it is the shape of the line a HUMAN pastes
@@ -193,7 +197,7 @@ on one existing on another machine):
 | `roster.md` | conductor | one row per worker (see below) |
 | `COMMON.md` | conductor | the common brief every worker reads first |
 | `W-<label>.md` | conductor | the per-worker brief |
-| `launch.txt` | conductor | one self-contained launch line per worker, ALWAYS written |
+| `launch.txt` | conductor | one self-contained launch line per worker, ALWAYS written; here only when no workflow skill owns the wave (`references/launch-seam.md` §2.1) |
 | `claims.md` | conductor | the claims ledger (`references/claims-protocol.md`) |
 | `learnings.md` | conductor | cross-session findings worth carrying to the next wave |
 | `skill-improvements.md` | conductor | gaps in the SKILLS themselves that this wave exposed |
@@ -240,7 +244,7 @@ has one worktree for N workers (gotcha G50).
 <KEY> · Stage 2 execution
 session <session label>
 branch <branch>
-brief .session/orchestration/<slug>/W-<label>.md
+brief <ABS>/.session/orchestration/<slug>/W-<label>.md
 ```
 
 **N workers in one checkout** — one FLEET-level card, and per-worker recovery lives in the roster,
@@ -384,17 +388,25 @@ screen and no command reports it, so closing the terminal destroys the number (g
 
 ### Orphan audit before removing a worktree
 
-Removing a worktree deletes everything gitignored inside it. In THIS repo that means the env file,
-captured evidence, any local session scope, the tracker cache and installed dependencies. Before
-`worktree rm`:
+Removing a worktree deletes everything gitignored inside it, silently and with exit 0. In THIS repo
+that means the env file, captured evidence, any local session scope, the tracker cache and installed
+dependencies. Before `worktree rm`:
 
 1. `git -C <wt> status --porcelain` — uncommitted work? Commit it or copy it out.
 2. `git -C <wt> cherry -v origin/<base>` — commits not in the base? Push or integrate first.
-3. `git -C <wt> status --porcelain --ignored` (or `git -C <wt> ls-files --others --ignored --exclude-standard`)
-   — list the gitignored files and decide, one by one: evidence and reports that matter get COPIED
-   into the primary checkout's `.session/orchestration/<slug>/reports/`; durable documents are moved
-   to where the repo keeps them; the rest is disposable by design.
-4. Only then remove, and `git worktree prune`.
+3. `bun run worktree:audit <wt>` — classifies every gitignored file as STATE, CACHE, DISPOSABLE or
+   UNKNOWN (`references/provisioning.md` §5) and exits 1 while STATE or UNKNOWN is only in the
+   worktree. `--rescue` copies STATE to the same path under `<<PRIMARY_ROOT>>`, never overwriting;
+   a CONFLICT line (the primary holds different bytes) and every UNKNOWN entry are decided by hand.
+   Exit 0 is the gate. Test-run outputs are DISPOSABLE by the owner's decision and never rescued.
+4. Is anyone going to RESUME this worker's session? Removing the worktree also ends that. A harness
+   finds its sessions by working directory (Claude Code keeps transcripts under a folder named after
+   the path), so once the directory is gone the resume command in the roster (`claude --resume
+   <label>`, `codex resume <label>`) has nowhere to run and the owner cannot bring the session back
+   after a crash or a restart. Keep the worktree while the session may still be resumed; when you do
+   remove it, mark the roster row `resume: gone (worktree removed)` so nobody tries.
+5. Only then remove, and `git worktree prune`. From the CLI that is `orca worktree rm --run-hooks`:
+   without the flag Orca skips the committed `orca.yaml` archive hook (which runs the same rescue).
 
 Mechanics and the untracked-files gotcha: `git-flow-master/references/worktrees.md`.
 

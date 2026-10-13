@@ -14,13 +14,13 @@ A tool name has two halves: `mcp__<server>__<tool>`. The **prefix** is the serve
 
 | Capability | Tool names that provide it (after the `mcp__<server>__` prefix) | Where the server lives | Used for |
 |---|---|---|---|
-| `web-search` | `tavily_search`, `tavily_extract`, `tavily_research` | HARNESS level, never `.mcp.json`: a claude.ai connector, a user-scope Claude server, the OpenCode or Codex user config (the list of moved servers: `cli/lib/harness-level-mcps.ts`) | `[WEB_SEARCH_TOOL]`: community fixes, error lookups, non-doc research |
+| `web-search` | Exa first: `web_search_exa`, `web_fetch_exa` (plus `web_search_advanced_exa` when the server enables it). Tavily second: `tavily_search`, `tavily_extract`, `tavily_research` | HARNESS level, never `.mcp.json`: a claude.ai connector, a user-scope Claude server, the OpenCode or Codex user config (the list of moved servers: `cli/lib/harness-level-mcps.ts`) | `[WEB_SEARCH_TOOL]`: community fixes, error lookups, non-doc research, spikes. Prefer an Exa tool when both providers are available; Tavily when Exa is absent or the user asks for it |
 | `library-docs` | `resolve-library-id`, `query-docs` | committed `context7` (no key) | `[DOCS_TOOL]`: official library / framework / SDK / CLI docs |
 | `db` | `execute_sql_<source_id>`, `search_objects_<source_id>` (DBHub appends the `dbhub.toml` source id, e.g. `execute_sql_primary`) | committed `dbhub` (project-scope `DBHUB_*`) | `[DB_TOOL]`: data validation, schema discovery (`./db-testing-doctrine.md`) |
 | `api-schema` | `list-api-endpoints`, `get-api-endpoint-schema` (the server also ships `invoke-api-endpoint`; never use it, execution is curl's job) | committed `openapi` (project-scope `OPENAPI_SPEC_PATH`, `API_BASE_URL`) | `[API_TOOL]` schema-read leg only (`./api-testing-doctrine.md`) |
-| `browser` | `browser_*` (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_take_screenshot`, ...) | committed `playwright` (no key) | `[AUTOMATION_TOOL]` fallback when `/playwright-cli` is not the right instrument |
+| `diagrams` | not an MCP tool: a loadable SKILL named `diagram-design` (a plugin-namespaced `…:diagram-design` counts) | a SKILL, installed at project level by `cli/install.ts` (`PROJECT_LEVEL_SKILLS`); a user-level install or a harness plugin satisfies it too | the figures of the context maps, drawn by `project-context` and `project-discovery` (`./business-context-maps.md` §7) |
 
-Only LOCAL servers with project-scope values, plus the two that need no key, are committed in the project MCP files. A remote server whose only project-side content is an API key (web search, Postman) is the harness's business: connected once per machine, resolved here by suffix (ADR-0005). A server no skill instructs gets no capability name; add one here AND in `KNOWN_CAPABILITIES` the day a skill needs it; the lint rejects an undeclared name on purpose.
+Only LOCAL (stdio) servers are committed in the project MCP files. Browser automation is not a capability: `[AUTOMATION_TOOL]` resolves to `/playwright-cli`, a CLI, and no browser MCP is committed or resolved (a downstream project that keeps one keeps it as a project-only server). A remote server whose only project-side content is an API key (web search, Postman) is the harness's business: connected once per machine, resolved here by suffix (ADR-0005). A server no skill instructs gets no capability name; add one here AND in `KNOWN_CAPABILITIES` the day a skill needs it; the lint rejects an undeclared name on purpose.
 
 ## 3. Declaring a requirement (skill authors)
 
@@ -29,10 +29,10 @@ The Agent Skills frontmatter spec allows extra keys only inside `metadata`, so t
 ```yaml
 metadata:
   kind: workflow
-  requires_capabilities: [db, api-schema, browser]
+  requires_capabilities: [db, api-schema]
 ```
 
-**Correspondence rule.** A skill declares a capability when its `SKILL.md` or a reference INSTRUCTS the AI to use it (a `[DB_TOOL]` / `[API_TOOL]` / `[AUTOMATION_TOOL]` / `[DOCS_TOOL]` / `[WEB_SEARCH_TOOL]` step, or the tool names above). Naming a server in a table, an env-var checklist or an "N/A here" sentence is not use. Nothing declared goes unused; nothing used goes undeclared. The `CAPABILITY-VOCAB` check in `scripts/lint-skills.ts` (ERROR) rejects a name outside §2; `CAPABILITY-UNDECLARED` (WARN) flags a `SKILL.md` body that carries one of the `[…_TOOL]` resolution tags for a capability in §2 without declaring the matching capability. That heuristic reads the `SKILL.md` body only (not `references/`), so a tag in a legend table trips it: treat the WARN as "declare it or drop the row", never as noise to silence in the script.
+**Correspondence rule.** A skill declares a capability when its `SKILL.md` or a reference INSTRUCTS the AI to use it (a `[DB_TOOL]` / `[API_TOOL]` / `[DOCS_TOOL]` / `[WEB_SEARCH_TOOL]` step, or the tool names above). Naming a server in a table, an env-var checklist or an "N/A here" sentence is not use. Nothing declared goes unused; nothing used goes undeclared. The `CAPABILITY-VOCAB` check in `scripts/lint-skills.ts` (ERROR) rejects a name outside §2; `CAPABILITY-UNDECLARED` (WARN) flags a `SKILL.md` body that carries one of the `[…_TOOL]` resolution tags for a capability in §2 without declaring the matching capability. That heuristic reads the `SKILL.md` body only (not `references/`), so a tag in a legend table trips it: treat the WARN as "declare it or drop the row", never as noise to silence in the script.
 
 Each declaring skill cites the point-of-use procedure with one line in its Compact Rules or its preflight section; the procedure itself lives ONLY in `./preflight-gate.md` §8.
 
@@ -46,9 +46,10 @@ Before the step that uses a declared capability, check that at least one availab
 
 | Host | Where the server lives | How to enable |
 |---|---|---|
-| Claude Code | `.mcp.json` (project, local servers), `~/.claude.json` (user scope: `claude mcp add --scope user ...`), or a claude.ai connector | `/mcp` inside the session lists every server and lets you enable, authenticate or reconnect one without leaving the session. Launch with `bun run claude` so `.env` feeds the project `${VAR}` references. A claude.ai connector is connected from claude.ai settings and its tools appear under `mcp__claude_ai_<connector>__`. |
-| OpenCode | `opencode.jsonc` → `mcp.<server>` (project), `~/.config/opencode/opencode.json` → `mcp` (user) | Set `enabled: true`; project secrets resolve through `{file:.auth/opencode/VAR}` (placeholder files created by `bun install`, an empty one yields an empty string). Restart the session. |
-| Codex CLI / Desktop | `.codex/config.toml` → `[mcp_servers.<server>]` (project), `~/.codex/config.toml` (user: `codex mcp add <name> --url <url>`) | Present in a TRUSTED repository; a missing `bearer_token_env_var` fails loudly naming the server. Restart the session. |
+| Claude Code | `.mcp.json` (project, local servers), `~/.claude.json` (user scope: `claude mcp add --scope user ...`), or a claude.ai connector | `/mcp` inside the session lists every server and lets you enable, authenticate or reconnect one without leaving the session. Project servers read `.env` themselves through the `.env` loader, however the session was launched. A claude.ai connector is connected from claude.ai settings and its tools appear under `mcp__claude_ai_<connector>__`. |
+| OpenCode | `opencode.jsonc` → `mcp.<server>` (project), `~/.config/opencode/opencode.json` → `mcp` (user) | Set `enabled: true`; project servers read `.env` through the `.env` loader. Restart the session. |
+| Codex CLI / Desktop | `.codex/config.toml` → `[mcp_servers.<server>]` (project), `~/.codex/config.toml` (user: `codex mcp add <name> --url <url>`) | Present in a TRUSTED repository; project servers read `.env` through the `.env` loader, and a user-level server's missing `bearer_token_env_var` fails loudly naming the server. Restart the session. |
+| any host, capability `diagrams` | `.agents/skills/diagram-design/` (project) or the harness's user skill / plugin store | `bun setup` re-runs the project install; alone: `bunx skills add https://github.com/cathrynlavery/diagram-design --skill diagram-design --yes`. Start a new session so the skill list refreshes. |
 
 `bun run setup:doctor` reports which harness-level servers this machine's user configs declare; a cloud connector leaves no file and is reported as not detectable, never as missing.
 

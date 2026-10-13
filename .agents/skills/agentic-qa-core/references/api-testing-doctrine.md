@@ -46,11 +46,11 @@ Use the MCP's dynamic meta-tools to learn the contract before sending anything:
 
 Record the endpoints relevant to the ticket into the `test-session-memory.md` API table (Method | Endpoint | Purpose | AC).
 
-**Spec source (adaptable per project).** `OPENAPI_SPEC_PATH` points the MCP at the schema, and accepts **either**:
-- a **local file** (e.g. `./api/openapi.json`, synced by `bun run api:sync`), or
-- a **live URL** — the most natural case: when QA clones the project-under-test and raises the backend locally, the backend serves its OpenAPI route (e.g. `http://localhost:3000/api/openapi`, a Swagger JSON, etc.). The MCP reads it directly.
+**Spec source (adaptable per project).** `OPENAPI_SPEC_PATH` points the MCP at the schema: the **full spec URL**, or a **file path relative to the repo root**; never the endpoint route alone.
+- a **full URL**, the most natural case: when QA clones the project-under-test and raises the backend locally, the backend serves its OpenAPI route (e.g. `http://localhost:3000/api/openapi`, a Swagger JSON, etc.). The MCP fetches it directly.
+- a **local file** relative to the repo root (e.g. `./api/openapi.json`, synced by `bun run api:sync`). It resolves against the directory the server starts in, so start the harness from the repo root.
 
-The MCP handles both; there is no loss either way.
+The server fetches only values that start with `http://` or `https://` and reads anything else as a file: `/api/openapi` alone fails with `ENOENT` and the MCP exits before its handshake. Prefix the origin of `API_BASE_URL`. `bun run setup:doctor` flags all three cases (a route alone, a missing file, a URL that does not answer).
 
 > **⚠ Schema-drift caveat (always keep in mind).** The schema you read is typically the **dev / latest** version. The environment you are *testing* (e.g. `staging`, `devstage`) may lag behind dev. So an endpoint or field present in the schema may not yet exist on the target server. On an unexpected `4xx`, a missing field, or a response shape that does not match the schema → **suspect drift first**, and verify against the actual target before filing a bug.
 
@@ -63,11 +63,13 @@ The MCP handles both; there is no loss either way.
 ```bash
 bun run api:login                       # active env (TEST_ENV), role=user
 bun run api:login staging               # explicit env
-bun run api:login staging --role admin  # named role
+bun run api:login staging --role admin  # logs in AS admin: STAGING_ADMIN_EMAIL / _PASSWORD
 bun run api:login staging --profile W1  # isolated token set -> .auth/profiles/W1/
 bun run api:login --profile W1          # flags may also precede the env (active env)
 bun run api:login --help                # options, storage paths, required .env vars
 ```
+
+The default role (`user`) logs in with `config.testUser` and is the only one that also writes `.auth/api-state.json` for the suite. Any other role reads its own pair, `<ENV>_<ROLE>_EMAIL` + `<ENV>_<ROLE>_PASSWORD`, and fails by name when either half is missing; the browser side of the same role uses the same pair (`browser-sessions.md` §4).
 
 Flag order does not matter and a flag VALUE is never read as the environment
 (`--profile W1` mints for the active env, it does not look for an env called
@@ -88,6 +90,8 @@ It authenticates the env+role's credentials (from `.env`) and writes:
 
 Nothing is written to `.env`, and **no credential enters any MCP** — so there is **no restart** after login.
 
+`api:login` is also the ONLY way an agentic session gets a token: it authenticates through the application's own login endpoint, as the role whose credentials it read. A token obtained any other way (a service-role or admin key, an admin user-management call, a locally signed JWT, a session row read out of the database) tests a user nobody can be. The full list, and what stays allowed (seeding data through the API, the auth story exercised through a real inbox), is `browser-sessions.md` §4 "Only the real login produces a session".
+
 ---
 
 ## Step 3 — Execute with curl (authenticated)
@@ -100,10 +104,10 @@ curl -s -H "Authorization: Bearer $API_TOKEN_ADMIN_STAGING" \
   "$API_BASE_URL/products"
 ```
 
-Set `API_BASE_URL` in the same call if it is not already exported (it comes from `.env`):
+Set `API_BASE_URL` in the same call if `.env` does not already export it. The value is the active environment's `{{API_URL}}` (`.agents/project.yaml` → `environments.<env>.api_url`), resolved before the command runs:
 
 ```bash
-source .auth/tokens.env && API_BASE_URL="https://dojo.upexgalaxy.com/api" && \
+source .auth/tokens.env && API_BASE_URL="{{API_URL}}" && \
 curl -s -X POST -H "Authorization: Bearer $API_TOKEN_USER_STAGING" \
   -H "Content-Type: application/json" \
   -d '{"name":"X"}' "$API_BASE_URL/products"
@@ -140,6 +144,7 @@ The OpenAPI MCP (its `--tools` mode is pinned in `.mcp.json`) exposes `list-api-
 - **NEVER** expect `$API_TOKEN_...` to survive across separate Bash calls — always `source .auth/tokens.env` in the same call as the curl.
 - **NEVER** hardcode or paste a raw token into a command, artifact, commit, or chat. It lives only in `.auth/` (gitignored).
 - **NEVER** write the token back into `.env` or inject it into an MCP.
+- **NEVER** obtain a token around the login: no service-role / admin key, no admin user-management API, no locally signed JWT, no token copied from a database session table. Seeding test data through the API is fine; the identity is not seeded (`browser-sessions.md` §4).
 - **NEVER** "fix" an expired JWT by editing `.mcp.json` (or `opencode.jsonc` / `.codex/config.toml`). The MCP holds no credential by design; a stale token is refreshed by `bun run api:login` into `.auth/tokens.env`, nothing else.
 - **NEVER** report a schema-vs-target mismatch as a bug without first checking for dev/target schema drift.
 

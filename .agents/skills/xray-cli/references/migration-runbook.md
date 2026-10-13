@@ -76,9 +76,11 @@ to the source before anything was exported.
 Inventory all three sources and report what each one says:
 
 ```bash
-jq -r '"cached  -> \(.jira_base_url)  client=\(.client_id[0:8])..."' ~/.xray-cli/config.json
+jq -r '"cached  -> \(.jira_base_url)  client_id=\(if (.client_id // "") == "" then "unset" else "set" end)"' ~/.xray-cli/config.json
 bun run --silent jira:url    # the host: .agents/project.yaml, not .env
-grep -E '^XRAY_CLIENT_ID' .env
+bunx varlock load --agent --filter 'XRAY_*'   # which Xray keys .env holds, values redacted
+# same keys in the cache and in .env? compared inside the loader, prints only same / different
+bunx varlock run -- sh -c '[ "$(jq -r .client_id ~/.xray-cli/config.json)" = "$XRAY_CLIENT_ID" ] && echo same || echo different'
 bun xray auth status
 ```
 
@@ -103,13 +105,13 @@ old backup in place looking current. Always build restore paths from
 
 Three checks, all read-only, all against Jira REST (not Xray). Set both credential
 sets up front so the snippets below are copy-pasteable — source from the cached
-config, destination from `.env`:
+config, destination by NAME from `.env`:
 
 ```bash
 SRC_URL=$(jq -r .jira_base_url  ~/.xray-cli/config.json | sed 's:/*$::')
 SRC_EMAIL=$(jq -r .jira_email   ~/.xray-cli/config.json)
 SRC_TOKEN=$(jq -r .jira_api_token ~/.xray-cli/config.json)
-set -a; source .env; set +a          # ATLASSIAN_EMAIL / ATLASSIAN_API_TOKEN
+# destination pair: $ATLASSIAN_EMAIL / $ATLASSIAN_API_TOKEN, used by name (see the note below)
 DEST_URL=$(bun run --silent jira:url)
 ```
 
@@ -117,6 +119,8 @@ DEST_URL=$(bun run --silent jira:url)
 a local variable. That matters most here: this runbook is precisely the moment a
 stale copy would still name the SOURCE site, and every "destination" check below
 would then pass by inspecting the site you are migrating away from.
+
+> **Secret hygiene (Critical Rule #1)**: never `source .env` into the agent's shell or `grep` it. The destination pair is never in the agent's environment (the harness opens bare), so run each destination check inside the loader, by name: `bunx varlock run -- sh -c 'curl -sS -u "$ATLASSIAN_EMAIL:$ATLASSIAN_API_TOKEN" ...'`. Canon: `agentic-qa-core/references/secret-hygiene.md`.
 
 Below, `$SITE` / `$EMAIL` / `$TOKEN` stand for one of those pairs; run each check
 against both sites.
@@ -414,7 +418,8 @@ A site move also **reassigns Jira custom-field IDs**. The old id usually still
 exists on the new instance pointing at a **different field**, so the failure mode
 is not a 404 but a `200 OK` writing your data into the wrong field, silently.
 
-Run `/jira-administration instance-migration` to repoint `.env`, `.agents/project.yaml` and the
+Run `/jira-administration instance-migration` to repoint `.agents/project.yaml` (the only place
+the host is written; a stale `ATLASSIAN_URL` in `.env` is deleted, never updated) and the
 machine-global `acli` session, and to regenerate the `.agents/` catalogs the move
 invalidated. An operator who follows only this Xray runbook is left with poisoned
 catalogs and no error to warn them.

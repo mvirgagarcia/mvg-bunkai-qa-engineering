@@ -14,8 +14,8 @@ metadata:
 
 Read in order; stop earlier when the batch is small enough that later inputs add no signal.
 
-1. `.context/business/business-feature-map.md` + `.context/business/business-data-map.md` + `.context/business/business-api-map.md` — domain vocabulary, entity model, CRUD matrix, auth model + endpoint contracts. Anchors refined ACs in real entities, flows, and API behavior. (All three are hard-required by the Readiness Preflight Gate + Phase 0.3.)
-2. `.context/master-test-plan.md` — regression Epic + in-scope modules. Tells the refinement whether the Story falls inside an already-prioritized area.
+1. The business context skills `business-e2e-context` + `business-data-context` + `business-api-context`, read through `bun run context:map <slug>` — journeys and feature catalog, entity model, CRUD matrix, auth model + endpoint groups. Anchors refined ACs in real entities, flows, and API behavior. (All three are hard-required by the Readiness Preflight Gate + Phase 0.3.)
+2. `.context/PBI/qa-artifacts/master-test-plan.md` — regression Epic + in-scope modules. Tells the refinement whether the Story falls inside an already-prioritized area.
 3. The Story's Acceptance Criteria + `**Source spec:**` reference on Jira. Detailed read via `bun run jira:sync-issues get <STORY_KEY> --include-comments`, then read the synced `acceptance-criteria.md` (+ description). NEVER `acli view` for custom fields. Canonical input — every refined AC must trace back here.
 4. `.context/PBI/epics/EPIC-<KEY>-<slug>/stories/STORY-<KEY>-<slug>/` if a PBI folder already exists for this Story (created by a prior `/sprint-testing` cycle). Carries earlier session notes worth honoring.
 5. `.agents/jira-workflows.json` — Story workflow + valid transitions (`backlog -> shift_left_qa -> estimation`). Source of `{{jira.transition.story.*}}` slugs used in Phase 3. ALSO the resolver for the `[QA] Shift-Left Review` tracking subtask: read it to confirm a subtask work type exists (+ its transitions) before Phase 1 creates any subtask; if the catalog has no subtask work type, the subtask steps are skipped with a warning — never blocked on.
@@ -55,8 +55,8 @@ The skill is **batch-by-design**: one session refines N Stories from the backlog
 | Output | ATP + ATR + bugs + execution evidence | Refined ACs + risk map + pre-sprint ATP in the Story field (outlines only) + `[QA] Shift-Left Review` subtask + batch report |
 | Execution | Smoke + UI / API / DB exploration | NONE — feature does not exist yet |
 | Code reads | Deep, targeted (reproduce / verify) | Light (feasibility only — does the codebase support this?) |
-| TC creation | Yes (TCs created in Stage 1) | No — Stage 4 (`test-documentation`) creates TCs after the Story ships |
-| Sprint-testing later | Runs full pipeline | Short-circuits Phases 1-3 (label `shift-left-reviewed` detected) and just validates |
+| TC creation | Yes, per the modality (see `/sprint-testing` §"TC creation timing") | No — `/sprint-testing` or Stage 4 (`test-documentation`) creates them, per the modality |
+| Sprint-testing later | Runs full pipeline | Short-circuits Phases 1-3 and just validates, only when the synced ATP body this skill published is present (the labels alone never open it, `sprint-testing/references/acceptance-test-planning.md` §0.0) |
 
 The reuse story is **deliberate**: most of the refinement logic already lives in `sprint-testing/references/acceptance-test-planning.md` Phases 1-3. This skill cites that reference instead of duplicating it — see Phase 2 below.
 
@@ -98,13 +98,13 @@ Requires `agentic-qa-core`. Loads on demand:
 
 This skill is **per-batch scope**: `<scope>` = `<YYYY-MM-DD>-<descriptor>` (e.g. `2026-05-20-payments-area`). Session state lives at `.session/shift-left-testing/<YYYY-MM-DD>-<descriptor>/{plan.md, progress.md}` per `agentic-qa-core/references/session-management.md` §3 + §9. The per-Story `shift-left-refinement.md` files stay under each Story's PBI folder (`[LOCAL]` staging buffer for Phase 2 → Phase 3 — disposable once Phase 3 publishes to Jira; see `references/atp-outline-template.md` and `.context/PBI/README.md`).
 
-This skill is compliant with the doctrine in `AGENTS.md` §"Orchestration Mode (Subagent Strategy)" and the session contract in `.agents/skills/agentic-qa-core/references/session-management.md`. Every dispatch follows the 7-component briefing format defined in `.agents/skills/agentic-qa-core/references/briefing-template.md`, and the pattern selected per phase matches the decision guide in `.agents/skills/agentic-qa-core/references/dispatch-patterns.md`.
+This skill is compliant with the doctrine in `AGENTS.md` §3 (Orchestration Mode) and the session contract in `.agents/skills/agentic-qa-core/references/session-management.md`. Every dispatch follows the 7-component briefing format defined in `.agents/skills/agentic-qa-core/references/briefing-template.md`, and the pattern selected per phase matches the decision guide in `.agents/skills/agentic-qa-core/references/dispatch-patterns.md`.
 
 | Phase | Pattern | Subagent role |
 |-------|---------|---------------|
 | Phase 1 — Selection | Single | Backlog Selection subagent: pull candidate Stories via `[ISSUE_TRACKER_TOOL]`, apply veto + risk-score triage, return ranked candidate table. After user OK: find-or-create the `[QA] Shift-Left Review` subtask under each accepted Story with assignee = self, left at `{{jira.status.subtask.active}}` where `create` lands it (skip with warning if the catalog has no subtask work type) |
 | Phase 2 — Refinement (per Story) | Sequential — looped per Story | Refinement subagent: load `acceptance-test-planning.md` Phases 1-3 + outline-only Phase 4, write `shift-left-refinement.md`, append PO/Dev questions, return summary block. ONE subagent per Story. NEVER parallel across Stories (each subagent writes a different PBI file but the orchestrator must present each summary to the user sequentially before the next dispatch) |
-| Phase 3 — Handoff (per Story) | Sequential — looped per Story | Handoff subagent: update Jira description + `{{jira.acceptance_test_plan}}` custom field (both modalities — no Test Plan item pre-sprint) + handoff comment + labels + subtask annotations + subtask transition to Done + Story transition `backlog -> shift_left_qa -> estimation`. Returns transition log + trace verification |
+| Phase 3 — Handoff (per Story) | Sequential — looped per Story | Handoff subagent: update Jira description + `{{jira.acceptance_test_plan}}` custom field (both modalities — no Test Plan item pre-sprint) + handoff comment + labels + subtask annotations + subtask transition to `{{jira.status.subtask.close}}` + Story transition `backlog -> shift_left_qa -> estimation`. Returns transition log + trace verification |
 | Phase 3 — Batch report | Single | Batch Report subagent: aggregate per-Story summaries into `.session/shift-left-testing/<batch-id>/batch-report.md` + post to parent epic if Stories share one |
 
 > **Sequential by design**. Phase 2 refinement looks parallelizable (each Story is independent in Jira), but the orchestrator must present each Story's refinement summary to the user before moving on. This keeps the user in the loop, lets them veto a Story mid-batch, and matches the team-grooming cadence the skill is designed for. Parallelism would burn the user's attention budget.
@@ -174,8 +174,9 @@ Phase 3 — Handoff
 
 ---> Cross-skill handoff (NOT this skill):
        When each Story later reaches Ready For QA:
-         /sprint-testing reads label `shift-left-reviewed` and short-circuits
-         Phases 1-3 to validation-only (sprint-testing/references/acceptance-test-planning.md §Phase 0).
+         /sprint-testing short-circuits Phases 1-3 to validation-only ONLY on
+         evidence: fresh `shift-left-*` labels AND the synced ATP body this skill
+         published (sprint-testing/references/acceptance-test-planning.md §0.0, fail-closed).
          Stage 1 ALSO creates the Test Plan item (`ATP: {STORY-KEY}: {title}`)
          FROM the {{jira.acceptance_test_plan}} field content — the item is
          in-sprint work, never pre-sprint.
@@ -192,7 +193,7 @@ Phase 3 — Handoff
 | Issue-tracker (`[ISSUE_TRACKER_TOOL]`) | REQUIRED | All refinement output lands on Jira (description, ATP field, comment, labels, transitions). Load `/acli`; validate setup via `bun run jira:check`. |
 | TMS modality resolved | REQUIRED | Recorded in `plan.md` and carried into the handoff so `/sprint-testing` Stage 1 knows which engine will materialize the Test Plan item later. The pre-sprint ATP write itself is modality-independent — field-first in both. The modality probe is `test-documentation/SKILL.md` §Phase 0; ask only if all auto-checks fail. |
 | `/xray-cli` + `XRAY_*` creds | NOT NEEDED | Shift-Left creates no TMS items in either modality. The pre-sprint ATP lives in the `{{jira.acceptance_test_plan}}` field (fallback: comment); the Test Plan item is created by `/sprint-testing` Stage 1 from the field content. |
-| Business context files | REQUIRED | `.context/business/*` + `.context/master-test-plan.md` — refinement without them produces low-value questions. Missing → hand off to `/project-discovery`. |
+| Business context maps + MTP | REQUIRED | each of `business-data-context`, `business-api-context`, `business-e2e-context` exists AND its map is generated (`bun run context:map <slug> --list` prints sections, no placeholder notice), plus `.context/PBI/qa-artifacts/master-test-plan.md` — refinement without them produces low-value questions. A missing skill → `bun sync`; a placeholder map → the matching `project-context` mode; a missing MTP cache is first refreshed with `bun run context:hydrate`, then written by `project-context` mode `test-plan` if the Epic has none. |
 | Candidate Story list | REQUIRED | Explicit IDs (args) or a backlog JQL. Confirm size with the user before Phase 1. |
 
 Env reachability, test-user creds, DBHub, OpenAPI / API token, Playwright and `resend` are **N/A** here — shift-left never executes against a running system. After the gate clears (all REQUIRED GREEN), continue to Phase 0 below.
@@ -212,13 +213,13 @@ Env reachability, test-user creds, DBHub, OpenAPI / API token, Playwright and `r
 
    This step is **mandatory before any pseudocode block below executes**. The skills carry the concrete syntax, flags, and JSON payloads this skill intentionally omits.
 
-0.3 **Verify project-wide context files exist**:
-   - `.context/business/business-data-map.md`
-   - `.context/business/business-feature-map.md`
-   - `.context/business/business-api-map.md`
-   - `.context/master-test-plan.md`
+0.3 **Verify project-wide context exists** (existence alone is not enough: a placeholder map passes a file check and carries nothing):
+   - `bun run context:map business-data-context --list`
+   - `bun run context:map business-e2e-context --list`
+   - `bun run context:map business-api-context --list`
+   - `.context/PBI/qa-artifacts/master-test-plan.md`
 
-   If any of these is missing, STOP and hand off to `project-discovery` (or the individual `project-context` modes `data` / `features` / `api` and `test-plan`). Shift-left refinement without business context produces low-value PO/Dev questions and bloats the batch report.
+   If a command prints the placeholder notice (or the skill is missing), or the plan is missing, STOP and hand off to `project-discovery` (or the individual `project-context` modes `data` / `e2e` / `api` and `test-plan`). Shift-left refinement without business context produces low-value PO/Dev questions and bloats the batch report.
 
 0.4 **Resolve the candidate Story list**. Two modes:
 
@@ -268,7 +269,7 @@ Decides which Stories actually enter the refinement loop and at what depth.
 5. **Present the ranked candidate table** (see `references/backlog-selection.md` §Output format) and **WAIT for user OK** before Phase 2. Same pattern as sprint-testing's Story Explanation gate.
 6. **Tracking subtask per accepted Story** (after user OK): find-or-create a subtask titled `[QA] Shift-Left Review` under the Story, **with `assignee` = the authenticated session user** (`agentic-qa-core/references/artifact-lifecycle.md` §2 — an unassigned QA artifact is a blocker waiting to happen). Jira's `create` transition lands it in `{{jira.status.subtask.active}}`; leave it there, Phase 3 closes it. Resolve the subtask work type from `.agents/jira-workflows.json`; if the catalog has no subtask work type (or the project disallows subtasks), log a warning in `progress.md` + the batch report and SKIP — never block the batch. Find-or-create: match the Story's existing subtasks by exact title before creating; an existing one already at `{{jira.status.subtask.close}}` is re-opened with `{{jira.transition.subtask.reactive}}` (refresh run). This makes QA's pre-sprint work visible on the board, and the subtask later receives the exhaustive session annotations in Phase 3.
 
-Persist the accepted list into `plan.md` §Inputs so a resumed session reads the same canonical decision. After user OK, append a progress entry: `## Phase 1 — Selection — <ts>` with `status: completed`, `artifacts_touched: [candidates.md, plan.md]`, `next: Phase 2 — Refinement`.
+Persist the FINAL accepted list in the session's `progress.md`, inside the Phase 1 entry, so a resumed session reads the same canonical decision (`references/backlog-selection.md` §Output format says the same). After user OK, append that entry: `## Phase 1 — Selection — <ts>` with `status: completed`, the accepted Story keys, `artifacts_touched: [candidates.md, progress.md]`, `next: Phase 2 — Refinement`.
 
 ---
 
@@ -397,7 +398,7 @@ For each refined Story, dispatch a Handoff subagent. Sequential, one Story at a 
    — the stage-specific lines are in `references/handoff-protocol.md` §Step 6b.
 ```
 
-The Handoff subagent returns a per-Story log: `{story: KEY, atp_container: <field|fallback_comment>, subtask: <done|skipped>, labels_added: [...], transitions: [...], trace_status: ok|warning|fail}`.
+The Handoff subagent returns a per-Story log: `{story: KEY, atp_container: <field|fallback_comment>, subtask: <close|skipped>, labels_added: [...], transitions: [...], trace_status: ok|warning|fail}`.
 
 ### Batch report + Archive
 
@@ -415,7 +416,7 @@ Contents (see `references/handoff-protocol.md` §Batch report template):
 - Risk distribution chart (LOW / MEDIUM / HIGH counts)
 - Blockers (Stories that surfaced data feasibility gaps — flagged for PO before sprint planning)
 - Recommended sprint-planning order (by risk + dependency)
-- Cross-skill pointer: "When each Story reaches Ready For QA, run `/sprint-testing` — it will short-circuit Phases 1-3 thanks to the `shift-left-reviewed` label."
+- Cross-skill pointer: "When each Story reaches Ready For QA, run `/sprint-testing` — it short-circuits Phases 1-3 when it finds the ATP body published here in the synced `acceptance-test-plan.md` (the labels alone do not open it)."
 
 If all Stories in the batch share a single parent epic, ALSO post the batch report as a comment on that epic. Otherwise, deliver inline to the user as the session-closing message.
 
@@ -434,7 +435,7 @@ After the batch report lands, append the final progress entry `## Phase 3 — Ha
 7. **No execution.** This skill does not run smoke, does not query DBs for data presence, does not run the app. Feasibility is established by READING code + APIs + DB schema only.
 8. **Sequential Phase 2.** One refinement subagent at a time, even if the user is impatient. Parallelism would prevent per-Story user OK and break the grooming cadence.
 9. **Transition guardrail.** Never advance beyond `{{jira.status.story.estimation}}`. PO/Dev lead owns `estimate -> ready_for_dev`. If a Story is already past `estimation` when the session starts, log a warning and SKIP the transition step — refinement still lands on Jira, but the workflow stays untouched.
-10. **Label hygiene.** Always add BOTH `shift-left-reviewed` AND `shift-left-{{YYYY-MM-DD}}`. The dated label lets `/sprint-testing` decide whether the refinement is still fresh (<30 days) and short-circuit, or whether to redo Phases 1-3.
+10. **Label hygiene.** Always add BOTH `shift-left-reviewed` AND `shift-left-{{YYYY-MM-DD}}`. The dated label lets `/sprint-testing` decide whether the refinement is still fresh (<30 days); the short-circuit itself opens only on the published ATP body (`sprint-testing/references/acceptance-test-planning.md` §0.0), so a label without that body still means a full Phases 1-3 run.
 11. **Jira is canonical.** No git commit, no test branch. Local `shift-left-refinement.md` is a working artifact — gitignored under `.context/PBI/**`. The populated `{{jira.acceptance_test_plan}}` field (or its `## Acceptance Test Plan (ATP)` fallback comment when the field is absent) is the contract `test-documentation` mode `repair-traceability` checks later.
 12. **Language**: artifacts + Jira content always English. Mirror the user's language only in conversation (per AGENTS.md §1 Rule #14).
 13. **Session-footer contract (mandatory at close).** The final phase is not done until the two chat-facing blocks from `../agentic-qa-core/references/session-footer-contract.md` are printed: (1) consolidated screenshot list — repo-relative paths, verified on disk, bug annotations first — plus in-flow surfacing of every capture's path the instant it lands; (2) Session Footer listing skills/MCPs/CLIs actually used + testing levels touched, with explicit "none" entries for expected-but-untouched levels. Framing for this skill: execution. Multi-subagent sessions: each stage report carries the five footer fields (`skills_loaded`, `mcps_used`, `clis_used`, `testing_levels_touched`, `screenshots_captured`); the orchestrator compiles the footer ONCE at close. Chat only — never in a Jira comment or ATR body. Lessons noticed during the session are PROPOSED to `.session/<skill-slug>/<scope>/refinements.md` and never applied to a live skill, per `../agentic-qa-core/references/skill-refinement-protocol.md`; the footer's `Refinements proposed:` line counts them.
@@ -446,11 +447,11 @@ After the batch report lands, append the final progress entry `## Phase 3 — Ha
 
 **L1.** NEVER force ambiguity questions onto a Story to fill a checklist — raise PO/Dev questions ONLY when a genuine gap, ambiguity, or untestable AC exists. Per AGENTS.md §1 Rule #4: shift-left adds value by surfacing real risk, not by inflating question counts. A clean Story exits with an empty question list and that is a valid outcome.
 
-**L2.** NEVER skip the `shift-left-reviewed` label when transitioning a Story out of Phase 3. `/sprint-testing` Phase 0 inspects that label to short-circuit Phases 1-3 of in-sprint planning; missing the label forces redundant work later and breaks the cadence this skill exists to enable.
+**L2.** NEVER skip the `shift-left-reviewed` label when transitioning a Story out of Phase 3. `/sprint-testing` Phase 0 requires that label (with its dated twin) AND the ATP body published to Jira before it short-circuits Phases 1-3 (`sprint-testing/references/acceptance-test-planning.md` §0.0); missing either forces redundant work later and breaks the cadence this skill exists to enable.
 
 **L3.** NEVER mix Story refinement with bug retest in the same batch. `/shift-left-testing` accepts Stories only (Phase 1 type filter is a hard reject). Bugs are reactive — they have no upstream ACs to refine and belong to `/sprint-testing` instead.
 
-**L4.** NEVER hand-write the ATP body as raw ADF JSON. Author the body in Markdown locally (`shift-left-refinement.md`) and let `[ISSUE_TRACKER_TOOL]` convert via its md-to-ADF path on update. Hand-rolled ADF drifts from the field content that `test-documentation` mode `repair-traceability` later validates.
+**L4.** NEVER hand-write the ATP body as raw ADF JSON. Author the body in Markdown locally (`shift-left-refinement.md`), convert and validate it with the bundled converter `.agents/skills/acli/scripts/md-to-adf.ts`, then publish the resulting ADF JSON. `[ISSUE_TRACKER_TOOL]` never converts Markdown on the CLI path: a Markdown body handed to it renders literal `#` and `**` (`sprint-testing` S6). Hand-rolled ADF drifts from the field content that `test-documentation` mode `repair-traceability` later validates.
 
 **L5.** NEVER transition a Story to `estimation` without a populated ATP (the `{{jira.acceptance_test_plan}}` custom field in BOTH modalities; the `## Acceptance Test Plan (ATP)` fallback comment when the field is absent). The pre-sprint ATP is what makes the Story estimable — without it, Dev and PO guess scope and the shift-left effort delivers no signal.
 
@@ -467,11 +468,11 @@ After the batch report lands, append the final progress entry `## Phase 3 — Ha
 | After Phase 3 you need... | Load this skill / command | Reason |
 |---------------------------|---------------------------|--------|
 | Wait for Dev to estimate + commit the Story into a sprint | (manual / PO) | This skill stops at `{{jira.status.story.estimation}}`. PO + Dev lead drive `estimate -> ready_for_dev` and sprint commitment. |
-| In-sprint manual QA once the Story reaches `Ready For QA` | `/sprint-testing` | Will detect label `shift-left-reviewed`, validate the refinement is still fresh, short-circuit Phases 1-3, and run Phases 4-8 + Stages 2 + 3 normally. Stage 1 also creates the Test Plan ITEM from the `{{jira.acceptance_test_plan}}` field this skill populated. |
+| In-sprint manual QA once the Story reaches `Ready For QA` | `/sprint-testing` | Will check the `shift-left-*` labels are fresh AND that the synced ATP body this skill published exists (fail-closed, `sprint-testing/references/acceptance-test-planning.md` §0.0), short-circuit Phases 1-3 only then, and run Phases 4-8 + Stages 2 + 3 normally. Stage 1 also creates the Test Plan ITEM from the `{{jira.acceptance_test_plan}}` field this skill populated. |
 | Formal TC creation + ROI scoring after Story ships | `/test-documentation` | Stage 4 turns the outlines + refined ACs into formal Xray TCs (Modality jira-xray) or Jira Test issues (Modality jira-native) with ROI scoring. |
 | Automated test code | `/test-automation` | Stage 5. |
 | Regression suite execution | `/regression-testing` | Stage 6. |
-| Generate / refresh business + master test plan context | `/project-discovery` + `project-context` modes `data` / `features` / `api` / `test-plan` | This skill consumes those; it does not create them. |
+| Generate / refresh business + master test plan context | `/project-discovery` + `project-context` modes `data` / `e2e` / `api` / `test-plan` | This skill consumes those; it does not create them. |
 | Adversarial dual-review of the refinement (optional) | `/judgment-day` | Useful when shift-left output goes to a high-risk Story. Not auto-invoked. |
 
 If Phase 0.3 reports any project-wide context file missing, STOP and hand off — refinement without business context produces vague PO questions and dilutes the batch report.
@@ -527,5 +528,5 @@ All references are self-contained. Load one at a time.
 - [ ] Batch report written + posted to parent epic (if applicable)
 - [ ] Archive: `.session/shift-left-testing/<batch-id>/` moved to `.session/.archive/<YYYY-MM-DD>-shift-left-testing-<batch-id>/` and `mem_session_summary` called
 - [ ] No git commit (Jira is canonical for this skill)
-- [ ] User informed: when each Story reaches `Ready For QA`, run `/sprint-testing` (will short-circuit thanks to `shift-left-reviewed`)
+- [ ] User informed: when each Story reaches `Ready For QA`, run `/sprint-testing` (it short-circuits on the published ATP body, not on the label alone)
 - [ ] Session footer + consolidated screenshot list printed in chat per session-footer-contract (never in a Jira comment)

@@ -6,9 +6,12 @@
  */
 
 import type { GateContext, VarSpec } from './lib/variables-manifest.ts';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 
-import { envVarVerdict } from './doctor.ts';
+import { checkoutSetupActions, envVarVerdict, probeOpenApiSpec } from './doctor.ts';
 import { VAR_MANIFEST, varsFor } from './lib/variables-manifest.ts';
 
 function spec(overrides: Partial<VarSpec> & { name: string }): VarSpec {
@@ -59,5 +62,74 @@ describe('envVarVerdict', () => {
     expect(blocking).toEqual([]);
     // And the manifest as a whole declares every scope the doctor prints.
     expect(new Set(VAR_MANIFEST.map(s => s.scope))).toEqual(new Set(['core', 'tooling', 'project']));
+  });
+});
+
+describe('probeOpenApiSpec', () => {
+  const root = mkdtempSync(join(tmpdir(), 'doctor-openapi-'));
+  mkdirSync(join(root, 'api'), { recursive: true });
+  writeFileSync(join(root, 'api', 'openapi.json'), '{}');
+  const answering = (status: number) => async () => new Response('{}', { status });
+  const silent = async () => { throw new Error('ECONNREFUSED'); };
+
+  test('says nothing when the variable is empty: the env row already covers it', async () => {
+    expect(await probeOpenApiSpec(undefined, root, silent)).toBeNull();
+    expect(await probeOpenApiSpec('  ', root, silent)).toBeNull();
+  });
+
+  test('a file path resolves against the repo root', async () => {
+    expect(await probeOpenApiSpec('./api/openapi.json', root, silent)).toBeNull();
+    const missing = await probeOpenApiSpec('./api/missing.json', root, silent);
+    expect(missing?.target).toBe('bun run api:sync');
+    expect(missing?.hint).toContain('./api/missing.json');
+    expect(missing?.hint).not.toContain('API route');
+  });
+
+  test('a value that starts with / and is no file reads as the API route alone', async () => {
+    const route = await probeOpenApiSpec('/api/openapi', root, silent);
+    expect(route?.target).toBe('bun run api:sync');
+    expect(route?.hint).toContain('/api/openapi');
+    expect(route?.hint).toContain('looks like an API route');
+    expect(route?.hint).toContain('origin of API_BASE_URL');
+    expect(route?.hint).toContain('relative to the repo root');
+    expect(await probeOpenApiSpec(join(root, 'api', 'openapi.json'), root, silent)).toBeNull();
+  });
+
+  test('a URL must answer 2xx, and the message names the host, never the full value', async () => {
+    expect(await probeOpenApiSpec('https://api.example.test/openapi.json?token=x', root, answering(200))).toBeNull();
+    const notFound = await probeOpenApiSpec('https://api.example.test/openapi.json?token=x', root, answering(404));
+    expect(notFound?.hint).toContain('api.example.test that answered 404');
+    expect(notFound?.hint).not.toContain('token=x');
+    const down = await probeOpenApiSpec('http://127.0.0.1:9/openapi.json', root, silent);
+    expect(down?.hint).toContain('127.0.0.1:9 that did not answer');
+  });
+});
+
+describe('checkoutSetupActions', () => {
+  const ready = { linked: false, envFile: true, deps: true, gitHooks: true };
+
+  test('a ready checkout needs nothing', () => {
+    expect(checkoutSetupActions(ready).actions).toEqual([]);
+    expect(checkoutSetupActions({ ...ready, linked: true }).actions).toEqual([]);
+  });
+
+  test('an unprovisioned worktree gets ONE provision command, never the template copy', () => {
+    const { actions, replaces } = checkoutSetupActions({ linked: true, envFile: false, deps: false, gitHooks: false });
+    expect(actions.map(a => a.target)).toEqual(['bun run worktree:provision']);
+    expect(actions[0].hint).toContain('.husky/_');
+    // The generic `cp .env.example .env` and `bun run harness:env` are exactly what empties
+    // the main checkout's env block from a worktree, so both are suppressed.
+    expect(replaces).toEqual({ envFile: true, deps: true, harnessEnv: true });
+  });
+
+  test('a worktree with .env but no hooks keeps the harness:env advice', () => {
+    const { actions, replaces } = checkoutSetupActions({ linked: true, envFile: true, deps: true, gitHooks: false });
+    expect(actions.map(a => a.target)).toEqual(['bun run worktree:provision']);
+    expect(replaces.harnessEnv).toBe(false);
+  });
+
+  test('a primary checkout with dependencies but no hook shims is told to reinstall', () => {
+    const { actions } = checkoutSetupActions({ ...ready, gitHooks: false });
+    expect(actions.map(a => a.target)).toEqual(['bun install']);
   });
 });

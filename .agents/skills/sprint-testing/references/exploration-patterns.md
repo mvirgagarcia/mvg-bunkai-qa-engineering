@@ -57,6 +57,8 @@ Deep-dive the UI on `{{WEB_URL}}` via `[AUTOMATION_TOOL]`. Goal: validate ACs, d
 
 Before any `[AUTOMATION_TOOL]` call, capture with an explicit destination path resolving to the ticket's `evidence/` folder — never repoint the shared `.playwright/cli.config.json` `outputDir` (see `agentic-qa-core/references/evidence-conventions.md` §1 Bucket B and §5). Screenshots still need the full path in `--filename` because `outputDir` does not apply to `.png`.
 
+**Session and login.** One named session per ticket (`-s=<KEY>`), in memory. The app's login comes from the role's state file, never from a login typed inside the exploration session: `open`, then `state-load <repo>/.auth/<env>-<role>.json`, then `goto`. Two roles = two sessions (`-s=<KEY>-admin`, `-s=<KEY>-member`). Missing file or a login page after `goto` → produce the file first (suite setup, or the one-off login recipe). Before the first session of the project, check `testing.browser.pair_mode` in `.agents/project.yaml` (`null` = ask once). `close` every session before reporting, and prove it with `playwright-cli list`. Canon: `agentic-qa-core/references/browser-sessions.md`.
+
 ### 1.2 Scenario loop (per AC)
 
 For each AC in the Stage-1 outlines:
@@ -125,7 +127,7 @@ curl -s -H "Authorization: Bearer $API_TOKEN_<ROLE>_<ENV>" "$API_BASE_URL/<path>
 
 ```
 OpenAPI MCP  list-api-endpoints
-  - source: {OpenAPI spec — local file or live URL, commonly the localhost backend}
+  - source: {OpenAPI spec — the full spec URL (commonly the localhost backend) or a file path relative to the repo root; never the endpoint route alone}
 
 OpenAPI MCP  get-api-endpoint-schema
   - endpoint: {method + path}
@@ -351,7 +353,7 @@ Two files are updated during Stage 2: `test-session-memory.md` (live log, in the
   test-session-memory.md      # Stage 2 live log (hand-authored)
 ```
 
-The whole PBI tree is a gitignored Jira cache (`AGENTS.md` §9). The live log sits in `.session/` so a re-sync cannot clobber it mid-execution.
+The whole PBI tree is a gitignored Jira cache (`.agents/instructions/agent-local-context-pbi.md`). The live log sits in `.session/` so a re-sync cannot clobber it mid-execution.
 
 ### 5.2 `test-session-memory.md` stage 2 block
 
