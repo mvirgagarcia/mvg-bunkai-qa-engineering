@@ -1,85 +1,58 @@
-# .context/ - Context Engineering Directory
+# .context/ - caches of a source of truth, plus what this repo owns
 
-This directory contains all the documentation that the AI reads to work on the project.
+`.context/` holds two kinds of file, and nothing else:
 
-## Structure
+1. **What a script pulls from a source of truth.** The file is regenerable, so it is never committed.
+2. **The few files this repo is itself the source of truth for.** Those are committed.
 
+What an AI **synthesizes** (the business model, the glossary, the architecture, the data and API maps, the user journeys) does not live here. It lives inside a context skill, next to the judgment that reads it. Why: `.agents/skills/agentic-qa-core/references/skill-scaffold.md` §3.
+
+## What lives here
+
+| Path | Kind | Owner | Recovered by |
+|---|---|---|---|
+| `PBI/` (the Jira mirror) | script cache | `scripts/sync-jira-issues.ts` | `bun run context:hydrate` |
+| `PBI/qa-artifacts/master-test-plan.md` | script cache | the `QA Master Test Plan` Epic description in Jira (`project-context` mode `test-plan` writes it) | `bun run context:hydrate` |
+| `reports/` | script cache | the command that writes each report | re-running that command |
+| `_framework/` | script cache | the framework scripts that write it | re-running them |
+| `PBI/README.md`, `PBI/templates/`, `PBI/epics/*/test-specs/` | repo-owned | this repo (automation plans version with the test code) | `git checkout` |
+| `ADR/` | repo-owned | test-architecture decisions, append-only (`ADR/README.md`) | `git checkout` |
+| `project-config.md` | repo-owned | `/project-discovery` writes it once; the team edits it | `git checkout` |
+| `regression-history/` | repo-owned | the hand-curated known-failures list `/regression-testing` reads | `git checkout` |
+| `README.md` (this file), `reports/README.md` | repo-owned | this repo | `git checkout` |
+
+The PBI tree has its own tier rules (`[SYNC]` / `[COMMIT]` / `[LOCAL]`): `PBI/README.md` and `.agents/instructions/agent-local-context-pbi.md`.
+
+## Ignored by default
+
+Everything under `.context/` is ignored unless it is re-included by name. `.gitignore` (the `.context/` block) is the one owner of that list: read it there, never from a copy in a doc. The effect is that a new cache never gets committed by accident, and nobody has to remember to add an ignore line for it.
+
+Git cannot re-include a file whose parent directory is excluded, so the block descends level by level down to `PBI/epics/*/test-specs/`. Probe any change with `git check-ignore -v` on a `test-specs/` file (must NOT be ignored) and on a synced `stories/.../story.md` (must be ignored).
+
+## Where the synthesis lives
+
+Every generated map is HTML inside its context map skill. The one list of those skills, each with its generator, is `CONTEXT_MAP_SKILLS` in `cli/lib/context-maps.ts`. Read a map through its reader, never the raw HTML:
+
+```bash
+bun run context:map <slug>                 # the whole map
+bun run context:map <slug> --list          # its section ids
+bun run context:map <slug> --section <id>  # one section
 ```
-.context/
-├── business/                            # All business-level context (single home)
-│   ├── business-model.md               #   /project-discovery (Phase 1 — Constitution)
-│   ├── domain-glossary.md              #   /project-discovery (Phase 1 — Constitution)
-│   ├── business-data-map.md            #   /business-data-map
-│   ├── business-feature-map.md         #   /business-feature-map
-│   └── business-api-map.md             #   /business-api-map
-├── PRD/                PHASE 2: Architecture - Product Requirements
-├── SRS/                PHASE 2: Architecture - Software Requirements
-├── PBI/                PHASES 4+: Product Backlog (Specification, Testing)
-├── reports/            Sprint-level testing frameworks (managed by /sprint-testing)
-└── master-test-plan.md                 # /master-test-plan — what to test and why
-```
 
-Workflow guidelines now live inside Claude Code skills in `.claude/skills/`. Each skill bundles its own `references/` material.
+A map that still prints the placeholder notice has not been generated yet: the notice names the generator to run (`/project-discovery` for the domain and infra maps, `project-context` for the data, API and E2E maps). Procedure and anatomy: `.agents/skills/agentic-qa-core/references/business-context-maps.md`. Skill list with tiers and kinds: `.agents/skills/REGISTRY.md`.
 
-## Getting Started
+## Legacy folders
 
-### Project Memory Setup
+A project scaffolded before this layout may still hold `business/`, `PRD/`, `SRS/`, `infrastructure/`, `master-test-plan.md`, `risk-assessment.md` or `PBI/ACCESS.md` at this level. They are left alone:
 
-Load the `/project-discovery` skill in your AI assistant. It:
-1. Detects your AI tool and generates the correct configuration file (`CLAUDE.md`, `GEMINI.md`, etc.)
-2. Generates a professional `README.md`
-3. Generates the `.context/` artifacts listed above
+- They stay tracked. An ignore rule never untracks a file already committed.
+- Where a context skill replaces one, its generator reads the old file as input the first time it builds the map (each skill's `legacy` list in `CONTEXT_MAP_SKILLS`). After that, the map is the one to read.
+- Nothing upstream ships deletes them: `bun sync` and `bun run setup:doctor` only name them in an informational line. Removing them is the project's own decision, made after the matching map is generated.
 
-### Project Phases
-
-**Discovery (one-time, handled end-to-end by `/project-discovery`):**
-
-- Business constitution -> generates `business/business-model.md` and `business/domain-glossary.md`
-- Architecture -> generates `PRD/` and `SRS/`
-- Infrastructure -> complements `SRS/`
-- Specification -> generates `PBI/`
-
-**QA workflow (iterative, via skills):**
-
-- `/sprint-testing` -- in-sprint planning, execution, and reporting per ticket
-- `/test-documentation` -- TMS documentation and prioritization
-- `/test-automation` -- KATA test planning + coding + review
-- `/regression-testing` -- regression execution and GO/NO-GO
-
-## Skills by Role
-
-| Role          | Primary Skills                                         |
-| ------------- | ------------------------------------------------------ |
-| QA Engineer   | `/sprint-testing`, `/test-documentation`               |
-| QA Automation | `/test-automation`, `/regression-testing`              |
-| Any role      | `CLAUDE.md` "MCPs Available" section when using MCPs   |
-
-## Recommended Context Files
-
-These files are generated by the project's discovery skill and commands. If they don't exist yet, create them using the command listed below:
-
-| File | Generator | Required For |
-|------|-----------|-------------|
-| `business/business-data-map.md` | `/business-data-map` command | Understanding system flows and entities |
-| `business/business-feature-map.md` | `/business-feature-map` command | Feature catalog, CRUD matrix, feature flags |
-| `business/business-api-map.md` | `/business-api-map` command | Auth model, critical journey endpoints, architecture behind the API |
-| `master-test-plan.md` | `/master-test-plan` command | Knowing what to test and why (risk-ranked) |
-| `business/business-model.md` | `/project-discovery` (Phase 1 — Constitution) | Business context for test planning |
-| `business/domain-glossary.md` | `/project-discovery` (Phase 1 — Constitution) | Consistent terminology |
-| `PRD/*.md` | `/project-discovery` (Phase 2 — Architecture) | User personas, user journeys |
-| `SRS/*.md` | `/project-discovery` (Phase 2 + Phase 3 — Infrastructure) | Technical specs, API contracts |
-| `api/schemas/` | `bun run api:sync` | OpenAPI-derived TypeScript types for integration tests |
-
-**Minimum viable context:** `business/business-data-map.md` + `master-test-plan.md` (run those two commands first).
-
----
+The outputs that were retired without a replacement file (`PRD/executive-summary.md`, `risk-assessment.md`, `PBI/ACCESS.md`) have no reader any more: product risks travel in the Master Test Plan in Jira, and the backlog recipe is `PBI/README.md` plus `.agents/instructions/agent-local-context-pbi.md`.
 
 ## References
 
-- **Project Memory**: `CLAUDE.md` (or equivalent for your AI tool)
-- **Context Engineering**: `../CONTEXT.md`
-- **Workflow skills**: `.claude/skills/` (each skill self-describes via its SKILL.md)
-
----
-
-**Last Updated**: 2026-04-03
+- `AGENTS.md` (always on, read by Claude Code through the generated `CLAUDE.md` shim) and the sections it routes to: `.agents/instructions/agent-context-map.md` (key paths) and `.agents/instructions/agent-local-context-pbi.md` (local context).
+- `../CONTEXT.md`: the context-engineering rationale.
+- `.agents/skills/`: every workflow and context skill self-describes in its `SKILL.md`.
