@@ -630,7 +630,7 @@ Assessment Date: 2026-05-31
 ### Code Quality
 - [x] ESLint: configured — `eslint.config.js` present, `@antfu/eslint-config` + `@next/eslint-plugin-next`
 - [x] Prettier: configured — `.prettierignore` referenced in `package.json` scripts
-- [x] TypeScript: strict — `tsconfig.json` has `"strict": true`; `bun run typecheck` script present
+- [x] TypeScript: strict — `tsconfig.json` has `"strict": true`; the app repo's `typecheck` script is present
 - [x] Pre-commit hooks: configured — Husky ^9.1.7 + lint-staged ^16.2.7 (ESLint fix on `.ts/.tsx`, Prettier on config/markup files)
 
 ### CI/CD Maturity: None
