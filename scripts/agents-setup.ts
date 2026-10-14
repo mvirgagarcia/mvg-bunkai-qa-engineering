@@ -46,6 +46,7 @@
  *   bun run agents:setup --non-interactive        # env-driven, no prompts
  *   bun run agents:setup --dry-run                # print result, do not write
  *   bun run agents:setup --reset                  # set every field back to null
+ *   bun run agents:setup --reseed                 # replace a copied maintainer yaml with the template
  *   bun run agents:setup --help                   # show help
  *
  * ENV-VAR MAPPING (--non-interactive):
@@ -55,7 +56,12 @@
  *     BACKEND_REPO, BACKEND_STACK, BACKEND_ENTRY
  *     FRONTEND_REPO, FRONTEND_STACK, FRONTEND_ENTRY
  *     DB_TYPE
- *     ISSUE_TRACKER, ISSUE_TRACKER_CLI, ATLASSIAN_URL
+ *     ISSUE_TRACKER, ISSUE_TRACKER_CLI
+ *
+ *   NOT seedable from the environment: `issue_tracker.atlassian_url`. It is the
+ *   source of truth for the Atlassian host, so accepting `ATLASSIAN_URL` here
+ *   would let a stale value inherited from the parent shell overwrite the
+ *   versioned one on every --non-interactive run.
  *     DEFAULT_ENV, TMS_CLI
  *
  *   ENV-SCOPED — pattern <KEY>_<ENV>, where KEY is the env-scoped leaf and
@@ -83,10 +89,13 @@
  * ============================================================================
  */
 
+import { execSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { confirm, input, select } from '@inquirer/prompts';
 import { parse as parseYaml } from 'yaml';
+
+import { classifyProjectYaml, SCHEMA_FILE, seedFromSchema } from '../cli/lib/agents-schema.ts';
 
 // ============================================================================
 // CONSTANTS
@@ -143,8 +152,17 @@ interface FlatFieldSpec {
   section: string
   /** snake_case key in project.yaml. */
   key: string
-  /** UPPER_SNAKE_CASE env-var name. */
-  envVar: string
+  /**
+   * UPPER_SNAKE_CASE env-var name that seeds this field in non-interactive
+   * mode, or `null` for a field that must NEVER be seeded from the environment.
+   *
+   * `null` is not a missing feature. `atlassian_url` uses it because seeding
+   * that field from `ATLASSIAN_URL` inverts the precedence the yaml exists to
+   * establish: a stale host inherited from the parent shell would overwrite the
+   * correct versioned value on any `--non-interactive` run, which is the exact
+   * corruption the anchor was introduced to stop.
+   */
+  envVar: string | null
   validator: ValidatorKind
 }
 
@@ -174,7 +192,10 @@ const FLAT_FIELDS: FlatFieldSpec[] = [
 
   { section: 'issue_tracker', key: 'issue_tracker', envVar: 'ISSUE_TRACKER', validator: 'non_empty' },
   { section: 'issue_tracker', key: 'issue_tracker_cli', envVar: 'ISSUE_TRACKER_CLI', validator: 'non_empty' },
-  { section: 'issue_tracker', key: 'atlassian_url', envVar: 'ATLASSIAN_URL', validator: 'url' },
+  // envVar: null — see FlatFieldSpec.envVar. This field is the source of truth
+  // for the Atlassian host; seeding it from the environment would let a stale
+  // inherited value overwrite the versioned one.
+  { section: 'issue_tracker', key: 'atlassian_url', envVar: null, validator: 'url' },
 
   // default_env is special: validated against the live env list at write time.
   { section: 'testing', key: 'default_env', envVar: 'DEFAULT_ENV', validator: 'env_select' },
@@ -197,6 +218,7 @@ interface CliFlags {
   nonInteractive: boolean
   dryRun: boolean
   reset: boolean
+  reseed: boolean
   help: boolean
 }
 
@@ -205,6 +227,7 @@ function parseArgs(argv: string[]): CliFlags {
     nonInteractive: false,
     dryRun: false,
     reset: false,
+    reseed: false,
     help: false,
   };
   for (const arg of argv) {
@@ -217,6 +240,9 @@ function parseArgs(argv: string[]): CliFlags {
         break;
       case '--reset':
         flags.reset = true;
+        break;
+      case '--reseed':
+        flags.reseed = true;
         break;
       case '--help':
       case '-h':
@@ -247,6 +273,10 @@ FLAGS:
   --reset              Reset every field back to \`null\` and restore the
                        original \`# TODO:\` prefix on each comment. Asks for
                        confirmation. Useful for re-onboarding.
+  --reseed             Consent, for --non-interactive runs, to replace a
+                       .agents/project.yaml copied from the boilerplate (GitHub
+                       "Use this template") with the blank template. Interactive
+                       runs ask instead.
   --help, -h           Show this help.
 
 VARIABLE MODEL:
@@ -272,8 +302,8 @@ INTERACTIVE FLOW (default):
   - For each environment, prompts for the four env-scoped vars.
   - Validates that default_env matches a real env (re-prompts if not).
   - For unfilled fields: prompts with the # TODO: description as helper text,
-    suggests the example value as a default, and validates input. Empty input
-    keeps the field as null (skip).
+    shows the example next to the question (never as the default), and
+    validates input. Empty input keeps the field as null (skip).
   - For filled fields: shows current value and asks keep / change / clear.
   - At the end: shows a summary, asks for confirmation, then writes the file
     back preserving every comment, blank line and section header.
@@ -286,7 +316,11 @@ ENV-VAR MAPPING (--non-interactive):
     BACKEND_REPO, BACKEND_STACK, BACKEND_ENTRY
     FRONTEND_REPO, FRONTEND_STACK, FRONTEND_ENTRY
     DB_TYPE
-    ISSUE_TRACKER, ISSUE_TRACKER_CLI, ATLASSIAN_URL
+    ISSUE_TRACKER, ISSUE_TRACKER_CLI
+
+  NOT seedable from the environment: issue_tracker.atlassian_url (source of
+  truth for the Atlassian host — a stale ATLASSIAN_URL must never overwrite it).
+  Set it interactively, or via the installer's day-0 prompt.
     DEFAULT_ENV, TMS_CLI
 
   ENV-SCOPED — pattern <KEY>_<ENV>:
@@ -565,9 +599,11 @@ async function promptFlatField(
   }
 
   while (true) {
+    // The example is shown, never pre-filled: Enter on an empty field must not
+    // write a made-up value (analysis §8 #12).
     const answer = await input({
-      message: `${field.section}.${field.key} — ${desc}`,
-      default: currentValue ?? example ?? undefined,
+      message: `${field.section}.${field.key} — ${desc}${!currentValue && example ? ` (e.g. ${example})` : ''}`,
+      default: currentValue ?? undefined,
     });
     if (!answer.trim()) {
       log.dim('  (skipped — kept as null)');
@@ -618,8 +654,8 @@ async function promptEnvScopedField(
 
   while (true) {
     const answer = await input({
-      message: `environments.${envName}.${field.key} — ${desc}`,
-      default: currentValue ?? example ?? undefined,
+      message: `environments.${envName}.${field.key} — ${desc}${!currentValue && example ? ` (e.g. ${example})` : ''}`,
+      default: currentValue ?? undefined,
     });
     if (!answer.trim()) {
       log.dim('  (skipped — kept as null)');
@@ -1130,6 +1166,7 @@ function runNonInteractive(loaded: LoadedConfig, dryRun: boolean): void {
   // Flat field env vars.
   for (const field of FLAT_FIELDS) {
     if (field.key === 'default_env') { continue; } // handled below
+    if (field.envVar === null) { continue; } // never seeded from the environment
     const envValue = process.env[field.envVar];
     if (envValue === undefined) { continue; }
     const result = validateField(field.validator, envValue);
@@ -1237,6 +1274,55 @@ async function runReset(loaded: LoadedConfig): Promise<void> {
 }
 
 // ============================================================================
+// COPIED TEMPLATE — GitHub "Use this template" carries the maintainers' yaml
+// ============================================================================
+
+function gitOrigin(): string | null {
+  try {
+    return execSync('git remote get-url origin', { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim() || null;
+  }
+  catch { return null; }
+}
+
+/**
+ * Replace a `.agents/project.yaml` copied from the boilerplate with the blank
+ * template, BEFORE any field is read: every value in that file is the
+ * maintainers' (their Jira, their URLs, their chosen push authorization), so
+ * nothing of this project's is lost. Asks once; `--non-interactive` needs
+ * `--reseed` as its consent; a refusal exits 1 before anything else runs.
+ */
+async function reseedCopiedTemplate(flags: CliFlags): Promise<void> {
+  if (!existsSync(PROJECT_YAML_PATH)) { return; }
+  const current = readFileSync(PROJECT_YAML_PATH, 'utf8');
+  if (classifyProjectYaml(current, gitOrigin()) !== 'copied-template') { return; }
+
+  const schemaPath = join(REPO_ROOT, SCHEMA_FILE);
+  const seeded = existsSync(schemaPath) ? seedFromSchema(readFileSync(schemaPath, 'utf8')) : null;
+  if (seeded === null) {
+    log.error(`.agents/project.yaml is the boilerplate maintainers' copy, and ${SCHEMA_FILE} is missing or malformed, so there is no template to reseed it from. Restore it from upstream, then re-run.`);
+    process.exit(1);
+  }
+
+  log.warn('.agents/project.yaml is the boilerplate maintainers\' own copy (GitHub "Use this template" carried it over): their project, their Jira, their standing push authorization.');
+  if (flags.dryRun) {
+    log.info(`Dry run: would replace it with the blank template from ${SCHEMA_FILE}. Nothing written.`);
+    return;
+  }
+  let proceed = flags.reseed;
+  if (!proceed && !flags.nonInteractive) {
+    proceed = await confirm({ message: `Replace it with the blank template from ${SCHEMA_FILE}? (nothing of this project's is in it)`, default: true });
+  }
+  if (!proceed) {
+    log.error(flags.nonInteractive
+      ? 'Refusing to fill the maintainers\' copy. Re-run with --reseed to replace it with the template first.'
+      : 'Kept as is. Nothing else ran: filling the maintainers\' copy would mix their identity into this project. Re-run when ready.');
+    process.exit(1);
+  }
+  writeFileSync(PROJECT_YAML_PATH, seeded, 'utf8');
+  log.success(`Reseeded ${relative(process.cwd(), PROJECT_YAML_PATH)} from ${SCHEMA_FILE}: every field is null, git_strategy is inherited.`);
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 
@@ -1254,6 +1340,7 @@ async function main(): Promise<void> {
     process.exit(1);
   });
 
+  await reseedCopiedTemplate(flags);
   const loaded = loadProjectYaml();
 
   if (flags.reset) {

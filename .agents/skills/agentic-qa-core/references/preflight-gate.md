@@ -1,0 +1,117 @@
+# Readiness Preflight Gate — Shared Doctrine
+
+> Cited by every skill marked `metadata.stage_owner: true` in its frontmatter. Loaded on demand at the very start of a skill, BEFORE its session-resume check and BEFORE any real work.
+> Sibling references: `./session-management.md` (resume contract — runs immediately AFTER this gate), `./orchestration-doctrine.md`, `./acli-integration.md`, `./mcp-capabilities.md` (capability vocabulary + enable table for the §8 point-of-use check).
+
+## 1. Purpose
+
+A testing run must not discover a missing tool, dead MCP, expired token, or unset credential **half-way through** — that is the single most expensive class of waste (an authored ATP against a dead env, a Stage-2 API exploration that 401s, a regression trigger that fails `gh auth`). This gate moves every such surprise to **t=0**: probe every capability the skill needs, surface a single checklist to the user, and either self-fix (with explanation + approval) or stop with an exact remedy — before the skill does anything else.
+
+The gate is a **clause**, not a phase rewrite. It runs, it clears, then the skill proceeds normally through its existing Phase 0 (resume) and pipeline.
+
+## 2. The two laws
+
+**Law 1 — Args-as-answers (no nagging).** Treat the user's invocation like a CLI call: anything they already specified in natural language is a **provided argument** — do NOT re-ask it. "QA UPEX-123 on staging" already answers *environment* and *scope*. "test the login API" already answers *which surface (API)*. Only ask the **gaps**. If every required answer is present and every probe is GREEN, ask nothing — announce the green checklist in one line and continue.
+
+**Law 2 — Probe, never assume.** "Configured in `.mcp.json`" ≠ "valid". A capability is GREEN only when actually exercised: DBHub lists a schema, the OpenAPI token is unexpired, `gh` reports authenticated, the browser binary exists, the env root returns 2xx/3xx. Presence of an env var is necessary, not sufficient.
+
+## 3. Gate sequence (run in order)
+
+1. **Resolve the environment.** From the invocation arg if present; else default **staging** (per `.agents/instructions/agent-ticket-work.md`); ask only when genuinely ambiguous. Persist as `<<ACTIVE_ENV>>` for the session.
+2. **Assemble the required-capability set.** Each skill ships its own matrix (§"Required capabilities" in its SKILL.md) plus the MCP capabilities its frontmatter declares (`metadata.requires_capabilities`, vocabulary in `./mcp-capabilities.md`; those are verified at the point of use, §8, not alarmed here). Drop capabilities that the resolved scope makes irrelevant (e.g. no DB surface in this ticket → DBHub is OPTIONAL).
+3. **Probe every required capability** (§4 table) → build a GREEN / RED status list.
+4. **Branch:**
+   - All required GREEN → emit a one-line green summary, continue to the resume check.
+   - Any RED → go to §5 (classify + surface checklist via `AskUserQuestion`).
+5. **Resolve REDs** per §5, then re-probe the ones you fixed in-session. MCP-spawn-time vars (§6) cannot be re-probed without an agent restart → STOP after writing them.
+
+On **resume** (the skill's Phase 0 finds prior `.session/` state): re-run the fast probes (env reachable, token unexpired, `gh` auth) but DO skip the user questions already answered in the prior `plan.md`. Tokens and env health expire; answers do not.
+
+## 3.1 Generic baseline vs skill-specific delta
+
+These hold for **every** testing skill and are owned HERE — a skill must NOT re-state them:
+
+- The two laws (§2) + the probe-don't-assume discipline.
+- Environment resolution (§3 step 1): arg-first, default staging, ask only if genuinely ambiguous.
+- Secret & token handling + the spawn-time RESTART rule (§6).
+- The single-checklist `AskUserQuestion` behavior (§5) and the output contract (§7).
+- **Surfaces / test-types are NEVER a user question** (§5) — always a planning-phase decision.
+- **The gate probes artifacts; it NEVER auto-runs heavy setup commands.** A missing adapted state, missing discovery output (no `.context/project-config.md`, or the `business-domain-context` / `infra-context` maps still placeholders), or any other heavy-setup gap → STOP and hand the user the command to run themselves (`/project-discovery`, `/test-framework-adaptation`). These are write-gated, interactive, token-heavy commands the user drives in a clean session — the gate verifies their OUTPUT, it does not execute them.
+
+Each skill therefore declares ONLY its **specific capability delta**: the REQUIRED / SCOPE-conditional / OPTIONAL rows from §4 that its work actually needs. A skill's gate section is that delta — not a re-listing of the baseline.
+
+## 4. Capability probe table
+
+Probe only what the skill's matrix lists. `[TAG_TOOL]` resolve per `.agents/instructions/agent-tool-resolution.md`.
+
+| Capability | GREEN probe | Typical RED remedy |
+|---|---|---|
+| **Framework adapted (artifacts present — NOT a generic boilerplate)** | The OUTPUT that `/test-framework-adaptation` produces is in place. Probe its Phase 9 ADAPTED signals, read-only: `bun run vars:check` exits 0 AND `.agents/project.yaml` has zero `null #` lines; none of `ExampleApi.ts` / `ExamplePage.ts` / `ExampleSteps.ts` / `api/schemas/example.types.ts` exist; no `module-example` spec dirs remain under `tests/e2e/` / `tests/integration/`. | Still generic → **STOP and hand the user the commands to run THEMSELVES**: `/project-discovery` (if `.context/project-config.md` is missing or `bun run context:map infra-context` prints a placeholder notice) then `/test-framework-adaptation`. The gate **never auto-runs** them — it verifies their artifacts only. |
+| **Active env reachable** | HTTP HEAD/GET on `{{WEB_URL}}` and `{{API_URL}}` root → 2xx/3xx (a login redirect counts). | 404/410/5xx, refused, or a dead-deploy page → STOP; offer a session env override (user-supplied alt URL). |
+| **Test-user credentials** | The credentials `config/variables.ts` declares for `<<ACTIVE_ENV>>` are present in `.env` (the shipped example names are `LOCAL_USER_*` / `STAGING_USER_*`; an adapted project may have renamed them). Nothing requires them up front: `config.testUser` fails by name the moment a test reads an empty pair, so this skill-time ask IS the point of use for a session about to log in. | Empty → user fills `.env` (template in `.env.example`). Never hardcode, never echo the value back. |
+| **User roles** | The project's role count is known and each role has creds in `.env`. When the SUT publishes a `/qa` testability page (`project-discovery/references/phase-3-infrastructure.md`), its demo users give the role count and its credentials button points at the credentials artifact (a Jira Epic by default, readable through the synced cache with `bun run jira:sync-issues get <KEY>`); the user copies those values into `.env`, and none of them is ever quoted back or written to a committed file. | Multi-role project with one cred set → ask how many roles; have the user add per-role creds as `<ENV>_<ROLE>_EMAIL` / `<ENV>_<ROLE>_PASSWORD` (role `user` = the existing pair). Browser state per role: `browser-sessions.md` §4. `bun run api:login [<env>] --role <role> [--profile <name>]` mints one token per role into `.auth/tokens.env` (var `API_TOKEN_<ROLE>_<ENV>`); `--profile <name>` isolates it under `.auth/profiles/<name>/` instead. Every role signs in through the app's own login, never a minted session (`browser-sessions.md` §4), and in `production` each role is a dedicated synthetic QA account: never a real customer's, a staff member's or the owner's. |
+| **OpenAPI MCP (schema read-only)** | `openapi` server present in `.mcp.json`; `OPENAPI_SPEC_PATH` set (the full spec URL, or a file path relative to the repo root; never the endpoint route alone); a `list-api-endpoints` / `get-api-endpoint-schema` call returns the spec. No token needed — the MCP does NOT execute. | Spec path unset / endpoints generic → the project never ran `/test-framework-adaptation`; hand off there. Authenticated execution is curl's job (see §6 + `api-testing-doctrine.md`). |
+| **DBHub MCP (data validation)** | `dbhub` server present; `DBHUB_*` set in `.env`; a probe query lists tables / returns the schema. | Unset vars or auth failure → user fills `.env` DBHUB_* block, then RESTART (spawn-time, §6). |
+| **Issue-tracker (`[ISSUE_TRACKER_TOOL]`)** | `/acli` loaded; auth check per `/acli` references passes (`bun run jira:check` validates the Jira field/workflow setup). | Not authenticated / token missing → tell the user the exact var (`ATLASSIAN_*`) + `.env`, ask them to fix + RESTART. |
+| **TMS (`[TMS_TOOL]`)** | Modality resolved (jira-xray vs jira-native, per `test-documentation/SKILL.md` §Phase 0). Modality jira-xray → `/xray-cli` loaded + `XRAY_*` creds set. | Xray creds missing → user fills `.env` `XRAY_*`. Modality unresolved → run the modality probe in `test-documentation/SKILL.md` §Phase 0; ask only if all auto-checks fail. |
+| **GitHub CLI** | `gh auth status` → authenticated; repo + workflows visible. | Not authed → user runs `gh auth login` themselves (suggest the `!` prefix); do not proceed. |
+| **Playwright browsers** | `bunx playwright --version` resolves; chromium installed. | Missing browser → offer to run `bun run pw:install` (explain it downloads chromium), then proceed. |
+| **Email (`resend`)** | The `resend` binary present and logged in (`resend login`, keychain-backed; load `/resend-cli`). Mailbox can RECEIVE, not just send, for magic-link / token flows. | Send-only or not logged in → STOP for email-dependent tickets; surface before authoring anything. |
+| **Web search / docs** (`web-search` / `library-docs`) | At least one available tool provides the capability by suffix (`web_search_exa` or `tavily_search` / `resolve-library-id`, any prefix: `mcp-capabilities.md` §2). Web search is a HARNESS-level server (a connector or a user-scope MCP), never a project `.env` key. | No provider → the §8 point-of-use STOP (name the capability + how to enable it per host, `mcp-capabilities.md` §5). Never degrade to built-in `WebSearch` / `WebFetch` on your own; the user may choose it explicitly. |
+| **Dev toolchain** | `bun run test` / `types:check` / `lint:check` resolve; `kata-manifest.json` present + `bun run kata:manifest:check` clean. | Stale manifest → `bun run kata:manifest`. Missing dep → `bun install`. |
+| **GitHub Actions Secrets/Variables** | For CI-driven skills only: the runner holds the env-prefixed creds + tokens as Repository / Environment Secrets — `gh secret list` / `gh variable list` (add `--env <env>` for environment-scoped) shows them. | Missing → set from `.env` via `gh secret set <NAME>` / `gh variable set <NAME>` (`--env <env>` for environment scope). NOTE: `/test-framework-adaptation` §7.2 emits the copy-paste list and offers the opt-in `gh secret set` push; pushing them with `gh secret set` is the lower-friction path and avoids a runner that 401s mid-suite. |
+
+## 5. Classify each RED, then surface ONE checklist
+
+Split REDs into:
+
+- **Self-fixable in-session** (no restart): run `bun run pw:install`, `bun run kata:manifest`, load a tool skill, run `bun run jira:check`. → Offer to do it, **explain what it does**, ask approval, then do it.
+- **User-action** (a secret you must not invent, or an interactive login): missing `.env` value, `gh auth login`. → Tell the user the **exact var + file + why**, ask them to fix it.
+- **MCP-spawn-time** (§6): `OPENAPI_SPEC_PATH`, any `DBHUB_*` — even when you can write the value, the running MCP will not see it until restart. → Write it, then STOP and ask for a restart. (NOTE: the API token is NOT in this class — it never enters an MCP; curl reads `.auth/tokens.env` live, no restart.)
+
+Surface them as a **single batched checklist** with one batched `AskUserQuestion` call (multi-select where natural). Compose questions only for genuine gaps + REDs — never to pad a checklist (per `AGENTS.md` Critical Rule #4, Shift-Left). One question per real decision: environment (ONLY if unresolved by an arg), missing-secret intents, and a confirm-to-fix for each self-fixable remedy.
+
+**Never ask the user which test types / surfaces to run.** That is the skill's OWN decision, derived from story analysis + veto + risk-scoring in its planning phase (e.g. `sprint-testing` Stage 1). The gate's job is to PROBE and REPORT which surface tools are ready; the planning phase reads that report and picks trifuerza (UI/API/DB), a single surface, or code-review-only on its own. If a surface the planning later selects has a RED tool, surface that remedy then (lazy) — do not front-load a surface menu at the gate.
+
+If a single question round cannot hold the gaps AND the user benefits from seeing the full readiness table while answering, prefer the `mkd` decision deck over multiple terminal rounds. The threshold, what a deck owes the reader, the gate when `mkd` is absent, and how to read the returned contract are canon in `agentic-qa-core/references/decision-elicitation-doctrine.md`.
+
+GREEN items are reported, not asked.
+
+## 6. Secret & token handling (load-bearing — read every time)
+
+- Secrets live in `.env` ONLY. Never hardcode, never paste a secret into a skill artifact, a Jira field, a commit, or chat. When reporting status, say "set" / "unset" / "expired" — never the value.
+- Every MCP server that needs a secret starts through the `.env` loader on all three hosts (`.mcp.json`, `opencode.jsonc`, `.codex/config.toml`: `varlock run ... --filter <its vars> -- <server>`), which reads `.env` from the project root. It reads the value **at MCP-server spawn time** — there is no mid-session refresh (per `AGENTS.md` Critical Rule #10). So any write to `.env` that an MCP depends on (any `.env` var in an MCP server's `--filter`) requires the user to **restart the agent** (`bun claude` / `bun opencode`) before the change takes effect. (The API token is exempt — it never enters an MCP; curl reads `.auth/tokens.env` live.) Always end such a remedy with that instruction and STOP.
+
+### The API testing maneuver (canonical — schema read / token / curl)
+
+The OpenAPI MCP is **schema-read-only**; authenticated requests run via **curl**. Canon: `agentic-qa-core/references/api-testing-doctrine.md`.
+
+1. **Schema (read-only):** use the `openapi` MCP's `list-api-endpoints` + `get-api-endpoint-schema` to learn the contract. `OPENAPI_SPEC_PATH` is the full spec URL (commonly the localhost backend) or a file path relative to the repo root, never the endpoint route alone. No token needed.
+2. **Precondition for execution:** `scripts/api-login.project.ts` is project-adapted (auth endpoint + payload shape wired by `/test-framework-adaptation`; the CLI around it — `scripts/lib/api-login-core.ts` (synced) and `scripts/api-login.ts` (delivered once, never overwritten; a pre-split repo adopts the split by hand, copying in the current `scripts/api-login.ts` entry from the boilerplate) — is never adapted), and `<<ACTIVE_ENV>>`-scoped creds exist in `.env`. Still generic → hand off to `/test-framework-adaptation`; do not improvise an auth call.
+3. **Mint the token:** run `bun run api:login [<env>] [--role <role>] [--profile <name>]` (flag order is free; a flag value is never taken as the env). It authenticates the env+role creds and writes `.auth/tokens.env` (`export API_TOKEN_<ROLE>_<ENV>='…'`) + `.auth/tokens.json` (metadata) + `.auth/api-state.json` (Playwright; default role only, never profiled). `--profile <name>` redirects the first two into `.auth/profiles/<name>/` — an isolated set (e.g. per orchestration worker) that never overwrites the default. The AI never pastes the raw token.
+4. **Execute (curl):** `source .auth/tokens.env && curl -H "Authorization: Bearer $API_TOKEN_<ROLE>_<ENV>" "$API_BASE_URL/<path>"` — `source` + `curl` in the SAME Bash call. **No restart** (the token never enters an MCP). Multiple roles/envs coexist in the same files.
+
+## 7. Output contract
+
+The gate produces, before any other skill output:
+
+```
+Readiness — <skill> — env: <<ACTIVE_ENV>>
+  GREEN: <capability, …>
+  RED:   <capability — remedy class>
+  Action: <none | questions asked | fix applied | RESTART required>
+```
+
+Then: all-GREEN → continue to the resume check. Any blocking RED unresolved → STOP at the gate. Never enter the skill's real work with a required capability RED.
+
+## 8. Point-of-use capability check (MCP capabilities)
+
+A disabled MCP is not a gate finding: nothing reports it at session start (people disable servers to save tokens). The check runs **immediately before the step that uses the capability**, for every capability the skill declares in `metadata.requires_capabilities` (vocabulary + enable table: `./mcp-capabilities.md`).
+
+1. **Look at the tools available in THIS session.** A tool provides a capability when its name, after the `mcp__<server>__` prefix, matches one of the capability's tool names (`web_search_exa`, `tavily_search`, `resolve-library-id`, `execute_sql_<source>`, `list-api-endpoints`, ...). The prefix is irrelevant: the project server, a user-level server and a claude.ai connector all qualify. The one skill-provided capability, `diagrams`, is resolved the same way against the SKILLS this session can load: any skill named `diagram-design`, whatever its source (project install, user install, harness plugin).
+2. **At least one provider → use it and continue.** No question, no note.
+3. **No provider → STOP before the step.** One message, three facts: the missing capability, the server that normally provides it, and the enable path for the running host (`/mcp` in Claude Code, `opencode.jsonc` on OpenCode, `.codex/config.toml` on Codex, or connecting the claude.ai connector). Then wait.
+4. **Never substitute on your own.** Built-in `WebSearch` / `WebFetch` for `web-search` or `library-docs`, route-file reading for `api-schema`, a guess for `db`: none of them is a silent fallback. The user's explicit "use X instead" is the only thing that unblocks a substitute, and the report then names the substitution.
+5. **The tool answers but fails on its first call (401/403, mystery error)** → that is the credential case: `AGENTS.md` Critical Rule #10 (exact env var, `.env`, RESTART).
+
+**User prompts follow the same rule.** A request that clearly needs a capability ("search the web for X", "look up the docs of Y", "query the staging DB") gets the same one-message STOP when no tool provides it, instead of a substitute.

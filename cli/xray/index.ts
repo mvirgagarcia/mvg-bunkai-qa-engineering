@@ -19,12 +19,14 @@ import * as backup from './commands/backup.js';
 
 import * as exec from './commands/exec.js';
 import * as importCmd from './commands/import.js';
+import * as link from './commands/link.js';
 import * as plan from './commands/plan.js';
 import * as precondition from './commands/precondition.js';
 import * as repairCmd from './commands/repair.js';
 import * as run from './commands/run.js';
 import * as set from './commands/set.js';
 import * as test from './commands/test.js';
+import * as traceCmd from './commands/trace.js';
 import { colors, log } from './lib/logger.js';
 import { parseArgs } from './lib/parser.js';
 
@@ -50,6 +52,12 @@ ${colors.bold}AUTHENTICATION${colors.reset}
 
   auth logout    Clear stored credentials
   auth status    Show current authentication status
+
+${colors.bold}CAPTURING WHAT YOU CREATED${colors.reset}
+  Every 'create' below (test, precondition, exec, plan, set) ends with a bare
+  ANSI-free line 'KEY <PROJ-123>', and accepts --json for the same value as a
+  field. Capture from one of those; never scrape the decorated success line.
+    KEY=$(xray test create --project DEMO --summary "..." | grep '^KEY ' | cut -d' ' -f2)
 
 ${colors.bold}TEST MANAGEMENT${colors.reset}
   test create    Create a new test case
@@ -77,6 +85,13 @@ ${colors.bold}TEST MANAGEMENT${colors.reset}
                      --action <text>    Step action (required)
                      --data <text>      Step test data
                      --result <text>    Expected result
+  test update-step   Update an existing step in place (only the flags you pass
+                     change; omitted fields keep their value)
+                     <TEST_KEY>         Test key or issue ID (optional, informational)
+                     --step <id>        Step ID to update (required)
+                     --action <text>    New step action
+                     --data <text>      New step test data
+                     --result <text>    New expected result
   test remove-step   Remove a step from a test
                      --test <id>        Test issue ID (required)
                      --step <id>        Step ID to remove (required)
@@ -90,6 +105,17 @@ ${colors.bold}TEST MANAGEMENT${colors.reset}
                      --test <id>        Test issue ID (required)
                      --type <name>      New test type (required)
 
+  test enrich        Backfill the synced Test .md cache (.context/PBI) with the
+                     Xray-only associations the Jira REST sync cannot see:
+                     inlined Preconditions + Test Set membership. Re-run safe —
+                     replaces its own delimited section. Also writes
+                     test-sets/<KEY>.md member indexes.
+                     --dir <path>       PBI cache root (default: .context/PBI)
+                     --project <key>    Only enrich Tests of this project
+                     --batch <n>        Keys per GraphQL request (default: 50)
+                     --dry-run          Report without writing files
+                     --no-set-index     Skip the test-sets/<KEY>.md indexes
+
 ${colors.bold}PRECONDITIONS${colors.reset}
   precondition create      Create a Precondition issue
                      --project <key>    Project key (required)
@@ -98,9 +124,18 @@ ${colors.bold}PRECONDITIONS${colors.reset}
                      --definition <text> Precondition definition / setup body
                      --labels <l1,l2>   Comma-separated labels
                      --folder <path>    Folder path in Xray
+  precondition list        List preconditions
+                     --project <key>    Filter by project
+                     --jql <query>      Custom JQL filter
+                     --limit <n>        Max results (default: 20)
+  precondition get <key>   Get precondition details (definition + the tests
+                     using it). Also addressable via --id <numeric>.
   precondition add-to-test Attach precondition(s) to a test
                      --test <id>        Test key or numeric issue ID (required)
                      --preconditions <k1,k2> Precondition keys/ids (required)
+  precondition remove-from-test  Detach a precondition from a test
+                     <PRECOND_KEY>      Precondition key or issue ID (required)
+                     --test <id>        Test key or numeric issue ID (required)
   precondition update      Update a precondition's definition / type
                      --precondition <id> Precondition key or issue ID (required)
                      --definition <text> New definition
@@ -115,12 +150,20 @@ ${colors.bold}TEST EXECUTIONS${colors.reset}
                                         separated). Pins the execution to an
                                         environment (e.g. staging) so results are
                                         congruent across runs and comparable.
+                                        ${colors.yellow}Strongly recommended — omitting it prints a
+                                        WARNING${colors.reset} (suggested value comes from
+                                        .agents/project.yaml testing env).
 
   exec get <id>      Get execution details with test runs
   exec list          List executions
   exec add-tests     Add tests to an existing execution
                      --execution <id>   Execution issue ID
                      --tests <id1,id2>  Test issue IDs to add
+  exec add-set       Cascade a Test Set's membership into an execution
+                     <EXEC_KEY>         Execution key or issue ID (required)
+                     --set <key>        Test Set key or issue ID (required)
+                     Reads the Set membership, adds only the tests the
+                     execution is missing, reports added/skipped.
   exec remove-tests  Remove tests from an execution
   exec set-environment  Associate Test Environment(s) with an existing execution
                      --execution <id>   Execution key or numeric issue ID
@@ -135,7 +178,13 @@ ${colors.bold}TEST RUNS${colors.reset}
                      --execution <id>   Execution issue ID
   run status         Update test run status
                      --id <id>          Test run ID (required)
-                     --status <status>  TODO|EXECUTING|PASSED|FAILED|ABORTED|BLOCKED
+                     --status <status>  Xray DEFAULTS: TODO|EXECUTING|PASSED|FAILED|
+                                        ABORTED|BLOCKED. The vocabulary is
+                                        PER-INSTANCE: a project may accept only
+                                        TODO|EXECUTING|PASSED|FAILED and reject the
+                                        rest at mutation time. Record a blocked case
+                                        in a status the project defines and explain
+                                        it with 'run comment'; never leave it TODO.
 
   run step-status    Update a specific step status
                      --run <id>         Test run ID
@@ -177,10 +226,19 @@ ${colors.bold}TEST PLANS${colors.reset}
                      --summary <text>   Plan summary (required)
                      --tests <id1,id2>  Test issue IDs to include
 
+  plan get <id>      Get test plan details with tests
   plan list          List test plans
   plan add-tests     Add tests to an existing test plan
                      --plan <id>        Test plan key or numeric issue ID
                      --tests <id1,id2>  Test issue IDs or keys to add
+  plan add-set       Cascade a Test Set's membership into a test plan
+                     <PLAN_KEY>         Test plan key or issue ID (required)
+                     --set <key>        Test Set key or issue ID (required)
+                     Reads the Set membership, adds only the tests the plan
+                     is missing, reports added/skipped.
+  plan add-executions  Associate Test Execution(s) with a test plan
+                     <PLAN_KEY>         Test plan key or issue ID (required)
+                     --executions <k1,k2>  Execution keys/ids, comma-separated (required)
   plan remove-tests  Remove tests from a test plan
   plan sync          Diff Jira-layer issuelinks vs Xray-layer attachment for a Test Plan
                      --plan <id>        Test plan key or numeric issue ID
@@ -198,6 +256,50 @@ ${colors.bold}TEST SETS${colors.reset}
                      --set <id>         Test set issue ID
                      --tests <id1,id2>  Test issue IDs to add
   set remove-tests   Remove tests from a test set
+  set sync           Diff Jira-layer issuelinks vs Xray-layer membership for a Test Set
+                     --set <id>         Test set key or numeric issue ID
+                     --apply            Re-attach missing tests at the Xray layer
+
+${colors.bold}ISSUE LINKS${colors.reset}
+  link create        Create a Jira issue link between two issues
+                     <FROM_KEY>         Performs the link type's outward verb (required)
+                     <TO_KEY>           Receives it (required)
+                     --type <slug>      Link-type SLUG from .agents/jira-required.yaml
+                                        -> link_types (default: test). Display names
+                                        are resolved from the catalog, never hardcoded.
+                     Coverage case: 'link create <ATS_KEY> <STORY_KEY> --type test'
+                     — the Set tests the Story. MEASURED shape: the Story's
+                     issuelinks entry then carries 'inwardIssue: <ATS_KEY>', and
+                     that is the only shape Xray's coverage panel counts. The
+                     confirmation line prints the payload actually POSTed.
+                     Also: TC→Story (last resort), Bug↔Test.
+
+  link delete        Remove one issue link by its own id
+                     --id <LINK_ID>     issuelinks[].id (required) — NOT an issue
+                                        key and NOT an issue id
+                     --yes              Required to apply. Deleting is not reversible
+                     --dry-run          Print what would be deleted and stop
+                     Needed to repair an inverted link: Jira dedupes a link between
+                     the same pair and type regardless of direction, so recreating
+                     it is a silent no-op until the wrong one is gone. 'trace --json'
+                     prints the id for a failing coverage edge whose link exists.
+
+${colors.bold}TRACEABILITY${colors.reset}
+  trace <STORY_KEY>  Verify the three-edge traceability check in one call:
+                     Story↔ATS (coverage, link type 'test' — the only edge the
+                     Xray coverage panel counts), ATP↔Story and ATR↔Story
+                     (administrative), plus ATS membership == ATP test list ==
+                     ATR test list. Read-only.
+                     <STORY_KEY>...     One or more keys (also comma-separated)
+                     --jql <query>      Verify every issue the query returns
+                     --limit <n>        Page size for --jql (default: 100)
+                     --json             Machine-readable verdict. One key keeps the
+                                        single-object shape; a sweep wraps it in
+                                        { stories, unreadable, summary }
+                     Exits 0 only when ALL four edges pass for EVERY Story; every
+                     failed edge prints the exact command that repairs it, and a
+                     sweep closes with a repair worklist. An inverted coverage link
+                     is invisible per Story and only reads as a pattern in a sweep.
 
 ${colors.bold}IMPORT RESULTS${colors.reset}
   import junit       Import JUnit XML results
@@ -258,7 +360,8 @@ ${colors.bold}BACKUP & RESTORE${colors.reset}
                                         (default: each backup's own key)
 
 ${colors.bold}REPAIR${colors.reset}
-  repair             Bulk Jira-layer ↔ Xray-layer reconciliation across a project.
+  repair             Bulk Jira-layer ↔ Xray-layer reconciliation across a project
+                     (Test Executions + Test Plans + Test Sets).
                      Useful after Test Executions or Test Plans were created via Jira
                      fallback paths without Xray auth (the Jira layer accepts the
                      issue but the Xray layer never registers the test attachment).
@@ -286,6 +389,10 @@ ${colors.bold}EXAMPLES${colors.reset}
   xray run evidence --id 5acc7ab0a3fe1b --file a.png --file b.png --file c.png
   xray run evidence --id 5acc7ab0a3fe1b --dir ./.context/PBI/{{PROJECT_KEY}}-8/evidence/
 
+  # Enrich the synced Test cache with Preconditions + Test Set membership
+  xray test enrich --project {{PROJECT_KEY}}
+  xray test enrich --dry-run
+
   # Import JUnit results
   xray import junit --file results.xml --project DEMO
 
@@ -301,20 +408,46 @@ ${colors.bold}EXAMPLES${colors.reset}
   # Sync existing tests (after migration)
   xray backup restore --file backup.json --project PROJ --sync
 
+  # Set-first cascade: propagate a Test Set's membership into a Plan / Execution
+  xray plan add-set {{PROJECT_KEY}}-200 --set {{PROJECT_KEY}}-180
+  xray exec add-set {{PROJECT_KEY}}-194 --set {{PROJECT_KEY}}-180
+
+  # Associate executions with a plan
+  xray plan add-executions {{PROJECT_KEY}}-200 --executions {{PROJECT_KEY}}-194,{{PROJECT_KEY}}-195
+
+  # Coverage link: the Set tests the Story (Story then carries inwardIssue: -180)
+  xray link create {{PROJECT_KEY}}-180 {{PROJECT_KEY}}-42 --type test
+
+  # Verify a Story's full traceability in one call (exit 0 = all four edges hold)
+  xray trace {{PROJECT_KEY}}-42
+  xray trace {{PROJECT_KEY}}-42 --json
+
+  # Sweep a project for inverted / missing coverage links and get a repair worklist
+  xray trace --jql "project = {{PROJECT_KEY}} AND issuetype = Story" --limit 100
+
+  # Repair one inverted link: read the id, dry-run, delete, recreate
+  xray trace {{PROJECT_KEY}}-42 --json
+  xray link delete --id 10421 --dry-run
+  xray link delete --id 10421 --yes
+  xray link create {{PROJECT_KEY}}-180 {{PROJECT_KEY}}-42 --type test
+
   # Diff Jira-layer vs Xray-layer for a Test Execution and (optionally) repair
   xray exec sync --execution {{PROJECT_KEY}}-194
   xray exec sync --execution {{PROJECT_KEY}}-194 --apply
 
-  # Bulk repair every Test Execution + Test Plan in a project
+  # Bulk repair every Test Execution + Test Plan + Test Set in a project
   xray repair --project {{PROJECT_KEY}}
   xray repair --project {{PROJECT_KEY}} --apply
 
 ${colors.bold}ENVIRONMENT VARIABLES${colors.reset}
   XRAY_CLIENT_ID      Xray API Client ID
   XRAY_CLIENT_SECRET  Xray API Client Secret
-  ATLASSIAN_URL       Atlassian site URL (for sync features)
   ATLASSIAN_EMAIL     Atlassian account email
   ATLASSIAN_API_TOKEN Atlassian API token
+
+  The Jira site host is NOT an environment variable: it is read from
+  .agents/project.yaml -> issue_tracker.atlassian_url (print it with
+  'bun run --silent jira:url'), or from 'xray auth login --jira-url'.
 
 ${colors.bold}CONFIG FILES${colors.reset}
   ~/.xray-cli/config.json   Stored credentials
@@ -385,6 +518,9 @@ async function main(): Promise<void> {
           case 'add-step':
             await test.addStep(flags);
             break;
+          case 'update-step':
+            await test.updateStep(flags, positional);
+            break;
           case 'remove-step':
             await test.removeStep(flags);
             break;
@@ -397,9 +533,12 @@ async function main(): Promise<void> {
           case 'update-type':
             await test.updateType(flags);
             break;
+          case 'enrich':
+            await test.enrich(flags);
+            break;
           default:
             log.error(`Unknown test command: ${subcommand}`);
-            log.info('Available: create, get, list, add-step, remove-step, update-gherkin, update-definition, update-type');
+            log.info('Available: create, get, list, add-step, update-step, remove-step, update-gherkin, update-definition, update-type, enrich');
         }
         break;
 
@@ -409,15 +548,24 @@ async function main(): Promise<void> {
           case 'create':
             await precondition.create(flags);
             break;
+          case 'list':
+            await precondition.list(flags);
+            break;
+          case 'get':
+            await precondition.get(flags, positional);
+            break;
           case 'add-to-test':
             await precondition.addToTest(flags);
+            break;
+          case 'remove-from-test':
+            await precondition.removeFromTest(flags, positional);
             break;
           case 'update':
             await precondition.update(flags);
             break;
           default:
             log.error(`Unknown precondition command: ${subcommand}`);
-            log.info('Available: create, add-to-test, update');
+            log.info('Available: create, list, get, add-to-test, remove-from-test, update');
         }
         break;
 
@@ -436,6 +584,9 @@ async function main(): Promise<void> {
           case 'add-tests':
             await exec.addTests(flags);
             break;
+          case 'add-set':
+            await exec.addSet(flags, positional);
+            break;
           case 'remove-tests':
             await exec.removeTests(flags);
             break;
@@ -447,7 +598,7 @@ async function main(): Promise<void> {
             break;
           default:
             log.error(`Unknown exec command: ${subcommand}`);
-            log.info('Available: create, get, list, add-tests, remove-tests, sync, set-environment');
+            log.info('Available: create, get, list, add-tests, add-set, remove-tests, sync, set-environment');
         }
         break;
 
@@ -497,11 +648,20 @@ async function main(): Promise<void> {
           case 'create':
             await plan.create(flags);
             break;
+          case 'get':
+            await plan.get(flags, positional);
+            break;
           case 'list':
             await plan.list(flags);
             break;
           case 'add-tests':
             await plan.addTests(flags);
+            break;
+          case 'add-set':
+            await plan.addSet(flags, positional);
+            break;
+          case 'add-executions':
+            await plan.addExecutions(flags, positional);
             break;
           case 'remove-tests':
             await plan.removeTests(flags);
@@ -511,7 +671,7 @@ async function main(): Promise<void> {
             break;
           default:
             log.error(`Unknown plan command: ${subcommand}`);
-            log.info('Available: create, list, add-tests, remove-tests, sync');
+            log.info('Available: create, get, list, add-tests, add-set, add-executions, remove-tests, sync');
         }
         break;
 
@@ -533,9 +693,27 @@ async function main(): Promise<void> {
           case 'remove-tests':
             await set.removeTests(flags);
             break;
+          case 'sync':
+            await set.sync(flags);
+            break;
           default:
             log.error(`Unknown set command: ${subcommand}`);
-            log.info('Available: create, get, list, add-tests, remove-tests');
+            log.info('Available: create, get, list, add-tests, remove-tests, sync');
+        }
+        break;
+
+      case 'link':
+        switch (subcommand) {
+          case 'create':
+            await link.create(flags, positional);
+            break;
+          case 'delete':
+          case 'rm':
+            await link.del(flags, positional);
+            break;
+          default:
+            log.error(`Unknown link command: ${subcommand}`);
+            log.info('Available: create, delete');
         }
         break;
 
@@ -571,6 +749,12 @@ async function main(): Promise<void> {
             log.error(`Unknown backup command: ${subcommand}`);
             log.info('Available: export, restore, preflight');
         }
+        break;
+
+      case 'trace':
+        // Single-word command: the Story key arrives as `subcommand` when it is
+        // the first token, or as a positional after a flag.
+        await traceCmd.trace(flags, [subcommand, ...positional].filter(a => a !== ''));
         break;
 
       case 'repair':

@@ -1,27 +1,30 @@
-bunx lint-staged
+bunx lint-staged --no-stash
 
-# Light-weight repo health checks on every commit (fast, cover full repo).
-bun run types:check
-bun run vars:check
-bun run skills:check
-
-# kata-manifest freshness gate — only runs when staged files affect it.
-STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
-if echo "$STAGED" | grep -qE '^(tests/components/|scripts/kata-manifest\.ts$|kata-manifest\.json$)'; then
-  bun run kata:manifest:check || {
-    echo ""
-    echo "❌ kata-manifest.json is stale. Fix:"
-    echo "   bun run kata:manifest && git add kata-manifest.json"
-    exit 1
-  }
+# Framework gates, in one call. They live in `.husky/framework-gates.sh`, which
+# the boilerplate updater SYNCS, while this hook is project-owned and never
+# overwritten — so a gate added upstream lands here without rewriting your file.
+# The `-f` guard is required: `.husky/_/h` runs this under `sh -e`, and sourcing
+# a file that is not there would kill the hook.
+#
+# Your own gates go around this call; the ordering in this file is yours.
+# `lint-staged` stays above it on purpose: it REWRITES staged files, so it has
+# to finish before anything reads the staged list.
+GATES="$(dirname -- "$0")/framework-gates.sh"
+if [ -f "$GATES" ]; then
+  . "$GATES"
+  framework_gates_pre_commit
+else
+  echo "⚠️  .husky/framework-gates.sh missing — framework pre-commit gates SKIPPED."
+  echo "   Restore it with: bun sync"
 fi
 
-# skill-registry freshness gate — only runs when staged files affect it.
-if echo "$STAGED" | grep -qE '^(\.claude/skills/.+/SKILL\.md$|scripts/build-skill-registry\.ts$|\.claude/skills/REGISTRY\.md$)'; then
-  bun run skills:registry:check || {
+# Docs dead-link gate — only when the staged set touches the human docs or the
+# decks, and only where the script exists (a project synced before it shipped).
+if git diff --cached --name-only --diff-filter=ACMRD | grep -qE '^(docs/|packages/decks/|README\.md$|INSTALLER\.md$|CONTEXT\.md$)' \
+  && grep -q '"docs:check"' package.json 2>/dev/null; then
+  bun run docs:check || {
     echo ""
-    echo "❌ .claude/skills/REGISTRY.md is stale. Fix:"
-    echo "   bun run skills:registry && git add .claude/skills/REGISTRY.md"
+    echo "❌ A doc links to a file or cites a path that does not exist. Fix the link, or the path."
     exit 1
   }
 fi

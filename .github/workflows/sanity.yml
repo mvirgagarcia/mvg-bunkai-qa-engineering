@@ -47,6 +47,16 @@ on:
         required: false
         default: 'sanity'
         type: string
+      execution_key:
+        description: 'Key of the Test Execution this run imports into (an RTR created by /regression-testing, or the sprint-close STR). Empty = the Xray import is skipped; sanity never writes into a regression execution on its own.'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  # Same gh-pages publish race as regression.yml — queue, never cancel.
+  group: sanity-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CI: true
@@ -56,6 +66,37 @@ env:
   LOCAL_USER_PASSWORD: ${{ secrets.LOCAL_USER_PASSWORD }}
   STAGING_USER_EMAIL: ${{ secrets.STAGING_USER_EMAIL }}
   STAGING_USER_PASSWORD: ${{ secrets.STAGING_USER_PASSWORD }}
+  # TMS write-back (optional, opt-in). Mirrors regression.yml so a project that
+  # turns AUTO_SYNC on gets the same behaviour from every suite. This workflow
+  # has no separate Xray JUnit-import job, so the sync step below covers both
+  # modalities: 'xray' imports the ATC runs into the execution_key passed at
+  # dispatch (and skips without one), 'jira' writes a status field and a
+  # comment on each Test issue.
+  TMS_PROVIDER: ${{ vars.TMS_PROVIDER || 'xray' }}
+  AUTO_SYNC: ${{ secrets.AUTO_SYNC || 'false' }}
+  XRAY_CLIENT_ID: ${{ secrets.XRAY_CLIENT_ID }}
+  XRAY_CLIENT_SECRET: ${{ secrets.XRAY_CLIENT_SECRET }}
+  # Smoke and sanity never write into a regression execution. The
+  # STP_EXECUTION_KEY secret is NOT read here on purpose: it names the RTR (or
+  # the sprint-close STR) of the regression suite, and a sanity run of one file
+  # importing into it would flip Test Runs that belong to a full regression
+  # verdict. Pass an execution key explicitly at dispatch to import; otherwise
+  # the Xray leg is skipped.
+  STP_EXECUTION_KEY: ${{ github.event.inputs.execution_key }}
+  # Atlassian credentials — uncomment when AUTO_SYNC=true on a jira-native
+  # project. There is NO ATLASSIAN_URL secret: the host is read from the
+  # checked-out .agents/project.yaml (issue_tracker.atlassian_url).
+  # ATLASSIAN_EMAIL: ${{ secrets.ATLASSIAN_EMAIL }}
+  # ATLASSIAN_API_TOKEN: ${{ secrets.ATLASSIAN_API_TOKEN }}
+  # Secret manager (ADVANCED, optional; ADR-0010). Only for a project that
+  # committed .env.provider.schema: the service account reads the team vault
+  # inside every step that runs through the launcher (`bun run test*`,
+  # `test:env:check`, `test:sync`). It sits BESIDE the per-variable secrets
+  # above, never instead: a per-variable secret that is set still wins, and one
+  # left unset (an empty string here) is dropped by the launcher so it cannot
+  # blank the vault value. Steps that call a tool directly (`bun xray`, the
+  # portal publisher) still read the per-variable secrets only.
+  OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
 
 jobs:
   SanityTest:
@@ -85,28 +126,49 @@ jobs:
       - name: Install Playwright Browsers
         run: bun run pw:install
 
+      # The free-text inputs (grep, test_file) are typed by whoever dispatches
+      # the run. They reach the shell ONLY through env: so the expression is
+      # expanded in memory, never spliced into the script text, and are read
+      # quoted so a value with spaces or shell metacharacters stays one
+      # argument. GitHub secure-use guide: "Use an intermediate environment
+      # variable". No eval: the command is assembled as a bash array.
       - name: Run Sanity Tests on ${{ env.TEST_ENV }}
         shell: bash
+        env:
+          GREP_INPUT: ${{ github.event.inputs.grep }}
+          TEST_FILE: ${{ github.event.inputs.test_file }}
+          TEST_TYPE: ${{ github.event.inputs.test_type }}
         run: |
-          GREP_OPTION=""
-          if [ -n "${{ github.event.inputs.grep }}" ]; then
-            GREP_OPTION="--grep='${{ github.event.inputs.grep }}'"
+          grep_args=()
+          if [ -n "$GREP_INPUT" ]; then
+            grep_args=(--grep "$GREP_INPUT")
           fi
 
           # Determine which test command to run
-          if [ -n "${{ github.event.inputs.test_file }}" ]; then
-            echo "Running specific test file: ${{ github.event.inputs.test_file }}"
-            eval "bun run test ${{ github.event.inputs.test_file }} $GREP_OPTION"
-          elif [ "${{ github.event.inputs.test_type }}" == "e2e" ]; then
+          if [ -n "$TEST_FILE" ]; then
+            echo "Running specific test file: $TEST_FILE"
+            bun run test "$TEST_FILE" "${grep_args[@]}"
+          elif [ "$TEST_TYPE" == "e2e" ]; then
             echo "Running E2E tests"
-            eval "bun run test:e2e $GREP_OPTION"
-          elif [ "${{ github.event.inputs.test_type }}" == "integration" ]; then
+            bun run test:e2e "${grep_args[@]}"
+          elif [ "$TEST_TYPE" == "integration" ]; then
             echo "Running Integration tests"
-            eval "bun run test:integration $GREP_OPTION"
+            bun run test:integration "${grep_args[@]}"
           else
             echo "Running all tests"
-            eval "bun run test $GREP_OPTION"
+            bun run test "${grep_args[@]}"
           fi
+
+      # The TMS write-back runs HERE, after the Playwright process has exited:
+      # reports/atc_results.json is written by KataReporter.onEnd(), which fires
+      # after the global-teardown project, so nothing inside the run can read it
+      # (issue #27). `always()` so a failing suite still reports its results.
+      # jira-native writes a per-Test status and needs no execution key. Xray
+      # imports ONLY into an explicit key, so a sanity run of one file never
+      # flips Test Runs inside the regression execution or mints an orphan.
+      - name: Sync Results to TMS
+        if: always() && env.AUTO_SYNC == 'true' && (env.TMS_PROVIDER != 'xray' || env.STP_EXECUTION_KEY != '')
+        run: bun run test:sync
 
       - name: Upload Allure Results
         if: always()
@@ -167,6 +229,11 @@ jobs:
     if: ${{ always() && github.event.inputs.generate_allure != 'false' }}
 
     steps:
+      # Full repo checkout: the report is generated with the repo's own
+      # allurerc.mjs + allure devDependency (identical to local runs).
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
       - name: Get Allure History
         uses: actions/checkout@v4
         with:
@@ -194,32 +261,51 @@ jobs:
             echo "has_results=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Build Allure Report
+      - name: Setup Bun
         if: steps.check_allure.outputs.has_results == 'true'
-        uses: simple-elf/allure-report-action@master
+        uses: oven-sh/setup-bun@v2
         with:
-          gh_pages: gh-pages
-          subfolder: ${{ env.TEST_ENV }}/${{ github.event.inputs.custom_allure_url }}
-          allure_results: sanity-artifacts/allure-results
-          allure_report: allure-report
-          allure_history: allure-history
-          keep_reports: 3
+          bun-version: latest
 
-      - name: Deploy to GitHub Pages
+      - name: Install Dependencies
         if: steps.check_allure.outputs.has_results == 'true'
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_branch: gh-pages
-          publish_dir: allure-history/${{ env.TEST_ENV }}/${{ github.event.inputs.custom_allure_url }}
-          destination_dir: ${{ env.TEST_ENV }}/${{ github.event.inputs.custom_allure_url }}
-          keep_files: true
+        run: bun install
 
-      - name: Post Report URL
+      # Allure 3 generate + publish: same allurerc.mjs as local (Awesome report
+      # served directly, trends via historyPath), real retention, latest redirect.
+      # PRIVATE portal mode is opt-in: when the PORTAL_URL secret is set, the
+      # report goes to the auth-walled Test Report Portal (R2) INSTEAD of
+      # public GitHub Pages. Runbook: .agents/skills/regression-testing/
+      # references/private-hosting-setup.md
+      - name: Build & Publish Allure Report (Allure 3)
         if: steps.check_allure.outputs.has_results == 'true'
+        env:
+          PORTAL_URL: ${{ secrets.PORTAL_URL }}
+          PORTAL_PROJECT: ${{ secrets.PORTAL_PROJECT }}
+          PORTAL_API_KEY: ${{ secrets.PORTAL_API_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          # Free-text input: read through env and quoted, never interpolated into the script.
+          ALLURE_SUITE: ${{ github.event.inputs.custom_allure_url || 'sanity' }}
+          CUSTOM_ALLURE_URL: ${{ github.event.inputs.custom_allure_url }}
         run: |
-          echo "## Allure Report" >> $GITHUB_STEP_SUMMARY
-          echo "View the report: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/${{ env.TEST_ENV }}/${{ github.event.inputs.custom_allure_url }}/" >> $GITHUB_STEP_SUMMARY
+          if [ -n "$PORTAL_URL" ]; then
+            bun scripts/ci/publish-allure-portal.ts \
+              --env "${{ env.TEST_ENV }}" \
+              --suite "$ALLURE_SUITE" \
+              --run "${{ github.run_number }}" \
+              --results sanity-artifacts/allure-results
+          else
+            bun scripts/ci/publish-allure-pages.ts \
+              --env "${{ env.TEST_ENV }}" \
+              --suite "$ALLURE_SUITE" \
+              --run "${{ github.run_number }}" \
+              --results sanity-artifacts/allure-results --pages gh-pages --keep 10
+            echo "## Allure Report" >> $GITHUB_STEP_SUMMARY
+            echo "View the report: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/${{ env.TEST_ENV }}/${CUSTOM_ALLURE_URL}/" >> $GITHUB_STEP_SUMMARY
+          fi
 
   # ============================================
   # TODO: Implement Slack notification job

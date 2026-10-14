@@ -1,18 +1,19 @@
-# Pre-push gate: ONLY the checks pre-commit does NOT already run per-commit.
+# Framework gates, in one call: the full-repo checks pre-commit skips for speed
+# (format, lint, env-var parity, and the unconditional freshness/parity safety
+# nets). They live in `.husky/framework-gates.sh`, which the boilerplate updater
+# SYNCS, while this hook is project-owned and never overwritten — so a gate added
+# upstream lands here without rewriting your file. Read that file for what each
+# gate covers and why.
 #
-# pre-commit covers (every commit): types:check, vars:check, skills:check
-#   + conditional kata:manifest:check (when staged files affect the kata manifest)
-#   + conditional skills:registry:check (when staged files affect the registry).
-# pre-push adds the full-repo checks pre-commit skips for speed:
-#   - format:check / lint:check  full repo (lint-staged only touches staged files at commit)
-#   - vars:env:check             not run at commit time
-#   - skills:registry:check      unconditional safety net — a commit in the push range may
-#                                have changed the registry without pre-commit catching it.
-#   - kata:manifest:check        unconditional safety net — same rationale as the registry.
+# The `-f` guard is required: `.husky/_/h` runs this under `sh -e`, and sourcing
+# a file that is not there would kill the hook.
 #
-# Commands are INLINED (not an aggregate npm script) on purpose: this hook syncs to
-# downstream projects via the boilerplate updater's `husky` directory component, and must
-# never depend on a package.json script key that could land in a separate, partially-applied
-# sync phase. Every command below already exists in every scaffolded project.
-# The full suite (incl. types/vars/skills) lives in `repo:check` for CI / manual runs.
-bun run format:check && bun run lint:check && bun run vars:env:check && bun run skills:registry:check && bun run kata:manifest:check
+# Your own pre-push gates go around this call; the ordering in this file is yours.
+GATES="$(dirname -- "$0")/framework-gates.sh"
+if [ -f "$GATES" ]; then
+  . "$GATES"
+  framework_gates_pre_push
+else
+  echo "⚠️  .husky/framework-gates.sh missing — framework pre-push gates SKIPPED."
+  echo "   Restore it with: bun sync"
+fi

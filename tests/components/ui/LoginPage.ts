@@ -77,7 +77,7 @@ export class LoginPage extends UiBase {
    *
    * @param credentials - Email (magic-link flow)
    */
-  @atc('PROJ-101')
+  @atc('PROJ-111')
   async loginSuccessfully(credentials: LoginCredentials): Promise<void> {
     await this.fillAndSubmitLoginForm(credentials);
 
@@ -94,7 +94,7 @@ export class LoginPage extends UiBase {
    *
    * @param credentials - Invalid email
    */
-  @atc('PROJ-102')
+  @atc('PROJ-112')
   async loginWithInvalidCredentials(credentials: LoginCredentials): Promise<void> {
     await this.fillAndSubmitLoginForm(credentials);
 

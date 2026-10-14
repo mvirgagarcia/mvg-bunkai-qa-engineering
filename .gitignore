@@ -150,3 +150,51 @@ dbhub.local.toml
 
 # ----- 2026-08-03 (sync) -----
 .template/upstream-sha/
+
+# ===== Cross-harness generated artifacts =====
+# Generated alias onto .agents/skills. Never edit or commit it.
+.claude/skills
+# Local recovery copy written by the cross-harness migration.
+.template/pre-agents-migration/
+
+# ----- 2026-09-29 (sync) -----
+.context/reports/*
+!.context/reports/README.md
+.env*
+!.env.example
+!.env.schema
+!.env.core.schema
+env.d.ts
+.backups*/
+.template/doctrine-ledger.json
+ is GITIGNORED (per-dev record of what the last
+.template/last-apply.json
+.context/PBI/*
+!.context/PBI/README.md
+!.context/PBI/templates/
+!.context/PBI/epics/
+.context/PBI/epics/*
+!.context/PBI/epics/*/
+.context/PBI/epics/*/*
+!.context/PBI/epics/*/test-specs/
+.agents/skills/*-workspace/
+.agents/skills/playwright-cli/
+.agents/skills/playwright-best-practices/
+.agents/skills/resend-cli/
+.agents/skills/skill-creator/
+!skills-lock.json
+!**/skills-lock.json
+
+# ----- 2026-10-13 (sync) -----
+.playwright/profiles/
+.playwright-cli/
+storage-state-*.json
+!.env.provider.schema
+.context/*
+!.context/README.md
+!.context/project-config.md
+!.context/ADR/
+!.context/regression-history/
+!.context/reports/
+!.context/PBI/
+.agents/skills/diagram-design/

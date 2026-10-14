@@ -15,7 +15,9 @@
  */
 
 import { existsSync, watch } from 'node:fs';
-import { basename, join, relative } from 'node:path';
+import { basename, join } from 'node:path';
+
+import { relativePosix } from './lib/posix-path';
 
 // ============================================================================
 // Types
@@ -34,7 +36,7 @@ interface ComponentInfo {
   atcs: ATCInfo[]
 }
 
-interface PreconditionInfo {
+interface StepsInfo {
   name: string
   file: string
   relativePath: string
@@ -48,13 +50,13 @@ interface KataManifest {
     api: ComponentInfo[]
     ui: ComponentInfo[]
   }
-  preconditions: PreconditionInfo[]
+  steps: StepsInfo[]
   summary: {
     totalComponents: number
     totalATCs: number
     apiComponents: number
     uiComponents: number
-    preconditionModules: number
+    stepsModules: number
   }
 }
 
@@ -69,7 +71,7 @@ const OUTPUT_FILE = join(PROJECT_ROOT, 'kata-manifest.json');
 const COMPONENT_PATHS = {
   api: join(COMPONENTS_DIR, 'api'),
   ui: join(COMPONENTS_DIR, 'ui'),
-  preconditions: join(COMPONENTS_DIR, 'preconditions'),
+  steps: join(COMPONENTS_DIR, 'steps'),
 };
 
 // Files to exclude (base classes, fixtures, etc.)
@@ -166,9 +168,9 @@ async function extractClassName(filePath: string): Promise<string> {
 }
 
 /**
- * Extract public methods from a precondition file (non-ATC reusable flows)
+ * Extract public methods from a Steps module file (non-ATC reusable flows)
  */
-async function extractPreconditionMethods(filePath: string): Promise<string[]> {
+async function extractStepsMethods(filePath: string): Promise<string[]> {
   const content = await Bun.file(filePath).text();
   const methods: string[] = [];
 
@@ -219,6 +221,19 @@ async function scanDirectory(dirPath: string): Promise<string[]> {
 // Main Generation Function
 // ============================================================================
 
+/**
+ * Locale-independent string ordering.
+ *
+ * JS string relational operators compare UTF-16 code units, which is the same
+ * answer on every machine. That is the whole point here: the manifest is
+ * byte-compared by `--check`.
+ */
+function byCodeUnit(a: string, b: string): number {
+  if (a < b) { return -1; }
+  if (a > b) { return 1; }
+  return 0;
+}
+
 async function generateManifest(): Promise<KataManifest> {
   const manifest: KataManifest = {
     version: '1.0',
@@ -227,13 +242,13 @@ async function generateManifest(): Promise<KataManifest> {
       api: [],
       ui: [],
     },
-    preconditions: [],
+    steps: [],
     summary: {
       totalComponents: 0,
       totalATCs: 0,
       apiComponents: 0,
       uiComponents: 0,
-      preconditionModules: 0,
+      stepsModules: 0,
     },
   };
 
@@ -244,7 +259,7 @@ async function generateManifest(): Promise<KataManifest> {
     const component: ComponentInfo = {
       name: await extractClassName(file),
       file: basename(file),
-      relativePath: relative(PROJECT_ROOT, file),
+      relativePath: relativePosix(PROJECT_ROOT, file),
       atcs,
     };
     manifest.components.api.push(component);
@@ -258,23 +273,23 @@ async function generateManifest(): Promise<KataManifest> {
     const component: ComponentInfo = {
       name: await extractClassName(file),
       file: basename(file),
-      relativePath: relative(PROJECT_ROOT, file),
+      relativePath: relativePosix(PROJECT_ROOT, file),
       atcs,
     };
     manifest.components.ui.push(component);
     manifest.summary.totalATCs += atcs.length;
   }
 
-  // Scan Preconditions
-  const preconditionFiles = await scanDirectory(COMPONENT_PATHS.preconditions);
-  for (const file of preconditionFiles) {
-    const precondition: PreconditionInfo = {
+  // Scan Steps modules
+  const stepsFiles = await scanDirectory(COMPONENT_PATHS.steps);
+  for (const file of stepsFiles) {
+    const steps: StepsInfo = {
       name: await extractClassName(file),
       file: basename(file),
-      relativePath: relative(PROJECT_ROOT, file),
-      methods: await extractPreconditionMethods(file),
+      relativePath: relativePosix(PROJECT_ROOT, file),
+      methods: await extractStepsMethods(file),
     };
-    manifest.preconditions.push(precondition);
+    manifest.steps.push(steps);
   }
 
   // Update summary
@@ -282,22 +297,68 @@ async function generateManifest(): Promise<KataManifest> {
   manifest.summary.uiComponents = manifest.components.ui.length;
   manifest.summary.totalComponents
     = manifest.summary.apiComponents + manifest.summary.uiComponents;
-  manifest.summary.preconditionModules = manifest.preconditions.length;
+  manifest.summary.stepsModules = manifest.steps.length;
 
   // Deterministic ordering — Bun.Glob.scan order is filesystem-dependent.
   // Sorting here keeps `kata-manifest.json` byte-stable across machines so
-  // `--check` stays meaningful and PR diffs stay reviewable.
-  manifest.components.api.sort((a, b) => a.name.localeCompare(b.name));
-  manifest.components.ui.sort((a, b) => a.name.localeCompare(b.name));
-  manifest.preconditions.sort((a, b) => a.name.localeCompare(b.name));
+  // `--check` stays meaningful and PR diffs stay reviewable. `localeCompare()`
+  // would not deliver that: with no locale argument it collates per the host's
+  // ICU locale, which is exactly the machine-dependence this block exists to
+  // remove. `byCodeUnit` is the same comparison on every machine.
+  manifest.components.api.sort((a, b) => byCodeUnit(a.name, b.name));
+  manifest.components.ui.sort((a, b) => byCodeUnit(a.name, b.name));
+  manifest.steps.sort((a, b) => byCodeUnit(a.name, b.name));
   for (const component of [...manifest.components.api, ...manifest.components.ui]) {
-    component.atcs.sort((a, b) => a.id.localeCompare(b.id));
+    component.atcs.sort((a, b) => byCodeUnit(a.id, b.id));
   }
-  for (const precondition of manifest.preconditions) {
-    precondition.methods.sort();
+  for (const steps of manifest.steps) {
+    steps.methods.sort();
   }
 
   return manifest;
+}
+
+/**
+ * Every `@atc` id that decorates more than one method, with where they live.
+ *
+ * An ATC id is the key the TMS and the teardown report both group by
+ * (`tests/teardown/global.teardown.ts` buckets results by `testId`), so a
+ * duplicate silently collapses N ATCs into one coverage row: a failure in one
+ * component becomes indistinguishable from a failure in another. The
+ * boilerplate shipped four methods on `PROJ-101` and four more on `PROJ-102`
+ * for exactly as long as nothing looked.
+ *
+ * Reported, never auto-renamed. Which id a method should carry is a TMS fact
+ * this script cannot know.
+ */
+export function findDuplicateAtcIds(manifest: KataManifest): Map<string, string[]> {
+  const seen = new Map<string, string[]>();
+  for (const component of [...manifest.components.api, ...manifest.components.ui]) {
+    for (const atc of component.atcs) {
+      const where = `${component.name}.${atc.method}`;
+      seen.set(atc.id, [...(seen.get(atc.id) ?? []), where]);
+    }
+  }
+  return new Map([...seen].filter(([, uses]) => uses.length > 1));
+}
+
+/**
+ * Print duplicate ids and say whether that should fail the caller.
+ *
+ * FAILS in `--check` (the pre-commit + CI gate) and WARNS on a plain
+ * generate, so a developer mid-refactor is told without being blocked while
+ * the second method is still being written.
+ */
+function reportDuplicateAtcIds(manifest: KataManifest, fatal: boolean): boolean {
+  const dupes = findDuplicateAtcIds(manifest);
+  if (dupes.size === 0) { return false; }
+  const write = fatal ? console.error : console.warn;
+  write(`${fatal ? '❌' : '⚠️ '} ${dupes.size} @atc id(s) used by more than one method:`);
+  for (const [id, uses] of dupes) { write(`     ${id} -> ${uses.join(', ')}`); }
+  write('   An id is the key the TMS and the teardown coverage report group by,');
+  write('   so duplicates collapse several ATCs into one row and hide which failed.');
+  write('   Give each method its own id (they are TMS test-case ids, not labels).');
+  return fatal;
 }
 
 // ============================================================================
@@ -336,6 +397,9 @@ async function checkManifest(): Promise<number> {
   const existingNorm = JSON.stringify(stripVolatile(existing), null, 2);
 
   if (freshNorm === existingNorm) {
+    // Freshness and uniqueness are different questions. A manifest can be
+    // perfectly in sync with a tree that carries four methods on one id.
+    if (reportDuplicateAtcIds(fresh, true)) { return 1; }
     console.log('✅ kata-manifest.json is up to date.');
     return 0;
   }
@@ -376,7 +440,10 @@ async function main() {
       console.log(`✅ Generated ${OUTPUT_FILE}`);
       console.log(`   📦 Components: ${manifest.summary.totalComponents} (${manifest.summary.apiComponents} API, ${manifest.summary.uiComponents} UI)`);
       console.log(`   🎯 ATCs: ${manifest.summary.totalATCs}`);
-      console.log(`   🔗 Preconditions: ${manifest.summary.preconditionModules}`);
+      console.log(`   🔗 Steps modules: ${manifest.summary.stepsModules}`);
+      // Warn only here: `--check` is the gate. Mid-refactor, the second
+      // method carrying a borrowed id may simply not be finished yet.
+      reportDuplicateAtcIds(manifest, false);
     }
   };
 
@@ -387,7 +454,7 @@ async function main() {
   if (watchMode && !stdoutMode) {
     console.log('\n👀 Watching for changes...\n');
 
-    const dirsToWatch = [COMPONENT_PATHS.api, COMPONENT_PATHS.ui, COMPONENT_PATHS.preconditions];
+    const dirsToWatch = [COMPONENT_PATHS.api, COMPONENT_PATHS.ui, COMPONENT_PATHS.steps];
 
     for (const dir of dirsToWatch) {
       if (existsSync(dir)) {

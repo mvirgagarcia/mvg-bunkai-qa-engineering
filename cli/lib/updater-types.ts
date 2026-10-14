@@ -154,6 +154,22 @@ export interface Component {
    * Ignored when `bootstrapOnly` is false/undefined.
    */
   frameworkFiles?: string[]
+  /**
+   * Repo-relative path allowlist that RE-EXEMPTS files back to bootstrap-only
+   * (project-owned) behavior even though their basename matches `frameworkFiles`.
+   *
+   * Use case: the `README.md` under each `.context` sub-directory is framework
+   * scaffolding and flows through (`frameworkFiles: ['README.md']`), but
+   * `.context/ADR/README.md` carries a
+   * project-maintained ADR index table — it is hybrid (framework guidance +
+   * project state). Listing it here keeps it from being overwritten on update,
+   * since the basename-only `frameworkFiles` rule is too coarse to tell the two
+   * apart. Without this, an update silently clobbers the project's ADR index.
+   *
+   * Matching is on the full repo-relative path (e.g. `.context/ADR/README.md`),
+   * not the basename. Ignored when `bootstrapOnly` is false/undefined.
+   */
+  frameworkFilesExcept?: string[]
 }
 
 export type ChangeStatus = 'M' | 'A' | 'D';
@@ -192,6 +208,22 @@ export interface FailedFile {
   reason: string
 }
 
+/** A synced file the project had edited (3-way: local differed from the upstream copy at the lock cursor) that this run overwrote. */
+export interface LocalEditOverwritten {
+  path: string
+  component: string
+}
+
+/** A `package.json` key kept at the project's value although upstream differs (Phase 4.5b, `skip` or `mine`). */
+export interface PackageJsonKeptKey {
+  file: string
+  section: string
+  key: string
+  localValue: string
+  upstreamValue: string
+  resolution: 'skip' | 'mine'
+}
+
 export interface RunSummary {
   applied: AppliedFile[]
   skipped: DeltaEntry[]
@@ -199,6 +231,23 @@ export interface RunSummary {
   newHeadSha: string
   componentsAdvanced: string[]
   componentsHeldBack: string[]
+  /**
+   * True when a preflight refusal ended the run before any sync (dirty tree,
+   * corrupt lock, clone failure, a declined migration or self-update). The
+   * wrapper must not report success on it. A run that found nothing to sync
+   * is NOT aborted.
+   */
+  aborted?: boolean
+  /** Absolute path of this run's pre-write backup directory (`.backups/update-<ts>/`), when one was created. */
+  backupDir?: string | null
+  /** Files overwritten this run whose local copy carried a project edit; each has a copy under `backupDir`. */
+  localEditsOverwritten?: LocalEditOverwritten[]
+  /** `package.json` keys kept at the project's value this run (upstream differs). */
+  packageJsonKept?: PackageJsonKeptKey[]
+  /** Paths recorded in `.template/last-apply.json`: the updater's own uncommitted output, exempt from the next dirty-tree guard. */
+  lastApplyPaths?: number
+  /** Set by the wrapper's parity hook when it saved the prompt file (`UpdaterConfig.promptFile`). */
+  promptSaved?: boolean
 }
 
 export interface MergeResult {
@@ -214,6 +263,8 @@ export interface DeprecatedFile {
   component: string
   reason: string
   deprecatedSince: string
+  /** Copy the file to the run's `.backups/` directory before removing it: set when a project may have edited it. */
+  backup?: boolean
 }
 
 export interface GitVersion {
@@ -275,7 +326,7 @@ export interface IgnoreDelta {
  * package you may not use appears in your manifest" — whereas the cost of
  * excluding it is that the `cli` component, which is synced wholesale and
  * imports several packages declared only here, ships code without the package
- * and leaves `bun run up` crashing on import in every downstream repo.
+ * and leaves `bun sync` crashing on import in every downstream repo.
  *
  * `lint-staged` is included for the same reason: `.husky/pre-commit` is synced
  * and shells out to `bunx lint-staged`, whose config lives in package.json and
@@ -315,7 +366,7 @@ export interface PackageJsonDelta {
 export interface PackageJsonKeyOption {
   /** The exact key name (value submitted by multiselect). */
   value: string
-  /** Display label, e.g. `"test:smoke" → "playwright test --project=smoke"`. */
+  /** Display label, e.g. `"test:smoke" → "playwright test --project=smoke-ui --project=smoke-api"`. */
   label: string
   /** Whether the key is checked by default in the multiselect. */
   checked: boolean
@@ -455,10 +506,29 @@ export interface UpdaterConfig {
    * be synced (each repo regenerates its own). Matched by exact repo-relative
    * path. Excluded from every detection path — bootstrap, content reconcile, and
    * git-log delta — so they are never copied, overwritten, or deleted.
-   * Example: `.claude/skills/REGISTRY.md` (built by `bun run skills:registry`
+   * Example: `.agents/skills/REGISTRY.md` (built by `bun run skills:registry`
    * from the repo's own installed skill set, including local community skills).
    */
   excludePaths?: string[]
+  /**
+   * Paths that live in the template repo but must never reach a consumer project
+   * — the boilerplate's OWN material rather than framework the consumer
+   * inherits. Matched as a repo-relative path or as a directory prefix at a
+   * segment boundary, so `docs/qa-standard` covers everything under it without
+   * swallowing a sibling `docs/qa-standards`.
+   *
+   * Distinct from the two neighbours above, which both describe a file the
+   * consumer DOES have:
+   *   - `bootstrapOnlyPaths` ships once at scaffold, then the consumer owns it.
+   *   - `excludePaths` exists in both repos; the sync just never overwrites it.
+   *   - `repoOnlyPaths` never travels at all.
+   *
+   * The scaffold side is enforced separately by `TEMPLATE_EXCLUDES` in
+   * `packages/create-agentic-qa/src/prepare.ts`; a sync-reachable entry
+   * usually belongs in both, or `bun sync` re-delivers what the scaffold
+   * pruned.
+   */
+  repoOnlyPaths?: string[]
   /**
    * Extra repo-relative paths added to the sparse-checkout of the template
    * clone. Not synced — they exist so afterApply hooks can READ the upstream
@@ -475,24 +545,22 @@ export interface UpdaterConfig {
    * child sets `UPEX_UPDATER_REEXEC=1` to prevent infinite re-exec loops.
    */
   selfUpdateComponent?: string
+  /**
+   * Repo-relative path of the parity prompt the wrapper saves. Named by the
+   * dirty-tree guard when it refuses a tree that still holds the previous
+   * run's uncommitted output plus user edits, next to the suggested commit.
+   */
+  promptFile?: string
   hooks?: {
     afterApply?: (summary: RunSummary) => Promise<void>
     skillsResolver?: (templateDir: string) => string[]
+    /**
+     * Runs right before the process hands itself to another updater (the
+     * self-update re-exec, or the upstream updater a `--dry-run` previews
+     * with). The parent's event loop is blocked while the child runs, so a
+     * live page must be handed over here: the hook stops what it serves and
+     * returns the env the child needs to pick it up (installer-ui plan §6).
+     */
+    beforeReexec?: (info: { kind: 'self-update' | 'preview', from: string, to: string }) => Promise<Record<string, string>>
   }
-}
-
-// ============================================================================
-// PARSED CLI ARGS — kept exported so the wrapper's parseArgs can return it.
-// Repo-specific commands stay union-typed via plain string[] to avoid pinning
-// updater-core to a particular repo's command vocabulary.
-// ============================================================================
-
-export interface ParsedArgs {
-  commands: string[]
-  help: boolean
-  dryRun: boolean
-  rollback: boolean
-  auto: boolean
-  /** Repo-specific subcommand value (e.g. DEV's MCP agent). Typed loosely on purpose. */
-  updateMcpTemplate: string | null
 }

@@ -26,7 +26,7 @@
  * MANUAL-INVOCATION POLICY
  * ============================================================================
  *
- * This script is NOT auto-invoked by `bun run setup`, `bun run jira:check`,
+ * This script is NOT auto-invoked by `bun setup`, `bun run jira:check`,
  * or any CI hook (locked decision §0 of the product-management refactor plan).
  * Run it by hand whenever the workspace's issue-link-type catalog changes —
  * which is rare. `bun run jira:check` degrades to DEFERRED when the output
@@ -46,8 +46,10 @@
  * ENVIRONMENT
  * ============================================================================
  *
+ * Instance host — NOT an env var. Resolved from `.agents/project.yaml` ->
+ * `issue_tracker.atlassian_url` (see `cli/lib/atlassian-instance.ts`).
+ *
  * Required environment variables (same as the sibling sync scripts):
- *   ATLASSIAN_URL=https://your-instance.atlassian.net
  *   ATLASSIAN_EMAIL=your-email@example.com
  *   ATLASSIAN_API_TOKEN=ATATT3x...
  *
@@ -95,6 +97,12 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 
+import {
+  formatInstanceMismatchWarning,
+  instanceSourceLabel,
+  resolveAtlassianInstance,
+} from '../cli/lib/atlassian-instance';
+
 // ============================================================================
 // CONSTANTS
 // ============================================================================
@@ -111,7 +119,7 @@ const MANIFEST_PATH = join(REPO_ROOT, '.agents', 'jira-required.yaml');
  * flag is mainly a convenience for users who want the UPEX standard without
  * running the script against their own workspace.
  *
- * Hardcoded per-repo (QA vs DEV) so `bun up` re-syncs the URL with the script.
+ * Hardcoded per-repo (QA vs DEV) so `bun sync` re-syncs the URL with the script.
  * Pinned to `main` so `--upex` always means "current UPEX standard".
  */
 const UPEX_UPSTREAM_URL = 'https://raw.githubusercontent.com/upex-galaxy/agentic-qa-boilerplate/main/.agents/jira-link-types.json';
@@ -270,8 +278,11 @@ FLAGS:
                    Source: ${UPEX_UPSTREAM_URL}
   --help, -h       Show this help.
 
+INSTANCE HOST (not an env var):
+  .agents/project.yaml -> issue_tracker.atlassian_url
+  Print it with: bun run --silent jira:url
+
 ENVIRONMENT:
-  ATLASSIAN_URL          e.g. https://your-instance.atlassian.net
   ATLASSIAN_EMAIL        e.g. you@example.com
   ATLASSIAN_API_TOKEN    Atlassian API token (https://id.atlassian.com/manage-profile/security/api-tokens)
 
@@ -291,7 +302,7 @@ OUTPUT:
                                their slugified workspace name.
 
 MANUAL INVOCATION ONLY:
-  This script is NOT wired into \`bun run setup\` or \`bun run jira:check\`
+  This script is NOT wired into \`bun setup\` or \`bun run jira:check\`
   (locked decision §0 of the product-management refactor plan). Run it by
   hand when the workspace's issue-link-type catalog changes — which is rare.
 
@@ -310,12 +321,28 @@ EXIT CODES:
 // ============================================================================
 
 function loadConfig(): Config {
-  const baseUrl = process.env.ATLASSIAN_URL;
+  // Instance host: `.agents/project.yaml` first, `ATLASSIAN_URL` only as fallback.
+  // This script overwrites the versioned `.agents/jira-link-types.json` catalog, so a
+  // stale host silently replaces it with another site's link-type names — every
+  // `{{jira.link_types.*}}` reference would then resolve against the wrong workspace.
+  // Rationale: cli/lib/atlassian-instance.ts.
+  let instance;
+  try {
+    instance = resolveAtlassianInstance();
+  }
+  catch (err) {
+    log.error((err as Error).message);
+    process.exit(1);
+  }
+
+  const warning = formatInstanceMismatchWarning(instance);
+  if (warning) { log.warn(warning); }
+
+  // Credentials stay env-only — never mirrored into the versioned yaml.
   const email = process.env.ATLASSIAN_EMAIL;
   const apiToken = process.env.ATLASSIAN_API_TOKEN;
 
   const missing: string[] = [];
-  if (!baseUrl) { missing.push('ATLASSIAN_URL'); }
   if (!email) { missing.push('ATLASSIAN_EMAIL'); }
   if (!apiToken) { missing.push('ATLASSIAN_API_TOKEN'); }
 
@@ -326,8 +353,10 @@ function loadConfig(): Config {
     process.exit(1);
   }
 
+  log.info(`Using instance=${instance.baseUrl} (source: ${instanceSourceLabel(instance.source)})`);
+
   return {
-    baseUrl: baseUrl!.replace(/\/$/, ''),
+    baseUrl: instance.baseUrl,
     email: email!,
     apiToken: apiToken!,
   };

@@ -1,0 +1,638 @@
+# KATA Architecture — Layers, Fixtures, ATCs, Steps
+
+Full reference for the Komponent Action Test Architecture (KATA). Load when designing new components, picking fixtures, wiring ATCs, or building Steps chains.
+
+> **Canonical formula — the one sentence every KATA surface must agree with:**
+>
+> **KATA organises automation in four layers with a single direction of dependency: TestContext,
+> Base, domain Components and Fixtures. Steps is an optional intermediate layer between Components
+> and Fixtures. Test files consume the Fixtures — they are not a layer.**
+>
+> Short form, for a chip or a title: **"four named layers, plus optional Steps"**. Never publish a
+> bare number. Banned on every surface: "three layers", "five layers", "6 layers", "Test files" as
+> a layer, and the acronym expanded with a C ("Component Action Test Architecture"). The expansion is
+> **Komponent Action Test Architecture**: the K lives only in the name; the layer is "domain
+> Components", spelled normally. DRY zones that are NOT layers: `tests/utils/`, `tests/data/`,
+> `config/`. Consumers: `tests/e2e/`, `tests/integration/`.
+
+---
+
+## 1. The Four Layers
+
+```
+Layer 4 — Fixtures (DI)
+    TestFixture, ApiFixture, UiFixture
+        |
+        v
+Layer 3.5 — Steps (optional)
+    AuthSteps, CheckoutSteps — reusable ATC chains for preconditions
+        |
+        v
+Layer 3 — Domain Components (ATCs)
+    UsersApi, LoginPage, CheckoutPage — @atc lives here
+        |
+        v
+Layer 2 — Base Components
+    ApiBase (HTTP helpers), UiBase (Playwright helpers)
+        |
+        v
+Layer 1 — TestContext
+    Playwright drivers (page, request), config, environment, DataFactory
+```
+
+| Layer | Responsibility | Typical files |
+|-------|---------------|---------------|
+| 1 — TestContext | Playwright drivers, config, env, DataFactory (faker-backed data) | `TestContext.ts` |
+| 2 — Base | HTTP and Playwright helpers | `ApiBase.ts`, `UiBase.ts` |
+| 3 — Domain | Business logic, ATCs | `UsersApi.ts`, `LoginPage.ts` |
+| 3.5 — Steps | Reusable ATC chains for preconditions | `AuthSteps.ts`, `CheckoutSteps.ts` |
+| 4 — Fixtures | DI entry point | `TestFixture.ts`, `ApiFixture.ts`, `UiFixture.ts` |
+| Tests | Orchestrate ATCs into scenarios | `tests/e2e/**`, `tests/integration/**` |
+
+Rule: a component in a higher layer may use a lower layer, never the other way round.
+
+---
+
+## 2. Directory Structure
+
+```
+/config
+    variables.ts                 # Single source for env vars + URLs
+
+/tests
+  KataReporter.ts               # Custom Playwright reporter
+  /components
+    TestContext.ts              # Layer 1
+    ApiFixture.ts               # Layer 4 (API only)
+    UiFixture.ts                # Layer 4 (UI only)
+    TestFixture.ts              # Layer 4 (unified: api + ui)
+
+    /api
+      ApiBase.ts                # Layer 2
+      UsersApi.ts               # Layer 3
+    /ui
+      UiBase.ts                 # Layer 2
+      LoginPage.ts              # Layer 3
+    /steps
+      ExampleSteps.ts           # Layer 3.5 (reference pattern)
+
+  /data
+    DataFactory.ts              # Typed faker-backed factories
+    types.ts                    # Payload / domain TypeScript types
+    constants.ts                # Static test values, boundaries (create-on-demand)
+    /fixtures                   # Static JSON/CSV rows
+    /mocks                      # Canned mock/stub responses (create-on-demand)
+  /integration/{module}         # API-only tests
+  /e2e/{module}                 # UI (+API) tests
+  /setup
+    global.setup.ts             # Global setup (+ api-auth / ui-auth setup projects)
+  /teardown
+    global.teardown.ts          # Global teardown
+  /utils
+    decorators.ts               # @atc, @step
+```
+
+`tests/data/` canonical TypeScript files (naming is fixed; create only when the scope needs them):
+
+| File | Holds | Example members |
+|------|-------|-----------------|
+| `DataFactory.ts` | Typed, faker-backed factories that build payloads at runtime | `generateUserPayload()`, `generateOrderPayload()` |
+| `types.ts` | Payload / domain TypeScript types shared by factories and ATCs | `UserPayload`, `OrderPayload` |
+| `constants.ts` | Static test values, magic numbers, boundary constants | `MAX_ORDER_ITEMS`, `DEFAULT_PAGE_SIZE` |
+
+These three complement the static data folders: `tests/data/fixtures/` (parameterization rows as JSON/CSV) and `tests/data/mocks/` (canned mock/stub responses). Factories generate fresh runtime data; fixtures and mocks hold committed static data. Naming + folder conventions for those two live in `automation-standards.md` §6.
+
+Import aliases are mandatory (no relative imports):
+
+```typescript
+import { config, env } from '@variables';
+import { ApiBase } from '@api/ApiBase';
+import { LoginPage } from '@ui/LoginPage';
+import { atc, step } from '@utils/decorators';
+import { TestContext, type TestContextOptions } from '@TestContext';
+```
+
+---
+
+## 3. TestContext (Layer 1)
+
+Stores Playwright drivers and global utilities. Every higher layer extends it or receives its options.
+
+```typescript
+interface TestContextOptions {
+  page?: Page;                   // Optional — API tests don't need it
+  request?: APIRequestContext;   // Optional — some setups don't need it
+  environment?: Environment;
+}
+```
+
+Responsibilities: hold the Playwright drivers (`page`, `request`); select URLs/credentials from `config` based on `TEST_ENV`; expose the environment label (`env`); expose `DataFactory` (the faker-backed test data, through `data`). It has no logger and no `faker` field of its own: faker lives inside `tests/data/DataFactory.ts`.
+
+Do not put Playwright-specific logic here (belongs in UiBase). Do not put HTTP-specific logic here (belongs in ApiBase).
+
+---
+
+## 4. Base Components (Layer 2)
+
+### ApiBase
+
+Wraps `APIRequestContext` with type-safe HTTP helpers that return tuples:
+
+```typescript
+protected async apiGET<T>(path: string): Promise<[APIResponse, T]>
+protected async apiPOST<T, P>(path: string, payload: P): Promise<[APIResponse, T, P]>
+protected async apiPUT<T, P>(path: string, payload: P): Promise<[APIResponse, T, P]>
+protected async apiPATCH<T, P>(path: string, payload: P): Promise<[APIResponse, T, P]>
+protected async apiPOSTForm<T>(path: string, form: FormData, options?: RequestOptions): Promise<[APIResponse, T]>
+protected async apiDELETE<T>(path: string): Promise<[APIResponse, T]>
+```
+
+### UiBase
+
+Extends `TestContext`. Adds Playwright helpers: response interception, network waiting, storage-state snapshots, Allure attachments.
+
+Rule: anything that needs `PageContext` goes in UiBase; anything needing `APIRequestContext` goes in ApiBase; anything agnostic (allure attachments, string helpers) goes in `tests/utils/`.
+
+**Why E2E API calls carry the browser session.** `ApiBase`'s `request` getter returns `this._page.request` whenever a page exists and falls back to the standalone `APIRequestContext` only in API-only fixtures (`tests/components/api/ApiBase.ts`). `page.request` shares cookies and storage with the browser, so under `{ test }` or `{ ui }` an API call is authenticated by the UI session cookie. That is the mechanism, not the fixtures sharing an options object. Consequence: a negative auth test (clear the Bearer token, expect 401) belongs under `{ api }`, where no cookie exists; under `{ test }` the cookie still authenticates and the test gets 200.
+
+---
+
+## 5. Domain Components (Layer 3)
+
+One component per file. Max 15–20 ATCs per component — split if larger.
+
+Sizing heuristics. A component groups conceptually related ATCs, has a name that says what is in it, and does not depend on other components. Split it when any of these shows up: more than ~500 lines, unrelated responsibilities in one class, a specific ATC is hard to find, or the name no longer describes the content.
+
+| Type | Class | File |
+|------|-------|------|
+| API | `{Resource}Api` | `{Resource}Api.ts` |
+| UI | `{Page}Page` | `{Page}Page.ts` |
+
+Order inside the class: constructor → navigation (UI only) → helpers (no decorator or `@step`) → ATCs (`@atc`).
+
+### API component template
+
+```typescript
+import { expect, type APIResponse } from '@playwright/test';
+import { ApiBase } from '@api/ApiBase';
+import { atc, step } from '@utils/decorators';
+import type { TestContextOptions } from '@TestContext';
+
+export interface UserPayload { name: string; email: string; }
+export interface UserResponse { id: string; name: string; email: string; }
+
+export class UsersApi extends ApiBase {
+  constructor(options: TestContextOptions) { super(options); }
+
+  @step
+  async getUserById(id: string): Promise<[APIResponse, UserResponse]> {
+    return this.apiGET<UserResponse>(`/users/${id}`);
+  }
+
+  @atc('TICKET-ID')
+  async createUserSuccessfully(payload: UserPayload): Promise<[APIResponse, UserResponse, UserPayload]> {
+    const [response, body, sent] = await this.apiPOST<UserResponse, UserPayload>('/users', payload);
+    expect(response.status()).toBe(201);
+    expect(body.id).toBeDefined();
+    return [response, body, sent];
+  }
+}
+```
+
+### UI component template
+
+```typescript
+import { expect } from '@playwright/test';
+import { UiBase } from '@ui/UiBase';
+import { atc } from '@utils/decorators';
+import type { TestContextOptions } from '@TestContext';
+
+export interface LoginData { email: string; password: string; }
+
+export class LoginPage extends UiBase {
+  private readonly submitButton = () => this.page.locator('button[type="submit"]');
+
+  constructor(options: TestContextOptions) { super(options); }
+
+  @atc('TICKET-ID')
+  async loginWithValidCredentials(data: LoginData): Promise<void> {
+    await this.page.goto('/login');
+    await this.page.locator('#email').fill(data.email);
+    await this.page.locator('#password').fill(data.password);
+    await this.submitButton().click();
+    await expect(this.page).toHaveURL(/.*dashboard.*/);
+  }
+}
+```
+
+---
+
+## 6. ATC Rules
+
+An ATC (Acceptance Test Case) is a **complete test case (mini-flow), not a single interaction**. Each ATC maps 1:1 to a ticket via `@atc('TICKET-ID')`.
+
+### Rule 1 — Complete flow
+
+```typescript
+// WRONG — single interaction
+@atc('TICKET-ID') async clickLoginButton() { await this.page.click('#login'); }
+
+// RIGHT — complete mini-flow
+@atc('TICKET-ID')
+async loginWithValidCredentials(data: LoginData) {
+  await this.page.goto('/login');
+  await this.page.locator('#email').fill(data.email);
+  await this.page.locator('#password').fill(data.password);
+  await this.page.locator('button[type="submit"]').click();
+  await expect(this.page).toHaveURL(/.*dashboard.*/);
+}
+```
+
+### Rule 2 — TC Identity = Precondition + Action
+
+A TC is defined by exactly two elements: the precondition (state) and the action (trigger). Every expected result from the same precondition + action is an assertion of the **same TC**, no matter which panel or endpoint it validates.
+
+```
+// WRONG — three TCs share the same precondition and action
+TC-A: Open published product -> verify Pricing block
+TC-B: Open published product -> verify Reviews block
+TC-C: Open published product -> verify page structure
+
+// RIGHT — one TC with all assertions
+TC: Open product detail page for published in-stock product
+  Precondition: product is published and stock > 0
+  Action: user navigates to the product detail page
+  Expected:
+    - Page structure visible
+    - Pricing values correct (Base - Discount = Final)
+    - Inventory metrics correct
+    - Reviews block shows rating + count
+    - Add to Cart enabled
+```
+
+A TC is only different when the **precondition** or **action** changes — not when you check a different field of the same response.
+
+### Rule 3 — Equivalence Partitioning
+
+Same expected output = one parameterized ATC.
+
+```typescript
+// WRONG — three ATCs, same output (HTTP 401)
+@atc('T1') async loginWithWrongEmail() {}
+@atc('T2') async loginWithWrongPassword() {}
+@atc('T3') async loginWithEmptyFields() {}
+
+// RIGHT — one parameterized ATC
+@atc('T1')
+async loginWithInvalidCredentials(payload: LoginPayload) {
+  // Test file parameterizes different invalid inputs; all produce 401
+}
+```
+
+Different status codes, different UI states, or different business outcomes = separate ATCs. Same outcome, different data = one parameterized ATC. Minor conditional variations within the same behavior are acceptable; fundamentally different behavior is a separate ATC.
+
+> Rule 3 is a *within-partition* dedup rule — it does NOT authorize collapsing distinct partitions, boundaries, or states into one ATC, and it does NOT replace Boundary Value Analysis. One AC still maps to multiple ATCs (1:N): one per partition + boundary cases + state transitions. Derivation canon + triggers: `agentic-qa-core/references/test-design-doctrine.md`.
+
+### Rule 4 — Locators inline
+
+Locators go inside the ATC, not in separate files.
+
+```typescript
+// WRONG
+export const LOCATORS = { email: '#email', password: '#password' };
+
+// RIGHT
+@atc('TICKET-ID')
+async loginWithValidCredentials(data: LoginData) {
+  await this.page.locator('#email').fill(data.email);
+  await this.page.locator('#password').fill(data.password);
+}
+```
+
+Exception — if the same locator is used in 2+ ATCs of the same component, extract to a `private readonly` arrow function on the class:
+
+```typescript
+class CheckoutPage extends UiBase {
+  private readonly cartTotal = () => this.page.locator('[data-testid="cart-total"]');
+  private readonly productRow = (name: string) => this.page.locator(`[data-product="${name}"]`);
+}
+```
+
+Never extract a locator used once. Never wrap a single `page.fill()` or `page.click()` in a helper.
+
+### Rule 5 — ATCs do not call ATCs
+
+ATCs are atomic. For reusable chains across multiple test files, use the Steps module (Section 8).
+
+```typescript
+// WRONG
+@atc('TICKET-ID')
+async checkoutWithNewUser() {
+  await this.signupSuccessfully(userData);   // calling an ATC!
+  await this.addToCartSuccessfully(product);
+}
+
+// RIGHT — test file orchestrates, or Steps module
+test('TICKET-ID: should checkout with new user', async ({ ui }) => {
+  await ui.signup.signupWithValidCredentials(userData);
+  await ui.cart.addToCartSuccessfully(product);
+});
+```
+
+### Rule 6 — Fixed assertions inside, flow assertions outside
+
+Fixed assertions (status code, required fields, URL redirect) go inside the ATC. Test-level assertions (business outcomes combining multiple ATCs) go in the test file.
+
+```typescript
+@atc('TICKET-ID')
+async signInSuccessfully(payload: SignInPayload) {
+  const [response, body] = await this.apiPOST<AuthResponse, SignInPayload>('/auth/signin', payload);
+  expect(response.status()).toBe(200);               // FIXED
+  expect(body.session.access_token).toBeDefined();   // FIXED
+  return [response, body];
+}
+
+// test file
+test('TICKET-ID: should persist session after login', async ({ test }) => {
+  const [, body] = await test.api.auth.signInSuccessfully(credentials);
+  expect(body.session.access_token).toMatch(/^eyJ/); // TEST-LEVEL
+});
+```
+
+### Rule 7 — Helpers vs ATCs
+
+| Type | What it does | `@atc` |
+|------|-------------|--------|
+| Helper | A GET that only prepares data or reads context another step needs | No — optional `@step` for tracing |
+| ATC | An action that changes state, OR a GET whose response IS the business outcome under test | Yes — `@atc('TICKET-ID')` |
+
+The question is whether the GET is the subject of the test case. When the TC's expected result is what a read endpoint returns (the right business data and shape, 401 without auth, 403 for the wrong role, 404 for an unknown id), that GET is an ATC: `api-patterns.md` §5 names one ATC per expected outcome, reads included. A GET that only fetches data for a later step is a helper. A GET that confirms an action's effect belongs *inside* that action's ATC as a verification step. A GET whose only assertion is status 200 verifies no business outcome, so it is a disguised helper, not an ATC (`planning-playbook.md`, "Disguised helpers").
+
+```typescript
+// WRONG — a data-preparation GET wearing @atc (no business outcome asserted)
+@atc('TICKET-ID') async getOrderForCheckout(id: string) { /* status 200 only */ }
+
+// RIGHT — the GET is the outcome under test (access control on a read endpoint)
+@atc('TICKET-ID')
+async getCurrentUserUnauthorized(): Promise<[APIResponse, ApiErrorResponse]> {
+  const [response, body] = await this.apiGET<ApiErrorResponse>('/auth/me');
+  expect(response.status()).toBe(401);
+  expect(body.error).toBeDefined();
+  return [response, body];
+}
+
+// RIGHT — a GET confirming an action stays inside that action's ATC
+@atc('TICKET-ID')
+async loginWithInvalidCredentials(credentials: LoginPayload) {
+  const [loginResp] = await this.apiPOST('/auth/login', credentials);
+  const [meResp] = await this.apiGET('/auth/me');
+  expect(loginResp.status()).toBe(401);
+  expect(meResp.status()).toBe(401);
+}
+```
+
+### ATC structure
+
+```
+1. Preconditions  -> received via parameters (not internal setup)
+2. Action         -> POST / PUT / click / submit
+3. Verification   -> optional GET or page check
+4. Assertions     -> fixed assertions on expected outcome
+5. Return         -> [response, body, payload] for API, void for UI
+```
+
+### ATC naming
+
+Format: `{verb}{Resource}{Scenario}`
+
+| Scenario | Suffix | Example |
+|----------|--------|---------|
+| Success | `Successfully` / `WithValidCredentials` | `createOrderSuccessfully` |
+| Invalid input | `WithInvalid{X}` | `loginWithInvalidCredentials` |
+| Not found | `WithNonExistent{X}` | `getUserWithNonExistentId` |
+| Expired | `WithExpired{X}` | `loginWithExpiredToken` |
+
+---
+
+## 7. Fixtures (Layer 4)
+
+Fixtures wire components together and expose them to tests. Three kinds (see `tests/components/TestFixture.ts` — the source of truth):
+
+| Fixture | Exposes | Opens browser? |
+|---------|---------|----------------|
+| `ApiFixture` | `api.users`, `api.orders`, ... | No |
+| `UiFixture` | `ui.login`, `ui.checkout`, ... | Yes |
+| `TestFixture` | `test.api` + `test.ui` in one object (shared context) | Yes |
+
+Steps classes are NOT a fixture — they live in `tests/components/steps/` and are instantiated directly (see §8).
+
+### TestFixture definition
+
+The real file (`tests/components/TestFixture.ts`) extends Playwright's `test` with the three fixtures. Simplified shape:
+
+```typescript
+import { test as base } from '@playwright/test';
+import { ApiFixture } from '@ApiFixture';
+import { UiFixture } from '@UiFixture';
+
+export const test = base.extend<{
+  test: TestFixture;   // TestFixture extends TestContext, holds .api + .ui
+  api: ApiFixture;
+  ui: UiFixture;
+}>({
+  test: async ({ page, request }, use) => {
+    await use(new TestFixture(page, request));
+  },
+  api: async ({ request }, use) => { await use(new ApiFixture({ request })); },
+  ui: async ({ page, request }, use) => { await use(new UiFixture({ page, request })); },
+});
+
+export { expect } from '@playwright/test';
+```
+
+### Lazy initialisation
+
+Playwright only instantiates the fixtures a test requests. API-only tests never open a browser.
+
+```typescript
+// No browser
+test('TICKET-ID: should get orders', async ({ api }) => {
+  await api.orders.getOrders({ limit: 10 });
+});
+
+// Browser opens
+test('TICKET-ID: should view order list', async ({ ui }) => {
+  await ui.orders.navigateTo();
+});
+
+// Browser opens, API and UI share the same context
+test('TICKET-ID: should create via API and verify via UI', async ({ test }) => {
+  const [, order] = await test.api.orders.createOrderSuccessfully(data);
+  await test.ui.orders.verifyOrderVisibleInList(order.id);
+});
+```
+
+### Fixture selection table
+
+| Test type | Fixture | Browser? | Use when |
+|-----------|---------|----------|----------|
+| API only (integration) | `{ api }` | No | Pure API testing. Default for `tests/integration/**`. |
+| UI only | `{ ui }` | Yes | UI-focused testing, no API setup. |
+| Hybrid | `{ test }` | Yes | API setup + UI action + API verification. |
+
+Reusable precondition chains (3+ ATCs repeated across 3+ files) are NOT a fixture — they go in a Steps class (§8), instantiated directly in the test.
+
+### Registration pattern
+
+```typescript
+// tests/components/UiFixture.ts
+export class UiFixture extends TestContext {
+  readonly login: LoginPage;
+  readonly checkout: CheckoutPage;
+
+  constructor(options: TestContextOptions) {
+    super(options);
+    this.login = new LoginPage(options);
+    this.checkout = new CheckoutPage(options);
+  }
+}
+```
+
+Creating a component without registering it in the fixture means tests cannot reach it. Registration is mandatory.
+
+---
+
+## 8. Steps Module (Layer 3.5)
+
+When three or more ATCs run in the same order across three or more tests, the chain becomes a Step.
+
+Steps are NOT ATCs: no `@atc` decorator, not reported individually to the TMS, purpose is eliminating repetition in **preconditions**.
+
+The real pattern lives in `tests/components/steps/ExampleSteps.ts`: a Steps class extends `TestContext`, takes `TestContextOptions` in its constructor, and drives `this._page` / `this._request` directly. No fixture registration.
+
+```typescript
+// tests/components/steps/AuthSteps.ts
+import type { TestContextOptions } from '@TestContext';
+import { TestContext } from '@TestContext';
+
+export class AuthSteps extends TestContext {
+  constructor(options: TestContextOptions = {}) {
+    super(options);
+  }
+
+  async authenticateUser(email: string, password: string): Promise<{ token: string }> {
+    if (!this._request) {
+      throw new Error('Request context not set. Pass { request } in constructor options.');
+    }
+    const response = await this._request.post('/api/auth/login', {
+      data: { email, password },
+    });
+    const body = await response.json();
+    return { token: body.token };
+  }
+
+  // Object param: 3+ arguments never go positional (see typescript-patterns.md
+  // §1). Three bare strings also read identically at the call site, so
+  // swapping the last two is a silent bug.
+  async navigateAsAuthenticatedUser(args: { path: string, email: string, password: string }) {
+    const { path, email, password } = args;
+    if (!this._page || !this._request) {
+      throw new Error('Page and Request context must be set.');
+    }
+    const auth = await this.authenticateUser(email, password);
+    await this._page.evaluate(token => localStorage.setItem('authToken', token), auth.token);
+    await this._page.goto(path);
+    return auth;
+  }
+}
+```
+
+Usage — instantiate the Steps class directly in the test (there is no `{ steps }` fixture):
+
+```typescript
+import { AuthSteps } from '@steps/AuthSteps';
+
+test('TICKET-ID: should display confirmation after checkout', async ({ ui, page, request }) => {
+  const steps = new AuthSteps({ page, request });
+  await steps.navigateAsAuthenticatedUser({ path: '/checkout', email: config.testUser.email, password: config.testUser.password });
+  await ui.checkout.completeCheckoutSuccessfully();
+  await expect(page.locator('[data-testid="confirmation"]')).toBeVisible();
+});
+```
+
+When to use Steps vs direct ATC calls:
+
+| Scenario | Steps | Direct ATCs |
+|----------|-------|-------------|
+| Same 3+ ATC chain in 3+ test files | Yes | No |
+| One-off precondition for one test | No | Yes |
+| Complex setup with 5+ ATCs | Yes | No |
+| Simple single-ATC setup | No | Yes |
+
+---
+
+## 9. Tests Validate FLOWS
+
+Tests orchestrate ATCs; they do not implement logic. One test validates a complete flow with multiple assertions.
+
+```typescript
+// WRONG — six tests, same call, different field checks
+test('should return orders', async ({ api }) => { ... });
+test('should have referenceNumber', async ({ api }) => { ... });
+
+// RIGHT — one test, complete contract
+test('TICKET-ID: should create order with correct totals when discount is applied', async ({ api }) => {
+  const [, order] = await api.orders.createOrderSuccessfully(orderData);
+  const totals = await api.orders.getTotals({ orderId: order.id });
+  expect(order.id).toBeDefined();
+  expect(order.discountApplied).toBe(true);
+  expect(totals.finalAmount).toBe(totals.baseAmount - totals.discountAmount);
+});
+```
+
+Separate tests only when the scenario is fundamentally different (different precondition, role, or outcome).
+
+Every `test()` must have the ticket ID as a prefix: `test('TICKET-ID: should {behavior} when {condition}', ...)`. One ticket per `describe`; never split a ticket across files. Multiple tickets can coexist in one file when they test different aspects of the same feature.
+
+Test independence: no shared state, each test generates its own data via `TestContext` helpers or faker, never rely on test ordering.
+
+---
+
+## 10. Decorators — @atc and @step
+
+```typescript
+@atc('TICKET-ID')
+async signInSuccessfully(payload: SignInPayload) { ... }
+
+@atc('TICKET-ID', { softFail: true, severity: 'critical' })
+async verifyOptionalField() { ... }
+
+@step
+async getCurrentUser() { ... }
+```
+
+| Aspect | `@atc` | `@step` |
+|--------|--------|---------|
+| Purpose | TMS traceability + tracing | Tracing only |
+| Apply to | Layer 3 state-changing ATCs | Layer 3 read-only helpers |
+| NDJSON export | Yes | No |
+
+`@atc` options: `softFail` (failure logs but does not block), `severity` for reporting. `severity` takes ALLURE's vocabulary — `'blocker' | 'critical' | 'normal' | 'minor' | 'trivial'` (`tests/utils/decorators.ts`) — because the value is forwarded straight to Allure. It is NOT the `critical/high/medium/low` scale used by the review checklists; passing one of those is a type error. Both decorators mask sensitive parameters (`password`, `token`, `secret`) in trace output.
+
+Never apply decorators to Layer 2 base methods or private helpers. Detailed tracing mechanics live in a separate tracing reference.
+
+`bun run kata:manifest` extracts every component and ATC into `kata-manifest.json`. **MUST be loaded before proposing any new Component or ATC** — Critical Rule #12 in `AGENTS.md`. The manifest is authoritative; the file system is not. Husky enforces freshness on commit (`bun run kata:manifest:check`), so the committed manifest is always trustworthy as the registry of record.
+
+---
+
+## 11. Migrating an existing suite to KATA
+
+For a project that already has Playwright tests and adopts this boilerplate. One area at a time; the old tests keep running until their replacement is proven.
+
+1. **Find ATC candidates.** Read the current tests for blocks that repeat, map each to a Jira/Xray test case, and start with the most reused. Check `kata-manifest.json` first (Critical Rule #12): the boilerplate may already ship the component.
+2. **Adapt Layers 1-2, do not rewrite them.** `TestContext`, `ApiBase` and `UiBase` ship in `tests/components/`; wire your URLs and credentials through `config/variables.ts` and `.env` (`/test-framework-adaptation` does this).
+3. **Extract the first component.** Pick one functional area, create `{Resource}Api` or `{Page}Page`, move its methods in as ATCs with `@atc('{TICKET-ID}')`, helpers with `@step`.
+4. **Register it in the fixture.** Add it to `ApiFixture` / `UiFixture` (`tests/components/`), then rewrite ONE test to use `{ api }` / `{ ui }` / `{ test }` per the fixture selection table (§7).
+5. **Migrate progressively.** One component per change, legacy tests running in parallel, each new ATC shown to behave like the code it replaces before the legacy code goes. Run `bun run kata:manifest` after each.
+6. **Turn on traceability last.** Once ATCs carry real ticket ids, enable the TMS write-back (`AUTO_SYNC`, see `ci-integration.md` §5) and confirm the first synced run in Jira/Xray.
+
