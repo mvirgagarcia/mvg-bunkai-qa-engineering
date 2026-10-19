@@ -75,6 +75,7 @@ Source: `.agents/project.yaml` environments section
 - Test management CLI: `bun xray` (Xray Cloud)
 - Database: resolved via [DB_TOOL] — DBHub MCP (`dbhub.toml`, `DBHUB_*` env vars)
 - API docs: Scalar UI at `/api/docs`; OpenAPI spec at `/api/openapi`
+- API spec source: `<env web_url>/api/openapi` (static JSON generated in the app repo by `bun run openapi:gen` into `public/openapi.json`); consumed here by `bun run api:sync`. `api/openapi-types.ts` is still a stub. Business angle: `business-api-context` map via `project-context` mode `api` (after discovery).
 - Credentials source: Jira Epic BK-29 (passwords and secrets)
 - Demo user: `qa.bot@bunkai-test.dev` (headless QA bot — provision via `POST /api/v1/auth/signup`)
 
@@ -96,3 +97,4 @@ Source: `.agents/project.yaml`, `app/qa/qa-config.ts`
 - [ ] CI/CD: no `.github/workflows/` found — no automated builds, tests, or deploys configured in the repo
 - [ ] Monitoring/alerting — no Sentry, Datadog, or equivalent found in `package.json` or code
 - [ ] Production URL confirmed as `upexbunkai.vercel.app` via `.agents/project.yaml` but no explicit env entry for production in `project.yaml` — only `local` and `staging` environments defined
+- [ ] `bun run jira:check` exits 1 on 3 work-type name mismatches (2026-10-19), not on access: connection, auth, 236 field/status/transition items and 10 link types are OK. `.agents/jira-required.yaml` declares the localized display names (`Historia`, `Error`, `Mejora`); the synced `.agents/jira-workflows.json` holds the canonical names (`Story`, `Bug`, `Improvement`) for the same type ids (10005, 10014, 10021). JQL rejects `issuetype = Historia` / `Error` and accepts `Story` / `Bug`. Impact (measured with `--dry-run`): `jira:sync-issues pull bugs` builds `issuetype = "Error"` and silently reports 0 bugs while BK holds 43; the Improvement sweep fails the same way. Stories sync fine (fetched per Epic, 127 of 128), and per-ticket routing (`get`) needs the localized name, because it matches the display name in the payload. A manifest-only fix breaks one side or the other: `scripts/sync-jira-issues.ts` uses `jira_issue_type` verbatim for both the JQL and the routing, and does not split `A | B` alternatives. Next step: through `/framework-development`, make the sync query by the canonical name or type id and route by either name, then re-run `bun run jira:check`.
