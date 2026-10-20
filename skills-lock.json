@@ -1,6 +1,12 @@
 {
   "version": 1,
   "skills": {
+    "diagram-design": {
+      "source": "cathrynlavery/diagram-design",
+      "sourceType": "github",
+      "skillPath": "skills/diagram-design/SKILL.md",
+      "computedHash": "0bcdd8c1a0ebbb2fe65ec0a690c6c69669a5a1b6d0dccdeb2cc0c92ee4fafe68"
+    },
     "playwright-best-practices": {
       "source": "currents-dev/playwright-best-practices-skill",
       "sourceType": "github",
