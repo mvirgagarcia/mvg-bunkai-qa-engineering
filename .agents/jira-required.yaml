@@ -381,8 +381,9 @@ link_types:
 # discovered by the sync.
 work_types:
   story:
-    # Built-in Jira type; this site's locale is Spanish, so the wire name is "Historia".
-    jira_issue_type: Historia
+    # Built-in Jira type. The wire name follows the site's locale ("Historia" on a
+    # Spanish site); a single name only, because sync-jira-issues puts it in JQL verbatim.
+    jira_issue_type: Story
     description: User story / feature work item
     sync: default
     coverable: true
@@ -484,8 +485,9 @@ work_types:
     used_by: [acli, sprint-testing, test-documentation, project-discovery]
 
   bug:
-    # Built-in Jira type; this site's locale is Spanish, so the wire name is "Error".
-    jira_issue_type: Error
+    # Built-in Jira type. The wire name follows the site's locale ("Error" on a
+    # Spanish site); a single name only, because sync-jira-issues puts it in JQL verbatim.
+    jira_issue_type: Bug
     description: Defect / bug work item
     sync: default
     coverable: true
@@ -702,8 +704,9 @@ work_types:
       aborted: { from: any, to: aborted, description: Abandon the defect (global transition) }
 
   improvement:
-    # Built-in Jira type; this site's locale is Spanish, so the wire name is "Mejora".
-    jira_issue_type: Mejora
+    # Built-in Jira type. The wire name follows the site's locale ("Mejora" on a
+    # Spanish site); a single name only, because sync-jira-issues puts it in JQL verbatim.
+    jira_issue_type: Improvement
     description: Improvement / enhancement work item
     sync: optional
     recommended: true
