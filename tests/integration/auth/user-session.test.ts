@@ -9,30 +9,29 @@
 
 import { config, expect, test } from '@TestFixture';
 
-test.describe('UPEX-100: User Session API', { tag: ['@critical'] }, () => {
+test.describe('Auth: User Session API', { tag: ['@critical'] }, () => {
   /**
-   * Validates that the auth token is automatically loaded from api-state.json
-   * and can be used to make authenticated API calls.
+   * Validates that the auth token (a PAT) is automatically loaded from
+   * api-state.json and can be used to make authenticated API calls.
    */
-  test('UPEX-100: should get current user with valid token', async ({ api }) => {
+  test('should get current user with valid token', async ({ api }) => {
     // The token is automatically loaded from api-state.json by ApiFixture
     // Use helper (not ATC) — this is a read-only verification
     const [response, userData] = await api.auth.getCurrentUser();
 
-    // Test-level assertions (UPEX Dojo format)
+    // Test-level assertions (Bunkai /v1/me shape)
     expect(response.status()).toBe(200);
-    expect(userData.user).toBeDefined();
-    expect(userData.user.id).toBeDefined();
-    expect(userData.user.email).toBeDefined();
-    expect(userData.user.name).toBeDefined();
-    expect(typeof userData.user.name).toBe('string');
+    expect(userData.user.id).toBeTruthy();
+    expect(userData.user.email?.toLowerCase()).toBe(config.testUser.email.toLowerCase());
+    expect(userData.auth.source).toBe('bearer');
+    expect(userData.workspaces.length).toBeGreaterThan(0);
   });
 
   /**
    * Validates that unauthenticated requests are rejected.
    * Uses the helper directly with token cleared.
    */
-  test('UPEX-100: should fail without token', async ({ api }) => {
+  test('should fail without token', async ({ api }) => {
     // Temporarily clear token to test unauthorized access
     api.clearAuthToken();
 
@@ -47,20 +46,22 @@ test.describe('UPEX-100: User Session API', { tag: ['@critical'] }, () => {
    * Validates that we can re-authenticate and get a new token.
    * This tests the runtime token refresh capability.
    */
-  test('UPEX-100: should be able to re-authenticate', async ({ api }) => {
+  test('should be able to re-authenticate', async ({ api }) => {
     // Clear existing token
     api.clearAuthToken();
 
-    // Re-authenticate using the ATC (UPEX Dojo uses 'email' field)
+    // Re-authenticate using the ATC; the minted PAT expires in a day
     const credentials = {
       email: config.testUser.email,
       password: config.testUser.password,
+      pat_name: 'kata-reauth-test',
+      pat_expires_in_days: config.auth.patExpiresInDays,
     };
 
     const [response, tokenData] = await api.auth.authenticateSuccessfully(credentials);
 
-    // Verify new token was obtained and set
+    // Verify a new PAT was obtained and set
     expect(response.status()).toBe(200);
-    expect(tokenData.access_token).toBeDefined();
+    expect(tokenData.pat.token).toMatch(/^bk_pat_/);
   });
 });

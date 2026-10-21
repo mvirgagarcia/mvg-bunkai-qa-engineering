@@ -64,32 +64,32 @@ import type { ApiLoginContext, ExtractedToken } from './lib/api-login-core';
 export const environments = ['local', 'staging'] as const;
 
 /**
- * Build the request body for the auth endpoint.
- * Override for different auth formats (e.g. `{ username, password }`, OAuth2).
+ * Bunkai: POST /api/v1/auth/signin mints a Personal Access Token on every call
+ * (a row on the shared database). Name it after the role and let it expire in
+ * a day, matching config.auth.patExpiresInDays.
  */
 export function buildAuthPayload(
   email: string,
   password: string,
-  _context: ApiLoginContext,
+  context: ApiLoginContext,
 ): Record<string, unknown> {
-  return { email, password };
+  return { email, password, pat_name: `kata-api-login-${context.role}`, pat_expires_in_days: 1 };
 }
 
 /**
- * Extract the token fields from the auth response.
- * Override if your API returns tokens in a different shape.
- *
- * Expected response format (default):
- *   { access_token: string, token_type: string, expires_in: number, refresh_token?: string }
+ * Bunkai signin response: `{ user, session, pat: { token, expires_at, ... }, warning }`.
+ * The Bearer /api/v1 accepts is `pat.token` (`bk_pat_...`), not `session.access_token`.
  */
 export function extractTokenFromResponse(
   body: Record<string, unknown>,
   _context: ApiLoginContext,
 ): ExtractedToken {
+  const pat = (body.pat ?? {}) as { token?: unknown, expires_at?: unknown };
+  const expiresAt = typeof pat.expires_at === 'string' ? Date.parse(pat.expires_at) : Number.NaN;
   return {
-    accessToken: String(body.access_token ?? ''),
-    tokenType: String(body.token_type ?? 'Bearer'),
-    expiresIn: Number(body.expires_in ?? 86400),
-    refreshToken: body.refresh_token ? String(body.refresh_token) : null,
+    accessToken: String(pat.token ?? ''),
+    tokenType: 'Bearer',
+    expiresIn: Number.isNaN(expiresAt) ? 86400 : Math.max(0, Math.round((expiresAt - Date.now()) / 1000)),
+    refreshToken: null,
   };
 }
