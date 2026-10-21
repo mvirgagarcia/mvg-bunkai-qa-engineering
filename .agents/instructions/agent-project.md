@@ -19,6 +19,17 @@ One row per skill this project authored: the `<aspect>-context` skills `project-
 | Skill | Trigger | Purpose |
 |---|---|---|
 
+## Test framework adaptation (KATA ↔ Bunkai)
+
+Wired by `/test-framework-adaptation`; its plan and results live in `.context/reports/test-framework-adaptation-plan.md` (local).
+
+- **Auth strategy**: `POST /api/v1/auth/signin` returns the Supabase session cookies AND a Personal Access Token. The Bearer that `/api/v1` accepts is `pat.token` (`bk_pat_…`), never `session.access_token`. Endpoints live in `config/variables.ts` → `config.auth`. Every signin mints a PAT row on the shared database, so the setups and `scripts/api-login.project.ts` send a `pat_name` and `config.auth.patExpiresInDays`; per-run mint, no auto-refresh.
+- **Login form**: email-first (`login-email` → `login-continue` → `login-password` → `login-signin`); an unknown email leads to the create-account step, so a wrong-credentials case uses an existing email with a wrong password (`tests/components/ui/LoginPage.ts`).
+- **First entity**: Runs (`tests/components/api/RunsApi.ts`). A Run can never be deleted, so the daily `@critical` smoke is read-only (`tests/integration/runs/smoke.test.ts`) and the write ATCs run only in tests launched on purpose, with `[QA-AUTO]` data (`DataFactory.createRunNotes`).
+- **ATC keys**: local `BK-ATC-<DOMAIN>-<n>` ids until `/test-documentation` creates the Jira test cases.
+- **OpenAPI source**: the staging spec URL saved by `bun run api:sync` in `api/.openapi-config.json`; refresh with `bun run api:sync -c -t`. Facades: `api/schemas/auth.types.ts`, `api/schemas/runs.types.ts`.
+- **Open gaps**: one test role only (viewer, admin, owner accounts and a second workspace are needed for permission and isolation tests); GitHub secrets `STAGING_USER_EMAIL` / `STAGING_USER_PASSWORD` are not set, so CI fails `test:env:check`.
+
 ## Project Assessment (Phase 1)
 
 Assessment Date: 2026-05-31

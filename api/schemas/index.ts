@@ -7,11 +7,8 @@
  *
  * Usage:
  *   import type { LoginPayload, TokenResponse } from '@schemas/auth.types';  // preferred
- *   import type { LoginPayload, Booking } from '@schemas';                   // cross-domain
+ *   import type { LoginPayload, Run } from '@schemas';                       // cross-domain
  */
 
 export type * from './auth.types';
-
-// Add new domain facades here:
-// export type * from './bookings.types';
-// export type * from './users.types';
+export type * from './runs.types';

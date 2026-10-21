@@ -156,12 +156,16 @@ export const config = {
   baseUrl: envData.base,
   apiUrl: envData.api,
 
-  // Authentication config (UPEX Dojo endpoints - relative to apiUrl)
+  // Authentication config (Bunkai endpoints - relative to apiUrl, which ends in /api).
+  // POST /v1/auth/signin returns the Supabase session AND a Personal Access Token
+  // (`pat.token`, `bk_pat_...`): the PAT is the Bearer /api/v1 accepts.
   auth: {
-    loginEndpoint: '/auth/login',
-    tokenEndpoint: '/auth/login', // Endpoint to intercept for token (used by page.waitForResponse)
-    meEndpoint: '/auth/me',
-    tokenLifetimeSeconds: 86400, // 24 hours (1 day)
+    loginEndpoint: '/v1/auth/signin',
+    tokenEndpoint: '/v1/auth/signin', // The browser login posts here too (intercepted by page.waitForResponse)
+    meEndpoint: '/v1/me',
+    tokenLifetimeSeconds: 86400, // Fallback when a PAT carries no expires_at
+    // Every signin mints a PAT row on the shared database: name it and let it expire.
+    patExpiresInDays: 1,
     // Storage paths for authenticated sessions
     storageStatePath: '.auth/user.json',
     apiStatePath: '.auth/api-state.json',

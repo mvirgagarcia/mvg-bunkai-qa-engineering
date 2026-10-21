@@ -2,7 +2,7 @@
  * KATA Architecture - API Auth Setup (Project)
  *
  * Authenticates via API directly using AuthApi.authenticateSuccessfully() ATC.
- * Generates a JWT token for use by Integration tests.
+ * Mints a short-lived Personal Access Token for use by Integration tests.
  *
  * Dependencies: global-setup
  * Dependents: integration
@@ -27,31 +27,36 @@ setup('API Setup: authenticate via API', async ({ api }) => {
   console.log('[API Setup] Starting API authentication...');
   console.log(`[API Setup] Target: ${config.apiUrl}${config.auth.loginEndpoint}`);
 
-  // Use AuthApi ATC (UPEX Dojo uses 'email' field)
+  // Every signin mints a PAT row on the shared database: name it and let it expire.
   const credentials = {
     email: config.testUser.email,
     password: config.testUser.password,
+    pat_name: 'kata-api-setup',
+    pat_expires_in_days: config.auth.patExpiresInDays,
   };
   const [response, tokenData] = await api.auth.authenticateSuccessfully(credentials);
+  const { pat } = tokenData;
 
-  // Attach to Allure for debugging
+  // Attach to Allure for debugging (no token, no password)
   await attachRequestResponseToAllure({
     url: response.url(),
     method: 'POST',
-    responseBody: tokenData,
+    responseBody: { user: tokenData.user, pat: { id: pat.id, name: pat.name, scopes: pat.scopes, expires_at: pat.expires_at } },
     requestBody: { email: credentials.email, password: '***' },
   });
 
+  const expiresIn = pat.expires_at
+    ? Math.max(0, Math.round((Date.parse(pat.expires_at) - Date.now()) / 1000))
+    : config.auth.tokenLifetimeSeconds;
   console.log('[API Setup] Authentication successful');
-  console.log(`[API Setup] Token type: ${tokenData.token_type}`);
-  console.log(`[API Setup] Expires in: ${tokenData.expires_in} seconds`);
+  console.log(`[API Setup] PAT scopes: ${pat.scopes.join(', ')}; expires in ${expiresIn} seconds`);
 
-  // Save token to file for use by integration tests
+  // Save the PAT for use by integration tests
   const apiState: ApiState = {
-    token: tokenData.access_token,
-    tokenType: tokenData.token_type,
-    expiresIn: tokenData.expires_in,
-    refreshToken: tokenData.refresh_token ?? null,
+    token: pat.token,
+    tokenType: 'Bearer',
+    expiresIn,
+    refreshToken: null,
     source: 'api-login',
     createdAt: new Date().toISOString(),
   };

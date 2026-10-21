@@ -26,27 +26,32 @@ const apiStateFile = config.auth.apiStatePath;
 /**
  * UI Authentication Setup
  *
- * Uses direct API call to /api/v1/auth/signin (headless auth)
- * instead of UI magic-link flow for speed + reliability.
+ * Uses a direct API call to /api/v1/auth/signin (headless auth), the endpoint
+ * the email-first login form posts to, for speed + reliability. The form itself
+ * is covered by LoginPage ATCs.
  *
  * 1. POSTs credentials to /api/v1/auth/signin
- * 2. Captures JWT token + PAT from response
+ * 2. Captures the session cookies + the PAT from the response
  * 3. Saves cookies for UI tests
  * 4. Saves api-state (token) for API integration
  */
 setup('UI Setup: authenticate via UI', async ({ page }) => {
   console.log('[UI Setup] Starting API authentication...');
-  console.log('[UI Setup] Target: /api/v1/auth/signin');
+  console.log(`[UI Setup] Target: ${config.apiUrl}${config.auth.loginEndpoint}`);
 
-  // Credentials for login
+  // Credentials for login. Every signin mints a PAT row on the shared database:
+  // name it and let it expire.
   const credentials = {
     email: config.testUser.email,
     password: config.testUser.password,
+    pat_name: 'kata-ui-setup',
+    pat_expires_in_days: config.auth.patExpiresInDays,
   };
 
-  // Direct API call (faster than UI magic-link flow)
-  // Use config.baseUrl/v1 to ensure full URL (not relative path)
-  const apiSigninUrl = `${config.baseUrl}/api/v1/auth/signin`;
+  // Direct API call to the same endpoint the login form posts to (faster and
+  // steadier than driving the form); the response sets the session cookies on
+  // this browser context, which storageState() then saves.
+  const apiSigninUrl = `${config.apiUrl}${config.auth.loginEndpoint}`;
   const response = await page.request.post(apiSigninUrl, {
     data: credentials,
   });
@@ -57,18 +62,19 @@ setup('UI Setup: authenticate via UI', async ({ page }) => {
   }
 
   const tokenData = (await response.json()) as TokenResponse;
+  const pat = tokenData?.pat;
 
-  // Attach to Allure for debugging
+  // Attach to Allure for debugging (no token, no password)
   await attachRequestResponseToAllure({
     url: response.url(),
     method: 'POST',
-    responseBody: tokenData,
+    responseBody: { user: tokenData?.user, pat: pat ? { id: pat.id, name: pat.name, scopes: pat.scopes, expires_at: pat.expires_at } : null },
     requestBody: { email: credentials.email, password: '***' },
   });
 
-  // Verify token was obtained
-  if (!tokenData?.access_token) {
-    throw new Error('Token response missing access_token');
+  // Verify the PAT was obtained (the Bearer /api/v1 accepts)
+  if (!pat?.token) {
+    throw new Error('Signin response missing pat.token');
   }
 
   console.log('[UI Setup] API authentication successful');
@@ -79,10 +85,12 @@ setup('UI Setup: authenticate via UI', async ({ page }) => {
 
   // Save the token for API calls within E2E tests
   const apiState: ApiState = {
-    token: tokenData.access_token,
-    tokenType: tokenData.token_type || 'Bearer',
-    expiresIn: tokenData.expires_in,
-    refreshToken: tokenData.refresh_token || null,
+    token: pat.token,
+    tokenType: 'Bearer',
+    expiresIn: pat.expires_at
+      ? Math.max(0, Math.round((Date.parse(pat.expires_at) - Date.now()) / 1000))
+      : config.auth.tokenLifetimeSeconds,
+    refreshToken: null,
     source: 'ui-login',
     createdAt: new Date().toISOString(),
   };

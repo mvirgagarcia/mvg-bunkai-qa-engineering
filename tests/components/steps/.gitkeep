@@ -1,0 +1,3 @@
+# KATA Layer 3.5 - Steps: reusable chains of ATCs (no @atc, no fixed assertions).
+# Empty until the first multi-ATC flow needs one, e.g. RunSteps chaining
+# start -> mark -> finish from RunsApi. See .agents/skills/test-automation/.

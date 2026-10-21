@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "generatedAt": "2026-09-29T23:37:35.963Z",
+  "generatedAt": "2026-10-20T19:51:32.907Z",
   "components": {
     "api": [
       {
@@ -9,72 +9,60 @@
         "relativePath": "tests/components/api/AuthApi.ts",
         "atcs": [
           {
-            "id": "PROJ-101",
+            "id": "BK-ATC-AUTH-1",
             "method": "authenticateSuccessfully",
-            "line": 73
+            "line": 70
           },
           {
-            "id": "PROJ-102",
+            "id": "BK-ATC-AUTH-2",
             "method": "loginWithInvalidCredentials",
-            "line": 112
+            "line": 110
           }
         ]
       },
       {
-        "name": "ExampleApi",
-        "file": "ExampleApi.ts",
-        "relativePath": "tests/components/api/ExampleApi.ts",
+        "name": "RunsApi",
+        "file": "RunsApi.ts",
+        "relativePath": "tests/components/api/RunsApi.ts",
         "atcs": [
           {
-            "id": "PROJ-103",
-            "method": "getResourceSuccessfully",
-            "line": 113
+            "id": "BK-ATC-RUN-1",
+            "method": "startRunSuccessfully",
+            "line": 102
           },
           {
-            "id": "PROJ-121",
-            "method": "createResourceSuccessfully",
-            "line": 57
+            "id": "BK-ATC-RUN-2",
+            "method": "markStepSuccessfully",
+            "line": 132
           },
           {
-            "id": "PROJ-122",
-            "method": "createResourceWithInvalidData",
-            "line": 88
+            "id": "BK-ATC-RUN-3",
+            "method": "finishRunSuccessfully",
+            "line": 160
+          },
+          {
+            "id": "BK-ATC-RUN-4",
+            "method": "abortRunSuccessfully",
+            "line": 188
           }
         ]
       }
     ],
     "ui": [
       {
-        "name": "ExamplePage",
-        "file": "ExamplePage.ts",
-        "relativePath": "tests/components/ui/ExamplePage.ts",
-        "atcs": [
-          {
-            "id": "PROJ-131",
-            "method": "submitFormWithValidData",
-            "line": 99
-          },
-          {
-            "id": "PROJ-132",
-            "method": "submitFormWithInvalidEmail",
-            "line": 122
-          }
-        ]
-      },
-      {
         "name": "LoginPage",
         "file": "LoginPage.ts",
         "relativePath": "tests/components/ui/LoginPage.ts",
         "atcs": [
           {
-            "id": "PROJ-111",
+            "id": "BK-ATC-AUTH-3",
             "method": "loginSuccessfully",
-            "line": 80
+            "line": 85
           },
           {
-            "id": "PROJ-112",
+            "id": "BK-ATC-AUTH-4",
             "method": "loginWithInvalidCredentials",
-            "line": 97
+            "line": 103
           }
         ]
       },
@@ -212,23 +200,12 @@
       }
     ]
   },
-  "steps": [
-    {
-      "name": "ExampleSteps",
-      "file": "ExampleSteps.ts",
-      "relativePath": "tests/components/steps/ExampleSteps.ts",
-      "methods": [
-        "authenticateUser",
-        "createTestResource",
-        "navigateAsAuthenticatedUser"
-      ]
-    }
-  ],
+  "steps": [],
   "summary": {
-    "totalComponents": 5,
-    "totalATCs": 34,
+    "totalComponents": 4,
+    "totalATCs": 33,
     "apiComponents": 2,
-    "uiComponents": 3,
-    "stepsModules": 1
+    "uiComponents": 2,
+    "stepsModules": 0
   }
 }
