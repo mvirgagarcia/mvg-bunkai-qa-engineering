@@ -26,21 +26,16 @@ export interface TestCredentials {
 }
 
 // ============================================
-// Project-Specific Types (example structure)
+// Project-Specific Types (Bunkai)
 // ============================================
 
-export interface TestHotel {
-  name: string
-  organizationId?: number
-  invoiceCap?: number
-}
-
-export interface TestBooking {
-  confirmationNumber: string
-  hotelId: number
-  stayValue: number
-  checkInDate: string
-  emailHash?: string
+/**
+ * Free text a test writes into a Run. Staging is one shared database and a Run
+ * can never be deleted, so every value carries the `[QA-AUTO]` marker.
+ */
+export interface TestRunNotes {
+  abortReason: string
+  stepNote: string
 }
 
 // ============================================

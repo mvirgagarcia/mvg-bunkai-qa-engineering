@@ -9,7 +9,7 @@
  *   - Import directo: import { DataFactory } from '@DataFactory'
  */
 
-import type { TestBooking, TestCredentials, TestHotel, TestUser } from '@data/types';
+import type { TestCredentials, TestRunNotes, TestUser } from '@data/types';
 
 import { faker } from '@faker-js/faker';
 
@@ -75,33 +75,20 @@ export class DataFactory {
   }
 
   // ============================================
-  // PROJECT-SPECIFIC (example structure)
+  // PROJECT-SPECIFIC (Bunkai)
   // ============================================
 
   /**
-   * Genera datos de Hotel para testing
-   * TODO: Expandir cuando se necesite
+   * Genera los textos que un test escribe en un Run.
+   * Staging es una base compartida y un Run no se puede borrar: todo lleva
+   * el marcador [QA-AUTO] para que se pueda encontrar y filtrar.
+   * La razón de abort respeta el CHECK de 3 a 500 caracteres.
    */
-  static createHotel(overrides?: Partial<TestHotel>): TestHotel {
+  static createRunNotes(overrides?: Partial<TestRunNotes>): TestRunNotes {
+    const id = this.uniqueId();
     return {
-      name: `Test Hotel ${faker.location.city()}`,
-      organizationId: faker.number.int({ min: 1, max: 100 }),
-      invoiceCap: faker.number.int({ min: 1000, max: 50000 }),
-      ...overrides,
-    };
-  }
-
-  /**
-   * Genera datos de Booking para testing
-   * TODO: Expandir cuando se necesite
-   */
-  static createBooking(overrides?: Partial<TestBooking>): TestBooking {
-    return {
-      confirmationNumber: `CONF-${faker.string.alphanumeric(8).toUpperCase()}`,
-      hotelId: faker.number.int({ min: 1, max: 1000 }),
-      stayValue: faker.number.float({ min: 100, max: 5000, fractionDigits: 2 }),
-      checkInDate: faker.date.future().toISOString().split('T')[0],
-      emailHash: faker.string.alphanumeric(32),
+      abortReason: `[QA-AUTO] Aborted by automation ${id}`,
+      stepNote: `[QA-AUTO] Marked by automation ${id}`,
       ...overrides,
     };
   }
